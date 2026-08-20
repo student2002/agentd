@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Teammate Local Control</title>
+  <style>
+    :root { color-scheme: light dark; }
+    body { font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; margin: 2rem; max-width: 64rem; }
+    h1 { font-size: 1.25rem; }
+    .card { border: 1px solid #8886; border-radius: 8px; padding: 1rem; margin: 1rem 0; }
+    button { padding: .5rem 1rem; margin: .25rem .25rem .25rem 0; cursor: pointer; }
+    button:disabled { opacity: .5; cursor: not-allowed; }
+    pre { background: #8882; padding: .75rem; border-radius: 6px; overflow: auto; max-height: 24rem; white-space: pre-wrap; }
+    .muted { color: #888; font-size: .85rem; }
+    .warn { color: #b00; }
+  </style>
+</head>
+<body>
+  <h1>Teammate Local Control</h1>
+  <p class="muted">本地控制台 — 所有操作仅作用于本机 agentd，服务器保持无感（节点保持 in_progress）。</p>
+
+  <div class="card">
+    <strong>运行状态</strong>
+    <div id="status">连接中…</div>
+    <div id="session" class="muted"></div>
+    <div>
+      <button id="pause">暂停认领</button>
+      <button id="resume">恢复认领</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <strong>当前执行节点</strong>
+    <div id="node" class="muted">无运行中的节点</div>
+    <div>
+      <button id="soft-interrupt" disabled>接管（软中断）</button>
+      <button id="handback" disabled>交还（继续执行）</button>
+      <button id="complete" disabled>人工完成</button>
+    </div>
+    <input id="message" style="width:100%;margin-top:.5rem;padding:.5rem" placeholder="向当前会话追加一条消息后回车…" />
+    <button id="intervene" disabled>发送并执行一轮</button>
+  </div>
+
+  <div class="card">
+    <strong>实时日志</strong>
+    <pre id="logs">（等待日志…）</pre>
+  </div>
+
+  <script>
+    const token = new URLSearchParams(location.search).get("token") || localStorage.getItem("teammate_local_token") || "";
+    if (token) localStorage.setItem("teammate_local_token", token);
+    const headers = { "Authorization": "Bearer " + token, "Content-Type": "application/json" };
+
+    const $ = (id) => document.getElementById(id);
+    const set = (id, text) => { const el = $(id); if (el) el.textContent = text; };
+
+    async function post(path, body) {
+      const res = await fetch(path, { method: "POST", headers, body: body ? JSON.stringify(body) : "{}" });
+      const text = await res.text();
+      try { return { ok: res.ok, status: res.status, json: JSON.parse(text) }; }
+      catch { return { ok: res.ok, status: res.status, text }; }
+    }
+
+    async function refreshSnapshot() {
+      try {
+        const res = await fetch("/api/local/runtime/snapshot", { headers });
+        if (!res.ok) { set("status", "无法获取快照：" + res.status); return; }
+        const snap = await res.json();
+        window.__snap = snap;
+        set("status", "运行时：" + (snap.runtime && snap.runtime.status) + " ｜ 代理：" + (snap.agent && snap.agent.status) + (snap.agent && snap.agent.paused ? "（已暂停认领）" : ""));
+        const es = snap.execution_session || {};
+        const running = es.status === "running" || es.status === "intervening";
+        set("session", "任务 " + (es.task_id || "—") + " / 节点 " + (es.node_id || "—") + "（" + (es.status || "idle") + "）" + (es.tool_session_id_present ? " ｜ 可接管" : ""));
+        set("node", es.node_name ? ("节点：" + es.node_name + "（" + es.status + "）") : "无运行中的节点");
+        const allowIntervene = running && es.tool_session_id_present;
+        $("soft-interrupt").disabled = !running;
+        $("intervene").disabled = !allowIntervene;
+        $("handback").disabled = es.status !== "intervening";
+        $("complete").disabled = !running;
+      } catch (e) { set("status", "连接失败：" + e); }
+    }
+
+    function currentTask() { return (window.__snap || {}).execution_session && window.__snap.execution_session.task_id; }
+    function currentNode() { return (window.__snap || {}).execution_session && window.__snap.execution_session.node_id; }
+    async function sendIntervene() {
+      const msg = $("message").value.trim();
+      if (!msg) return;
+      const r = await post("/api/local/control/intervene", { task_id: currentTask(), node_id: currentNode(), message: msg });
+      if (!r.ok) { alert("执行失败：" + (r.text || r.status)); }
+      $("message").value = "";
+      refreshSnapshot();
+    }
+
+    $("pause").onclick = async () => { await post("/api/local/control/pause"); refreshSnapshot(); };
+    $("resume").onclick = async () => { await post("/api/local/control/resume"); refreshSnapshot(); };
+    $("soft-interrupt").onclick = async () => { await post("/api/local/control/soft-interrupt", { task_id: currentTask(), node_id: currentNode() }); refreshSnapshot(); };
+    $("handback").onclick = async () => { await post("/api/local/control/handback", { task_id: currentTask(), node_id: currentNode() }); refreshSnapshot(); };
+    $("complete").onclick = async () => { await post("/api/local/control/complete", { task_id: currentTask(), node_id: currentNode() }); refreshSnapshot(); };
+    $("intervene").onclick = sendIntervene;
+    $("message").addEventListener("keydown", (e) => { if (e.key === "Enter") sendIntervene(); });
+
+    function streamLogs() {
+      const es = new EventSource("/api/local/logs/stream?since=0");
+      es.addEventListener("execution_session.output_line", (e) => {
+        try {
+          const line = JSON.parse(e.data);
+          const el = $("logs");
+          el.textContent = (el.textContent === "（等待日志…）" ? "" : el.textContent) + line.line + "\n";
+          el.scrollTop = el.scrollHeight;
+        } catch {}
+      });
+      es.onerror = () => { set("logs", "（日志连接中断，重连中…）"); };
+    }
+
+    refreshSnapshot();
+    streamLogs();
+    setInterval(refreshSnapshot, 3000);
+  </script>
+</body>
+</html>
