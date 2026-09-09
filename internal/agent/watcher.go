@@ -1,14 +1,22 @@
-// watcher.go 实现节点轮询监听器，在 SSE 断连时作为降级方案主动发现可认领节点。
+// watcher.go implements the node polling listener, which acts as a fallback to
+// actively discover claimable nodes when SSE is disconnected.
 //
-// 本文件提供 Agent Daemon 的被动节点发现机制，主要包括：
-//   - NodeWatcher 结构体：定期轮询工作区中所有项目的 pending 节点
-//   - Start / Stop：启动和停止轮询协程，支持优雅退出
-//   - TriggerPoll：立即触发一次轮询，用于 SSE 事件驱动的即时响应
-//   - poll：遍历工作区所有项目，逐个检查可认领节点
-//   - pollProject：检查单个项目的 pending 节点，尝试认领并分派给执行器
+// This file provides the Agent Daemon's passive node discovery mechanism,
+// mainly including:
+//   - NodeWatcher struct: periodically polls pending nodes across all projects
+//     in the workspace
+//   - Start / Stop: start and stop the polling goroutine, supporting graceful
+//     shutdown
+//   - TriggerPoll: triggers a poll immediately, for instant response driven by
+//     SSE events
+//   - poll: iterates over all projects in the workspace, checking claimable
+//     nodes one by one
+//   - pollProject: checks a single project's pending nodes, attempts to claim
+//     them and dispatches them to the executor
 //
-// 轮询间隔默认 60 秒。单次只执行一个节点（executor.IsRunning() 互斥检查），
-// 认领使用乐观锁（version 字段），并发认领返回 409 Conflict。
+// The default polling interval is 60 seconds. Only one node is executed at a
+// time (mutual exclusion via executor.IsRunning()). Claiming uses optimistic
+// locking (the version field); concurrent claims return 409 Conflict.
 package agent
 
 import (
@@ -20,15 +28,17 @@ import (
 	"time"
 )
 
-// NodeWatcher 轮询工作区中所有项目的可用节点，并分派给执行器执行。
-// 在 SSE 断连时作为降级方案，主动轮询可认领的 pending 节点。
+// NodeWatcher polls available nodes across all projects in the workspace and
+// dispatches them to the executor for execution.
+// It acts as a fallback when SSE is disconnected, actively polling claimable
+// pending nodes.
 type NodeWatcher struct {
 	client      *Client
 	executor    *TaskExecutor
 	agentID     string
 	workspaceID string
 	interval    time.Duration
-	pollCh      chan struct{} // 用于触发立即轮询
+	pollCh      chan struct{} // used to trigger an immediate poll
 	wg          sync.WaitGroup
 	paused      atomic.Bool
 
@@ -36,7 +46,7 @@ type NodeWatcher struct {
 	cancel context.CancelFunc
 }
 
-// NewNodeWatcher 创建一个新的节点监听器。
+// NewNodeWatcher creates a new node watcher.
 func NewNodeWatcher(client *Client, executor *TaskExecutor, agentID, workspaceID string, interval time.Duration) *NodeWatcher {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &NodeWatcher{
@@ -51,8 +61,9 @@ func NewNodeWatcher(client *Client, executor *TaskExecutor, agentID, workspaceID
 	}
 }
 
-// Start 启动节点轮询循环。
-// 初始轮询不会在此触发——调用方（Daemon）应在启动监听器后调用 TriggerPoll()。
+// Start starts the node polling loop.
+// The initial poll is NOT triggered here — the caller (Daemon) should call
+// TriggerPoll() after starting the watcher.
 func (w *NodeWatcher) Start() {
 	w.wg.Add(1)
 	go func() {
@@ -73,12 +84,13 @@ func (w *NodeWatcher) Start() {
 	}()
 }
 
-// TriggerPoll 立即触发一次可认领节点的轮询，用于 SSE 事件处理器收到 node:pending 事件时。
+// TriggerPoll triggers an immediate poll for claimable nodes, used by the SSE
+// event handler when it receives a node:pending event.
 func (w *NodeWatcher) TriggerPoll() {
 	select {
 	case w.pollCh <- struct{}{}:
 	default:
-		// 已有轮询在进行，跳过
+		// A poll is already in progress, skip
 	}
 }
 
@@ -102,15 +114,16 @@ func (w *NodeWatcher) IsPaused() bool {
 	return w.paused.Load()
 }
 
-// Stop 取消监听器上下文并等待协程退出。
+// Stop cancels the watcher context and waits for the goroutine to exit.
 func (w *NodeWatcher) Stop() {
 	w.cancel()
 	w.wg.Wait()
 }
 
-// poll 先恢复 Agent 之前认领但未完成的 in_progress 节点，
-// 然后遍历工作区中所有项目，逐个检查可认领的 pending 节点。
-// 在收到停止信号或上下文取消时提前退出。
+// poll first recovers in_progress nodes previously claimed but not completed by
+// the Agent, then iterates over all projects in the workspace, checking
+// claimable pending nodes one by one.
+// It exits early on receiving a stop signal or context cancellation.
 func (w *NodeWatcher) poll() {
 	// Paused mode: do not recover or claim any nodes. An in-progress execution
 	// is untouched — pause only gates new work discovery.
@@ -118,7 +131,7 @@ func (w *NodeWatcher) poll() {
 		return
 	}
 
-	// 优先恢复之前未完成的节点（Agent 重启场景）
+	// Recover previously unfinished nodes first (Agent restart scenario)
 	w.recoverInProgressNodes()
 
 	projects, err := w.client.ListProjects(w.ctx, w.workspaceID)
@@ -144,9 +157,10 @@ func (w *NodeWatcher) poll() {
 	}
 }
 
-// recoverInProgressNodes 查询当前 Agent 之前认领但未完成（in_progress）的节点，
-// 如果执行器空闲则恢复执行第一个此类节点。
-// 用于 Agent 重启后自动恢复被中断的任务。
+// recoverInProgressNodes queries the in_progress nodes previously claimed but
+// not completed by the current Agent, and recovers the first such node if the
+// executor is idle.
+// Used to automatically resume interrupted tasks after an Agent restart.
 func (w *NodeWatcher) recoverInProgressNodes() {
 	if w.executor.IsRunning() {
 		return
@@ -165,7 +179,7 @@ func (w *NodeWatcher) recoverInProgressNodes() {
 		return
 	}
 
-	// 恢复第一个 in_progress 节点
+	// Recover the first in_progress node
 	node := nodes[0]
 	if w.executor.IsRunning() {
 		return
@@ -178,18 +192,20 @@ func (w *NodeWatcher) recoverInProgressNodes() {
 		Name:            node.Name,
 		SortOrder:       node.SortOrder,
 		Status:          node.Status,
-		ReadonlyDirs:    node.ReadonlyDirs,    // 恢复执行时保持目录权限
-		FullControlDirs: node.FullControlDirs, // 恢复执行时保持目录权限
+		ReadonlyDirs:    node.ReadonlyDirs,    // preserve directory permissions when resuming
+		FullControlDirs: node.FullControlDirs, // preserve directory permissions when resuming
 	}, node.ProjectID)
 }
 
-// pollProject 检查单个项目中的 pending 节点，尝试认领并分派给执行器执行。
-// 工作流节点严格有序，仅认领第一个 pending 节点（sort_order 最小），
-// 前序节点未完成时后序节点不可认领。仅处理非人类分配的节点。
-// 单次只执行一个节点（executor.IsRunning() 互斥）。
+// pollProject checks the pending nodes in a single project, attempts to claim
+// them and dispatches them to the executor for execution.
+// Workflow nodes are strictly ordered; only the first pending node (smallest
+// sort_order) is claimed, and subsequent nodes cannot be claimed until their
+// predecessors are completed. Only non-human-assigned nodes are processed.
+// Only one node is executed at a time (executor.IsRunning() mutex).
 //
-// 参数:
-//   - projectID: 要检查的项目 ID
+// Parameters:
+//   - projectID: the project ID to check
 func (w *NodeWatcher) pollProject(projectID string) {
 	if w.executor.IsRunning() {
 		return
@@ -224,7 +240,7 @@ func (w *NodeWatcher) pollProject(projectID string) {
 			continue
 		}
 
-		// 工作流有序：只认领第一个 pending 且非人类分配的节点
+		// Workflow is ordered: only claim the first pending, non-human-assigned node
 		var firstPending *TaskNode
 		for i := range nodes {
 			if nodes[i].Status == "pending" && nodes[i].AssigneeType != "human" {
@@ -253,7 +269,7 @@ func (w *NodeWatcher) pollProject(projectID string) {
 			}
 			errMsg := err.Error()
 			if strings.Contains(errMsg, "self-review") {
-				// 不允许自审——跳过此节点，以便其他代理认领
+				// Self-review not allowed — skip this node so other agents can claim it
 				if skipErr := w.client.SkipClaim(w.ctx, w.agentID, task.TaskID, firstPending.ID); skipErr != nil {
 					log.Printf("[watcher] failed to skip-claim node %s: %v", firstPending.ID, skipErr)
 				} else {

@@ -1,5 +1,6 @@
-// Package agent_test 包含 agent 包的测试，涵盖 shell 转义、
-// 执行上下文构建、Git 操作以及 agent 守护进程使用的 token 估算。
+// Package agent_test contains tests for the agent package, covering shell
+// escaping, execution context construction, Git operations, and the token
+// estimation used by the agent daemon.
 package agent_test
 
 import (
@@ -12,7 +13,8 @@ import (
 	"github.com/teammate/agentd/internal/agent"
 )
 
-// TestBranchName 验证 BranchName 返回预期的分支名称格式 "teammate/task-{taskID}"。
+// TestBranchName verifies that BranchName returns the expected branch name
+// format "teammate/task-{taskID}".
 func TestBranchName(t *testing.T) {
 	got := agent.BranchName(123)
 	want := "teammate/task-123"
@@ -21,8 +23,9 @@ func TestBranchName(t *testing.T) {
 	}
 }
 
-// TestNodeStartTag 验证 NodeStartTag 返回预期的格式
-// "teammate/task-{taskID}/node-{order}/attempt-{attempt}/start"，用于在每个节点执行尝试开始时跟踪 Git 状态。
+// TestNodeStartTag verifies that NodeStartTag returns the expected format
+// "teammate/task-{taskID}/node-{order}/attempt-{attempt}/start", used to track
+// Git state at the start of each node execution attempt.
 func TestNodeStartTag(t *testing.T) {
 	got := agent.NodeStartTag(123, 2, 1)
 	want := "teammate/task-123/node-2/attempt-1/start"
@@ -31,7 +34,8 @@ func TestNodeStartTag(t *testing.T) {
 	}
 }
 
-// TestCurrentTime 验证 CurrentTime 返回一个合理的 Unix 时间戳（非零，大于10亿）。
+// TestCurrentTime verifies that CurrentTime returns a reasonable Unix
+// timestamp (non-zero and greater than one billion).
 func TestCurrentTime(t *testing.T) {
 	gm := agent.NewGitManager(t.TempDir())
 	ts := gm.CurrentTime()
@@ -43,9 +47,10 @@ func TestCurrentTime(t *testing.T) {
 	}
 }
 
-// --- 扩展的 Git 测试（从 internal/agent/git_internal_test.go 迁移而来） ---
+// --- Expanded Git tests (migrated from internal/agent/git_internal_test.go) ---
 
-// setupTestRepo 创建一个裸 Git 仓库作为"远程仓库"并返回其路径。
+// setupTestRepo creates a bare Git repository that acts as a "remote
+// repository" and returns its path.
 func setupTestRepo(t *testing.T) (remoteDir string, cleanup func()) {
 	t.Helper()
 
@@ -78,7 +83,8 @@ func setupTestRepo(t *testing.T) (remoteDir string, cleanup func()) {
 	return remoteDir, cleanup
 }
 
-// runGit 在指定目录执行 git 命令。测试失败时终止测试并在错误消息中包含 git 输出。
+// runGit runs a git command in the specified directory. On test failure it
+// terminates the test and includes the git output in the error message.
 func runGit(t *testing.T, dir string, args ...string) {
 	t.Helper()
 	cmd := exec.Command("git", args...)
@@ -90,7 +96,8 @@ func runGit(t *testing.T, dir string, args ...string) {
 	}
 }
 
-// TestGitManager_IsGitRepo 验证 IsGitRepo 对克隆的仓库返回 true，对不存在的目录返回 false。
+// TestGitManager_IsGitRepo verifies that IsGitRepo returns true for a cloned
+// repository and false for a non-existent directory.
 func TestGitManager_IsGitRepo(t *testing.T) {
 	tmpDir := t.TempDir()
 	gm := agent.NewGitManager(tmpDir)
@@ -104,7 +111,8 @@ func TestGitManager_IsGitRepo(t *testing.T) {
 	}
 }
 
-// TestGitManager_Clone 验证 Clone 在管理工作目录创建远程仓库的完整工作副本。
+// TestGitManager_Clone verifies that Clone creates a full working copy of the
+// remote repository in the managed working directory.
 func TestGitManager_Clone(t *testing.T) {
 	remoteDir, cleanup := setupTestRepo(t)
 	defer cleanup()
@@ -131,8 +139,9 @@ func TestGitManager_Clone(t *testing.T) {
 	}
 }
 
-// TestGitManager_Clone_SkipIfAlreadyRepo 验证如果工作目录已经是有效的 Git 仓库则跳过克隆，
-// 允许幂等的初始化。
+// TestGitManager_Clone_SkipIfAlreadyRepo verifies that clone is skipped if the
+// working directory is already a valid Git repository, allowing idempotent
+// initialization.
 func TestGitManager_Clone_SkipIfAlreadyRepo(t *testing.T) {
 	remoteDir, cleanup := setupTestRepo(t)
 	defer cleanup()
@@ -158,7 +167,8 @@ func TestGitManager_Clone_SkipIfAlreadyRepo(t *testing.T) {
 	}
 }
 
-// TestGitManager_FetchAndCheckout 验证 FetchAndCheckout 从基础分支创建并检出新分支。
+// TestGitManager_FetchAndCheckout verifies that FetchAndCheckout creates and
+// checks out a new branch from the base branch.
 func TestGitManager_FetchAndCheckout(t *testing.T) {
 	remoteDir, cleanup := setupTestRepo(t)
 	defer cleanup()
@@ -187,7 +197,9 @@ func TestGitManager_FetchAndCheckout(t *testing.T) {
 	}
 }
 
-// TestGitManager_FetchAndCheckout_SyncsFromRemote 验证共享同一远程仓库的两个克隆能在 fetch 后看到彼此的提交。
+// TestGitManager_FetchAndCheckout_SyncsFromRemote verifies that two clones
+// sharing the same remote repository can see each other's commits after a
+// fetch.
 func TestGitManager_FetchAndCheckout_SyncsFromRemote(t *testing.T) {
 	remoteDir, cleanup := setupTestRepo(t)
 	defer cleanup()
@@ -228,7 +240,8 @@ func TestGitManager_FetchAndCheckout_SyncsFromRemote(t *testing.T) {
 	}
 }
 
-// TestGitManager_FetchAndCheckout_SyncsLocalWithRemote 验证本地分支被重置为匹配远程状态（不仅是追加）。
+// TestGitManager_FetchAndCheckout_SyncsLocalWithRemote verifies that the local
+// branch is reset to match the remote state (not merely appended).
 func TestGitManager_FetchAndCheckout_SyncsLocalWithRemote(t *testing.T) {
 	remoteDir, cleanup := setupTestRepo(t)
 	defer cleanup()
@@ -282,7 +295,8 @@ func TestGitManager_FetchAndCheckout_SyncsLocalWithRemote(t *testing.T) {
 	}
 }
 
-// TestGitManager_CommitAll 验证 CommitAll 暂存所有更改并使用给定消息创建提交。
+// TestGitManager_CommitAll verifies that CommitAll stages all changes and
+// creates a commit with the given message.
 func TestGitManager_CommitAll(t *testing.T) {
 	remoteDir, cleanup := setupTestRepo(t)
 	defer cleanup()
@@ -311,7 +325,8 @@ func TestGitManager_CommitAll(t *testing.T) {
 	}
 }
 
-// TestGitManager_CommitAllWithResult 报告是否实际创建了一次提交。
+// TestGitManager_CommitAllWithResult reports whether a commit was actually
+// created.
 func TestGitManager_CommitAllWithResult(t *testing.T) {
 	remoteDir, cleanup := setupTestRepo(t)
 	defer cleanup()
@@ -342,7 +357,8 @@ func TestGitManager_CommitAllWithResult(t *testing.T) {
 	}
 }
 
-// TestGitManager_TagNodeStart 验证 TagNodeStart 创建用于跟踪节点执行状态的 Git 标签，且标签可检索。
+// TestGitManager_TagNodeStart verifies that TagNodeStart creates a Git tag used
+// to track node execution state and that the tag can be retrieved.
 func TestGitManager_TagNodeStart(t *testing.T) {
 	remoteDir, cleanup := setupTestRepo(t)
 	defer cleanup()
@@ -370,7 +386,8 @@ func TestGitManager_TagNodeStart(t *testing.T) {
 	}
 }
 
-// TestGitManager_ResetToNode 验证 ResetToNode 可以重置工作树到节点的起始标签，丢弃未提交的更改。
+// TestGitManager_ResetToNode verifies that ResetToNode can reset the working
+// tree to the node's starting tag, discarding uncommitted changes.
 func TestGitManager_ResetToNode(t *testing.T) {
 	remoteDir, cleanup := setupTestRepo(t)
 	defer cleanup()
@@ -403,7 +420,8 @@ func TestGitManager_ResetToNode(t *testing.T) {
 	}
 }
 
-// TestGitManager_SnapshotBeforeReject 验证 CreateSnapshot 在驳回操作回滚更改前创建当前状态的提交。
+// TestGitManager_SnapshotBeforeReject verifies that CreateSnapshot commits the
+// current state before a reject operation rolls back changes.
 func TestGitManager_SnapshotBeforeReject(t *testing.T) {
 	remoteDir, cleanup := setupTestRepo(t)
 	defer cleanup()
@@ -426,7 +444,8 @@ func TestGitManager_SnapshotBeforeReject(t *testing.T) {
 	}
 }
 
-// TestGitManager_ConfigureCredential 验证 ConfigureCredential 使用正确的 PAT 和用户信息编写 askpass 脚本。
+// TestGitManager_ConfigureCredential verifies that ConfigureCredential writes
+// an askpass script with the correct PAT and user information.
 func TestGitManager_ConfigureCredential(t *testing.T) {
 	remoteDir, cleanup := setupTestRepo(t)
 	defer cleanup()
@@ -441,7 +460,7 @@ func TestGitManager_ConfigureCredential(t *testing.T) {
 		t.Fatalf("ConfigureCredential failed: %v", err)
 	}
 
-	// 验证 git config 已设置
+	// Verify that git config has been set
 	cmd := exec.Command("git", "config", "user.name")
 	cmd.Dir = workDir
 	out, err := cmd.CombinedOutput()
@@ -455,7 +474,8 @@ func TestGitManager_ConfigureCredential(t *testing.T) {
 	gm.CleanupCredential()
 }
 
-// TestGitManager_ConfigureCredential_EmptyPAT 验证 ConfigureCredential 在空 PAT 字符串时返回错误。
+// TestGitManager_ConfigureCredential_EmptyPAT verifies that ConfigureCredential
+// returns an error when given an empty PAT string.
 func TestGitManager_ConfigureCredential_EmptyPAT(t *testing.T) {
 	tmpDir := t.TempDir()
 	runGit(t, tmpDir, "init")
@@ -466,7 +486,8 @@ func TestGitManager_ConfigureCredential_EmptyPAT(t *testing.T) {
 	}
 }
 
-// TestGitManager_SetGitConfig 验证 SetGitConfig 将用户名和电子邮件写入仓库的 Git 配置。
+// TestGitManager_SetGitConfig verifies that SetGitConfig writes username and
+// email to the repository's Git configuration.
 func TestGitManager_SetGitConfig(t *testing.T) {
 	tmpDir := t.TempDir()
 	runGit(t, tmpDir, "init")

@@ -1,4 +1,4 @@
-// local_state_test.go 覆盖本地状态管理的测试。
+// local_state_test.go covers tests for local state management.
 package agent_test
 
 import (

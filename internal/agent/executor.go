@@ -1,18 +1,19 @@
-// executor.go 实现任务执行器，负责使用编码工具执行已认领的节点。
+// executor.go implements the task executor, which is responsible for executing claimed
+// nodes using coding tools.
 //
-// 本文件是 Agent Daemon 中最核心的执行模块，包含以下功能：
-//   - 任务执行流程编排（准备工作区 → 构建上下文 → 调用工具 → 上报结果）
-//   - Git 工作区管理（克隆、分支创建、start/end tag）
-//   - 编码工具选择与调用（Claude Code / OpenClaw / OpenCode）
-//   - 执行日志实时上报（通过 SSE + Redis 缓冲）
-//   - 中断处理（接收 task:interrupt 事件，SIGTERM→SIGKILL 进程组）
-//   - 会话恢复（重启后恢复执行上下文）
-//   - 检查点提交（定期 commit 当前进度）
-//   - 磁盘配额检查和 Token 用量上报
+// This file is the core execution module of the Agent Daemon, containing the following functionality:
+//   - Task execution flow orchestration (prepare workspace -> build context -> invoke tool -> report result)
+//   - Git workspace management (clone, branch creation, start/end tag)
+//   - Coding tool selection and invocation (Claude Code / OpenClaw / OpenCode)
+//   - Real-time execution log reporting (via SSE + Redis buffering)
+//   - Interrupt handling (receive task:interrupt event, SIGTERM->SIGKILL process group)
+//   - Session recovery (resume execution context after restart)
+//   - Checkpoint commits (periodically commit current progress)
+//   - Disk quota check and Token usage reporting
 //
-// TaskExecutor 是执行器的主结构体，协调 Git、工具、日志等子模块。
-// 执行流程：克隆仓库 → 创建特性分支 → 打 start tag → 注入上下文 →
-// 调用编码工具 → 实时上报日志 → commit + push → 打 end tag → 上报用量。
+// TaskExecutor is the main struct of the executor, coordinating Git, tool, log and other submodules.
+// Execution flow: clone repository -> create feature branch -> tag start -> inject context ->
+// invoke coding tool -> report logs in real time -> commit + push -> tag end -> report usage.
 package agent
 
 import (
@@ -32,8 +33,8 @@ import (
 	"github.com/teammate/agentd/internal/agent/tool"
 )
 
-// TaskExecutor 负责使用编码工具执行已认领的节点，管理 Git 工作区、
-// 会话恢复、检查点提交和中断处理。
+// TaskExecutor is responsible for executing claimed nodes using coding tools, and manages
+// the Git workspace, session recovery, checkpoint commits, and interrupt handling.
 type TaskExecutor struct {
 	cfg      *Config
 	client   *Client
@@ -50,8 +51,8 @@ type TaskExecutor struct {
 	taskID      int32
 	node        TaskNode
 
-	sessionID   string // 当前 Claude Code 会话 ID，用于 --resume
-	lastWorkDir string // 上次工作目录，用于会话失效检测
+	sessionID   string // current Claude Code session ID, used for --resume
+	lastWorkDir string // last working directory, used for session invalidation detection
 
 	// nodeProjectID is the projectID of the running node, captured at Execute
 	// entry. Intervention turns reuse it for completeness; the turn makes no
@@ -93,15 +94,15 @@ type ExecutionObserver interface {
 	OnToolStatusChanged(provider string, status string, err error)
 }
 
-// NewTaskExecutor 创建一个新的任务执行器。
+// NewTaskExecutor creates a new task executor.
 //
-// 参数：
-//   - cfg: 守护进程配置
-//   - client: Server 通信客户端
-//   - agentID: 代理 ID
+// Args:
+//   - cfg: daemon configuration
+//   - client: Server communication client
+//   - agentID: agent ID
 //
-// 返回：
-//   - *TaskExecutor: 初始化完成的执行器实例
+// Returns:
+//   - *TaskExecutor: the initialized executor instance
 func NewTaskExecutor(cfg *Config, client *Client, agentID string) *TaskExecutor {
 	return NewTaskExecutorWithObserver(cfg, client, agentID, nil)
 }
@@ -116,12 +117,13 @@ func NewTaskExecutorWithObserver(cfg *Config, client *Client, agentID string, ob
 	}
 }
 
-// Execute 执行一个已认领的节点，包括 Git 工作区初始化、上下文构建、编码工具调用和结果上报。
+// Execute executes a claimed node, including Git workspace initialization, context building,
+// coding tool invocation, and result reporting.
 //
-// 参数：
-//   - taskID: 任务 ID
-//   - node: 要执行的节点信息
-//   - projectID: 项目 ID
+// Args:
+//   - taskID: task ID
+//   - node: the node information to execute
+//   - projectID: project ID
 func (e *TaskExecutor) Execute(taskID int32, node TaskNode, projectID string) {
 	log.Printf("[executor] starting node %s (%s) for task %d", node.ID, node.Name, taskID)
 
@@ -139,14 +141,14 @@ func (e *TaskExecutor) Execute(taskID int32, node TaskNode, projectID string) {
 		e.currentMu.Unlock()
 	}()
 
-	// 为本次执行创建可取消的上下文
+	// Create a cancellable context for this execution
 	ctx, cancel := context.WithCancel(context.Background())
 	e.mu.Lock()
 	e.cancelFunc = cancel
 	e.mu.Unlock()
 	defer cancel()
 
-	// 2. 获取任务详情以获取 projectID 和仓库信息
+	// 2. Fetch task details to obtain the projectID and repository information
 	task := Task{
 		ID:        taskID,
 		Title:     node.Name,
@@ -156,7 +158,7 @@ func (e *TaskExecutor) Execute(taskID int32, node TaskNode, projectID string) {
 	if projectID != "" {
 		if fetchedTask, err := e.client.GetTask(context.Background(), projectID, taskID); err == nil && fetchedTask != nil {
 			task = *fetchedTask
-			task.ProjectID = projectID // 即使 API 未返回也确保 projectID 已设置
+			task.ProjectID = projectID // ensure projectID is set even if the API did not return it
 		}
 		if project, err := e.client.GetProject(context.Background(), e.cfg.Workspace.ID, projectID); err == nil && project != nil {
 			projectRepoURL = strings.TrimSpace(project.RepoURL)
@@ -165,8 +167,8 @@ func (e *TaskExecutor) Execute(taskID int32, node TaskNode, projectID string) {
 		}
 	}
 
-	// 1. 创建隔离的工作目录：{Root}/{workspaceID}/{projectID}/{taskID}/{agentID}
-	// 确保不同项目和代理的任务相互隔离
+	// 1. Create an isolated working directory: {Root}/{workspaceID}/{projectID}/{taskID}/{agentID}
+	// Ensure tasks of different projects and agents are isolated from each other
 	projectDir := "no-project"
 	if task.ProjectID != "" {
 		projectDir = task.ProjectID
@@ -186,7 +188,7 @@ func (e *TaskExecutor) Execute(taskID int32, node TaskNode, projectID string) {
 	e.nodeProjectID = projectID
 	e.mu.Unlock()
 
-	// 执行前检查磁盘配额
+	// Check disk quota before execution
 	if err := e.checkDiskQuota(workDir); err != nil {
 		log.Printf("[executor] disk quota check failed: %v", err)
 		e.notifyExecutionFailed(taskID, node.ID, err)
@@ -194,13 +196,15 @@ func (e *TaskExecutor) Execute(taskID int32, node TaskNode, projectID string) {
 		return
 	}
 
-	// 3. 初始化 Git 工作区
+	// 3. Initialize the Git workspace
 	e.git = NewGitManager(workDir)
 	gitReady := false
 
-	// Git 是否为必需：项目配了 repo_url，或存在 git 凭据时，都视为必需。
-	// 这样克隆/凭据失败会作为致命错误终止执行并上报，而不是静默降级为无 Git 继续执行
-	// （否则会进入"克隆可选仓库失败→log 后继续→后续 push origin master 失败"的链路，错误被吞掉）。
+	// Whether Git is required: if the project has repo_url configured, or git credentials
+	// exist, it is treated as required. This way a clone/credential failure terminates the
+	// execution as a fatal error and is reported, rather than silently degrading to running
+	// without Git (otherwise it would enter the path of "optional repo clone fails -> log
+	// and continue -> later push origin master fails", and the error would be swallowed).
 	gitRequired := projectRepoURL != ""
 	if task.ProjectID != "" {
 		var err error
@@ -212,9 +216,8 @@ func (e *TaskExecutor) Execute(taskID int32, node TaskNode, projectID string) {
 			return
 		}
 	}
-	// 如果没有 projectID，则在无 Git 的情况下工作——workDir 是一个全新的空目录
-
-	// 执行完成后清理 Git 凭据（askpass 脚本）
+	// If there is no projectID, work without Git — workDir is a fresh empty directory
+	// Clean up Git credentials (askpass script) after execution completes
 	if e.git != nil {
 		defer e.git.CleanupCredential()
 	}
@@ -231,7 +234,7 @@ func (e *TaskExecutor) Execute(taskID int32, node TaskNode, projectID string) {
 	}
 
 	if gitReady {
-		// 标记节点开始——使用节点的 SortOrder，而非从名称解析
+		// Tag the node start — use the node's SortOrder rather than parsing it from the name
 		nodeOrder := int(node.SortOrder)
 		if nodeOrder <= 0 {
 			nodeOrder = ParseNodeOrder(node.Name)
@@ -239,21 +242,21 @@ func (e *TaskExecutor) Execute(taskID int32, node TaskNode, projectID string) {
 		if err := e.git.TagNodeStart(taskID, nodeOrder, attempt); err != nil {
 			log.Printf("[executor] warning: failed to tag node start: %v", err)
 		}
-		// 向 Server 上报 Git 分支名称，以便前端显示
+		// Report the Git branch name to the Server so the frontend can display it
 		branch := BranchName(taskID)
 		if err := e.client.ReportGitBranch(context.Background(), taskID, branch); err != nil {
 			log.Printf("[executor] warning: failed to report git branch: %v", err)
 		}
 	}
 
-	// 4. 选择编码工具
+	// 4. Select the coding tool
 	t := e.selectTool()
 	e.mu.Lock()
 	e.currentTool = t
 	e.mu.Unlock()
 	e.notifyToolStatus(t.Name(), LocalToolConnected, nil)
 
-	// 如果可用，设置会话恢复（Claude Code 和 AtomCode 支持）
+	// Set up session recovery if available (supported by Claude Code and AtomCode)
 	if claudeTool, ok := t.(*tool.ClaudeTool); ok {
 		if e.sessionID != "" && e.lastWorkDir == workDir {
 			claudeTool.SetResumeSession(e.sessionID)
@@ -267,8 +270,9 @@ func (e *TaskExecutor) Execute(taskID int32, node TaskNode, projectID string) {
 			log.Printf("[executor] captured Claude session ID: %s", sid)
 		})
 	} else if atomTool, ok := t.(*tool.AtomCodeTool); ok {
-		// AtomCode 会话按目录作用域：上一轮已在本工作目录执行过即可续接（传 -c），
-		// 而非依赖解析出的 session_id（AtomCode 输出不含可解析的 session id）。
+		// AtomCode sessions are scoped by directory: if the previous turn already ran in this
+		// working directory, it can be continued (pass -c), rather than relying on a parsed
+		// session_id (AtomCode output contains no parseable session id).
 		if e.lastWorkDir == workDir {
 			atomTool.SetContinueSession(true)
 			log.Printf("[executor] continuing AtomCode session in %s", workDir)
@@ -285,8 +289,8 @@ func (e *TaskExecutor) Execute(taskID int32, node TaskNode, projectID string) {
 		log.Printf("[executor] prepared capabilities for %s: skills=%d mcp_servers=%d", t.Name(), capabilities.SkillCount, capabilities.MCPServerCount)
 	}
 
-	// 5. 使用上下文注入层级构建执行上下文
-	// 恢复 Claude 会话时使用简化上下文（--resume 保留了之前的推理）
+	// 5. Build the execution context using the context injection layer
+	// Use a simplified context when resuming a Claude session (--resume retains the previous reasoning)
 	isResume := e.sessionID != "" && e.lastWorkDir == workDir
 	prompt, err := e.buildPromptWithClient(taskID, node, task, isResume, capabilities.PromptCapabilities)
 	if err != nil {
@@ -295,15 +299,16 @@ func (e *TaskExecutor) Execute(taskID int32, node TaskNode, projectID string) {
 		return
 	}
 
-	// 6. 打印完整注入上下文，方便调试
+	// 6. Print the full injected context for debugging
 	log.Printf("[prompt] ====== Injected Prompt (task=%d, node=%s) ======", taskID, node.Name)
 	log.Printf("[prompt]\n%s", prompt)
 	log.Printf("[prompt] ====== End Prompt (len=%d) ======", len(prompt))
 
-	// 7. 使用编码工具执行，同时进行定期检查点提交
+	// 7. Execute with the coding tool, with periodic checkpoint commits in parallel
 	log.Printf("[executor] running %s with prompt len=%d", t.Name(), len(prompt))
 
-	// 启动检查点协程——定期提交工作，防止工具进程崩溃时丢失未提交的更改
+	// Start the checkpoint goroutine — periodically commits work to prevent losing uncommitted
+	// changes if the tool process crashes
 	checkpointDone := make(chan struct{})
 	go func() {
 		defer close(checkpointDone)
@@ -335,7 +340,8 @@ func (e *TaskExecutor) Execute(taskID int32, node TaskNode, projectID string) {
 		}
 	}()
 
-	// 启动超时检测协程——超时后通知前端，不中断 Claude 进程，由用户决定是否中止
+	// Start the timeout detection goroutine — on timeout it notifies the frontend without
+	// interrupting the Claude process; the user decides whether to abort
 	timeoutDone := make(chan struct{})
 	go func() {
 		defer close(timeoutDone)
@@ -351,30 +357,30 @@ func (e *TaskExecutor) Execute(taskID int32, node TaskNode, projectID string) {
 		select {
 		case <-timer.C:
 			log.Printf("[executor] node %s execution exceeded %v, notifying user", node.Name, timeout)
-			warning := fmt.Sprintf("⚠️ 节点执行已超过 %v，可能需要人工介入。您可以在任务详情页中断此任务。", timeout)
+			warning := fmt.Sprintf("⚠️ Node execution exceeded %v; manual intervention may be required. You can interrupt this task on the task detail page.", timeout)
 			if sendErr := e.client.SendMessageWithType(context.Background(), taskID, node.ID, "system", warning); sendErr != nil {
 				log.Printf("[executor] failed to send timeout warning: %v", sendErr)
 			}
 		case <-ctx.Done():
-			// 执行已完成或被中断，无需超时通知
+			// Execution completed or was interrupted, no timeout notification needed
 		}
 	}()
 
 	result, err := t.Execute(ctx, workDir, prompt, capabilities.ToolOptions, func(line string) {
-		// 实时输出——脱敏并记录日志
+		// Real-time output — desensitize and log
 		safeLine := desensitizeOutputLine(line)
 		log.Printf("[output] %s", safeLine)
-		// 捕获到本地日志缓冲区（供 local control API 读取/SSE 推送）
+		// Capture into the local log buffer (for the local control API to read / SSE push)
 		if e.logBuffer != nil {
 			e.logBuffer.Append(LogLine{TaskID: taskID, NodeID: node.ID, Line: safeLine})
 		}
-		// 将脱敏后的日志发送到服务器
+		// Send the desensitized log to the server
 		if sendErr := e.client.SendMessage(context.Background(), taskID, node.ID, safeLine); sendErr != nil {
 			log.Printf("[executor] failed to send message: %v", sendErr)
 		}
 	})
 
-	// 取消上下文以停止检查点协程，然后等待其完成
+	// Cancel the context to stop the checkpoint goroutine, then wait for it to finish
 	cancel()
 	<-checkpointDone
 	<-timeoutDone
@@ -391,7 +397,7 @@ func (e *TaskExecutor) Execute(taskID int32, node TaskNode, projectID string) {
 			return
 		}
 		e.notifyToolStatus(t.Name(), LocalToolDisconnected, err)
-		// 提交部分工作成果
+		// Commit partial work
 		if e.git != nil && e.git.IsGitRepo() {
 			e.git.CommitAll(fmt.Sprintf("teammate: partial work for %s (failed)", node.Name))
 			_ = e.pushIfNeeded(taskID, node, attempt)
@@ -401,7 +407,7 @@ func (e *TaskExecutor) Execute(taskID int32, node TaskNode, projectID string) {
 		return
 	}
 
-	// 从结果中捕获会话 ID（作为回调未触发时的备份）
+	// Capture the session ID from the result (as a backup in case the callback did not fire)
 	if result.SessionID != "" {
 		e.mu.Lock()
 		e.sessionID = result.SessionID
@@ -410,13 +416,14 @@ func (e *TaskExecutor) Execute(taskID int32, node TaskNode, projectID string) {
 		log.Printf("[executor] captured Claude session ID from result: %s", result.SessionID)
 	}
 
-	// 记录本工作目录已执行过（会话按目录作用域）：供同任务下一节点判断是否续接（-c/--resume）。
-	// 不同任务使用不同 workdir，因此天然隔离、不会串会话。
+	// Record that this working directory has been executed (sessions are scoped by directory):
+	// used by the next node of the same task to decide whether to continue (-c/--resume).
+	// Different tasks use different workdirs, so they are naturally isolated and sessions do not leak.
 	e.mu.Lock()
 	e.lastWorkDir = workDir
 	e.mu.Unlock()
 
-	// 7. 提交更改并推送到远程仓库
+	// 7. Commit changes and push to the remote repository
 	pushFailed := false
 	commitFailed := false
 	gitChanged := false
@@ -438,7 +445,7 @@ func (e *TaskExecutor) Execute(taskID int32, node TaskNode, projectID string) {
 			commitFailed = true
 		}
 		if !commitFailed {
-			// 标记节点完成——使用节点的 SortOrder，与 TagNodeStart 对应
+			// Tag the node complete — use the node's SortOrder, matching TagNodeStart
 			nodeOrder := int(node.SortOrder)
 			if nodeOrder <= 0 {
 				nodeOrder = ParseNodeOrder(node.Name)
@@ -453,7 +460,7 @@ func (e *TaskExecutor) Execute(taskID int32, node TaskNode, projectID string) {
 		}
 	}
 
-	// 8. 上报 Token 用量
+	// 8. Report Token usage
 	if result.TotalTokens > 0 {
 		usage := TokenUsageRequest{
 			InputTokens:  result.InputTokens,
@@ -465,7 +472,7 @@ func (e *TaskExecutor) Execute(taskID int32, node TaskNode, projectID string) {
 		}
 	}
 
-	// 9. 检查代理是否需要人工输入
+	// 9. Check whether the agent needs human input
 	if strings.Contains(result.Output, "<needs_input>") {
 		log.Printf("[executor] agent requests human input for node %s", node.Name)
 		comment := extractNeedsInputComment(result.Output)
@@ -485,7 +492,7 @@ func (e *TaskExecutor) Execute(taskID int32, node TaskNode, projectID string) {
 		return
 	}
 
-	// 10. 生成节点摘要
+	// 10. Generate the node summary
 	summary := e.generateSummary(workDir, t, taskID, node)
 	if summary != "" {
 		if err := e.client.ReportSummary(context.Background(), taskID, node.ID, summary); err != nil {
@@ -493,7 +500,7 @@ func (e *TaskExecutor) Execute(taskID int32, node TaskNode, projectID string) {
 		}
 	}
 
-	// 11. 根据节点类型处理完成逻辑
+	// 11. Handle the completion logic according to the node type
 	if commitFailed || pushFailed {
 		reason := "Git push failed after completion — manual review required"
 		if commitFailed {
@@ -509,14 +516,14 @@ func (e *TaskExecutor) Execute(taskID int32, node TaskNode, projectID string) {
 	}
 
 	if node.NodeType == "review" {
-		// Review 节点：不要自动批准。将结构化的审查结果作为评论发布。
+		// Review node: do not auto-approve. Post the structured review result as a comment.
 		reviewComment := fmt.Sprintf("## Review Completed\n\n**Node:** %s\n\n**Recommendation:** Review analysis complete. A human or authorized agent should make the approve/reject decision.\n\n**Summary:** %s", node.Name, summary)
 		if err := e.client.PostNodeComment(context.Background(), taskID, node.ID, "", "code_review", reviewComment); err != nil {
 			log.Printf("[executor] failed to post review comment: %v", err)
 		}
 		log.Printf("[executor] review node %s completed, waiting for review decision (approve/reject)", node.Name)
 	} else {
-		// 标准/手动节点：执行后自动完成
+		// Standard/manual node: auto-complete after execution
 		handoffComment := e.buildHandoffComment(taskID, node, summary, gitReady)
 		if err := e.client.CompleteNode(context.Background(), e.agentID, taskID, node.ID, handoffComment); err != nil {
 			log.Printf("[executor] failed to complete node: %v", err)
@@ -535,15 +542,16 @@ func (e *TaskExecutor) Execute(taskID int32, node TaskNode, projectID string) {
 	e.notifyExecutionCompleted(taskID, node.ID)
 }
 
-// initGitWorkspace 初始化 Git 工作区：克隆或拉取仓库、配置凭据，返回 Git 是否就绪。
+// initGitWorkspace initializes the Git workspace: clones or pulls the repository, configures
+// credentials, and returns whether Git is ready.
 //
-// 参数：
-//   - workDir: 工作目录路径
-//   - taskID: 任务 ID
-//   - projectID: 项目 ID
+// Args:
+//   - workDir: working directory path
+//   - taskID: task ID
+//   - projectID: project ID
 //
-// 返回：
-//   - bool: Git 工作区是否就绪
+// Returns:
+//   - bool: whether the Git workspace is ready
 func (e *TaskExecutor) initGitWorkspace(workDir string, taskID int32, projectID, projectRepoURL string, required bool) (bool, error) {
 	creds, err := e.client.GetGitCredentials(context.Background(), projectID)
 	if err != nil {
@@ -593,8 +601,9 @@ func (e *TaskExecutor) initGitWorkspace(workDir string, taskID int32, projectID,
 	if repoURL == "" && cred != nil {
 		repoURL = cred.RepoURL
 	}
-	// 项目配了 git 凭据（cred != nil）即说明项目想用 git——此时即使 projectRepoURL 为空，
-	// 也把 required 提升为 true，避免凭据对应的仓库克隆失败时被静默降级。
+	// The project having git credentials configured (cred != nil) means the project intends to
+	// use git — so even if projectRepoURL is empty, promote required to true here, to avoid a
+	// silent degradation when cloning the credential's repository fails.
 	if cred != nil && !required {
 		required = true
 	}
@@ -626,8 +635,9 @@ func (e *TaskExecutor) initGitWorkspace(workDir string, taskID int32, projectID,
 	baseBranch := e.cfg.Git.BaseBranch
 	if err := e.git.Clone(repoURL, baseBranch); err != nil {
 		e.git.CleanupCredential()
-		// required 已在上方根据 cred 提升；克隆失败一律视为致命错误，避免静默降级后
-		// 走到 initEmptyRepo 的 "push origin master" 又失败的链路，错误被吞掉。
+		// required was promoted above based on cred; a clone failure is always treated as a
+		// fatal error, to avoid silent degradation followed by the initEmptyRepo "push origin
+		// master" path failing again and the error being swallowed.
 		if required {
 			return false, fmt.Errorf("clone repository %s: %w", repoURL, err)
 		}
@@ -639,7 +649,7 @@ func (e *TaskExecutor) initGitWorkspace(workDir string, taskID int32, projectID,
 		if required {
 			return false, fmt.Errorf("checkout task branch: %w", err)
 		}
-		// 分支校验失败始终是致命的——在基础分支上操作是危险的
+		// Branch verification failure is always fatal — operating on the base branch is dangerous
 		if strings.Contains(err.Error(), "branch verification failed") {
 			return false, fmt.Errorf("checkout task branch: %w", err)
 		}
@@ -650,20 +660,21 @@ func (e *TaskExecutor) initGitWorkspace(workDir string, taskID int32, projectID,
 	return true, nil
 }
 
-// setupExistingRepo 处理工作目录已包含 Git 仓库的情况，从远程拉取并检出任务分支。
+// setupExistingRepo handles the case where the working directory already contains a Git
+// repository: it pulls from the remote and checks out the task branch.
 //
-// 参数：
-//   - taskID: 任务 ID
+// Args:
+//   - taskID: task ID
 //
-// 返回：
-//   - bool: 是否成功设置
+// Returns:
+//   - bool: whether the setup succeeded
 func (e *TaskExecutor) setupExistingRepo(taskID int32, required bool) (bool, error) {
 	baseBranch := e.cfg.Git.BaseBranch
 	if err := e.git.FetchAndCheckout(taskID, baseBranch); err != nil {
 		if required {
 			return false, fmt.Errorf("fetch/checkout required git repository: %w", err)
 		}
-		// 分支校验失败始终是致命的——在基础分支上操作是危险的
+		// Branch verification failure is always fatal — operating on the base branch is dangerous
 		if strings.Contains(err.Error(), "branch verification failed") {
 			return false, fmt.Errorf("fetch/checkout git repository: %w", err)
 		}
@@ -672,12 +683,12 @@ func (e *TaskExecutor) setupExistingRepo(taskID int32, required bool) (bool, err
 	return true, nil
 }
 
-// fetchAgentGitIdentity 从服务器获取代理的 Git 用户名和邮箱。
-// 用于配置 git config user.name 和 user.email。
+// fetchAgentGitIdentity fetches the agent's Git username and email from the server.
+// Used to configure git config user.name and user.email.
 //
-// 返回：
-//   - gitName: Git 用户名
-//   - gitEmail: Git 邮箱
+// Returns:
+//   - gitName: Git username
+//   - gitEmail: Git email
 func (e *TaskExecutor) fetchAgentGitIdentity() (gitName, gitEmail string) {
 	var agent struct {
 		GitName  string `json:"git_name"`
@@ -690,27 +701,27 @@ func (e *TaskExecutor) fetchAgentGitIdentity() (gitName, gitEmail string) {
 	return agent.GitName, agent.GitEmail
 }
 
-// pushIfNeeded 将当前分支和节点开始标签推送到远程仓库。
-// 分支推送失败会返回错误，标签推送失败仅记录日志。
+// pushIfNeeded pushes the current branch and the node start tag to the remote repository.
+// A branch push failure returns an error; a tag push failure only logs.
 //
-// 参数：
-//   - taskID: 任务 ID
-//   - node: 节点信息
-//   - attempt: 尝试次数
+// Args:
+//   - taskID: task ID
+//   - node: node information
+//   - attempt: attempt count
 //
-// 返回：
-//   - error: 分支推送失败时返回错误
+// Returns:
+//   - error: returns an error when the branch push fails
 func (e *TaskExecutor) pushIfNeeded(taskID int32, node TaskNode, attempt int) error {
 	if e.git == nil || !e.git.IsGitRepo() {
 		return nil
 	}
 
-	// 推送分支
+	// Push the branch
 	if err := e.git.PushBranch(taskID); err != nil {
 		return fmt.Errorf("failed to push branch: %w", err)
 	}
 
-	// 推送节点开始标签——使用节点的 SortOrder
+	// Push the node start tag — use the node's SortOrder
 	nodeOrder := int(node.SortOrder)
 	if nodeOrder <= 0 {
 		nodeOrder = ParseNodeOrder(node.Name)
@@ -719,7 +730,7 @@ func (e *TaskExecutor) pushIfNeeded(taskID int32, node TaskNode, attempt int) er
 	if err := e.git.PushTag(startTag); err != nil {
 		log.Printf("[executor] warning: failed to push tag %s: %v", startTag, err)
 	}
-	// 推送节点完成标签（若存在）——完成阶段已创建
+	// Push the node complete tag (if it exists) — created during the completion phase
 	completeTag := NodeCompleteTag(taskID, nodeOrder, attempt)
 	if err := e.git.PushTag(completeTag); err != nil {
 		log.Printf("[executor] warning: failed to push tag %s: %v", completeTag, err)
@@ -727,20 +738,22 @@ func (e *TaskExecutor) pushIfNeeded(taskID int32, node TaskNode, attempt int) er
 	return nil
 }
 
-// Stop 终止执行器，关闭停止信号通道。
+// Stop terminates the executor and closes the stop signal channel.
 func (e *TaskExecutor) Stop() {
 	close(e.stopCh)
 }
 
-// Interrupt 处理 task:interrupt 事件，强制停止当前执行并提交中断快照。
-// 流程：取消上下文 → 停止工具进程 → 强制 Git 提交 → 推送中断标签 → 上报中断确认。
+// Interrupt handles the task:interrupt event: forcibly stops the current execution and
+// commits an interrupt snapshot.
+// Flow: cancel context -> stop the tool process -> force a Git commit -> push the interrupt
+// tag -> report the interrupt confirmation.
 //
-// 参数：
-//   - taskID: 要中断的任务 ID
-//   - nodeID: 要中断的节点 ID
+// Args:
+//   - taskID: the task ID to interrupt
+//   - nodeID: the node ID to interrupt
 //
-// 返回：
-//   - error: 中断处理失败时返回错误
+// Returns:
+//   - error: returns an error when interrupt handling fails
 func (e *TaskExecutor) Interrupt(taskID int32, nodeID string) error {
 	e.currentMu.Lock()
 	running := e.running
@@ -760,14 +773,14 @@ func (e *TaskExecutor) Interrupt(taskID int32, nodeID string) error {
 	e.interrupted.Store(true)
 	e.notifyExecutionInterrupted(taskID, nodeID)
 
-	// 1. 取消执行上下文
+	// 1. Cancel the execution context
 	e.mu.Lock()
 	if e.cancelFunc != nil {
 		e.cancelFunc()
 	}
 	e.mu.Unlock()
 
-	// 2. 通过 Stop() 方法停止工具进程
+	// 2. Stop the tool process via the Stop() method
 	e.mu.Lock()
 	t := e.currentTool
 	e.mu.Unlock()
@@ -777,7 +790,7 @@ func (e *TaskExecutor) Interrupt(taskID int32, nodeID string) error {
 		}
 	}
 
-	// 3. 使用标签 interrupted/<node-id> 强制提交 git
+	// 3. Force a git commit using the tag interrupted/<node-id>
 	if e.git != nil && e.git.IsGitRepo() {
 		nodeOrder := int(currentNode.SortOrder)
 		if nodeOrder <= 0 {
@@ -786,7 +799,7 @@ func (e *TaskExecutor) Interrupt(taskID int32, nodeID string) error {
 		interruptMsg := fmt.Sprintf("chore: interrupted by admin [%d node-%d]", taskID, nodeOrder)
 		e.git.CommitAll(interruptMsg)
 
-		// 先在本地创建中断标签，再推送
+		// Create the interrupt tag locally first, then push it
 		tag := fmt.Sprintf("%s/node-%d-interrupted-%d", BranchName(taskID), nodeOrder, time.Now().Unix())
 		if err := e.git.CreateTag(tag); err != nil {
 			log.Printf("[executor] warning: failed to create local interrupt tag: %v", err)
@@ -794,13 +807,13 @@ func (e *TaskExecutor) Interrupt(taskID int32, nodeID string) error {
 			log.Printf("[executor] warning: failed to push interrupt tag: %v", err)
 		}
 
-		// 将中断的工作推送到远程
+		// Push the interrupted work to the remote
 		if err := e.git.PushBranch(taskID); err != nil {
 			log.Printf("[executor] warning: failed to push interrupted branch: %v", err)
 		}
 	}
 
-	// 4. 向服务器上报中断完成
+	// 4. Report the interrupt completion to the server
 	if err := e.client.ReportInterrupt(context.Background(), taskID, nodeID); err != nil {
 		log.Printf("[executor] failed to report interrupt: %v", err)
 	}
@@ -1066,14 +1079,14 @@ func (e *TaskExecutor) notifyToolStatus(provider string, status string, err erro
 	}
 }
 
-// IsRunning 返回执行器当前是否正在运行任务。
+// IsRunning returns whether the executor is currently running a task.
 func (e *TaskExecutor) IsRunning() bool {
 	e.currentMu.Lock()
 	defer e.currentMu.Unlock()
 	return e.running
 }
 
-// CurrentTask 返回当前正在运行的任务 ID 和节点信息。
+// CurrentTask returns the currently running task ID and node information.
 func (e *TaskExecutor) CurrentTask() (taskID int32, node TaskNode, ok bool) {
 	e.currentMu.Lock()
 	defer e.currentMu.Unlock()
@@ -1083,7 +1096,7 @@ func (e *TaskExecutor) CurrentTask() (taskID int32, node TaskNode, ok bool) {
 	return e.taskID, e.node, true
 }
 
-// GetGitManager 返回当前的 Git 管理器，如果不可用则返回 nil。
+// GetGitManager returns the current Git manager, or nil if unavailable.
 func (e *TaskExecutor) GetGitManager() *GitManager {
 	e.currentMu.Lock()
 	defer e.currentMu.Unlock()
@@ -1165,12 +1178,12 @@ func (a testToolAdapter) Execute(ctx context.Context, workDir, prompt string, _ 
 func (a testToolAdapter) Stop() error       { return a.inner.Stop() }
 func (a testToolAdapter) IsInstalled() bool { return a.inner.IsInstalled() }
 
-// selectTool 根据配置选择合适的编码工具。
-// selectTool 根据 AgentInfo.Provider 选择编码工具。
-// Provider 为必填字段，在配置加载时已校验。
+// selectTool selects the appropriate coding tool based on the configuration.
+// selectTool selects the coding tool based on AgentInfo.Provider.
+// Provider is a required field, validated at configuration load time.
 //
-// 返回:
-//   - tool.Tool: 选中的编码工具适配器实例
+// Returns:
+//   - tool.Tool: the selected coding tool adapter instance
 func (e *TaskExecutor) selectTool() tool.Tool {
 	if e.toolFactoryForTest != nil {
 		return testToolAdapter{inner: e.toolFactoryForTest()}
@@ -1180,8 +1193,8 @@ func (e *TaskExecutor) selectTool() tool.Tool {
 	return tool.GetTool(provider, path)
 }
 
-// toolPath 返回指定 provider 的可执行文件路径。
-// 默认值由各工具构造函数处理，此处仅从配置中读取。
+// toolPath returns the executable path for the specified provider.
+// Default values are handled by each tool's constructor; here it only reads from the configuration.
 func (e *TaskExecutor) toolPath(provider string) string {
 	switch strings.ToLower(provider) {
 	case "claude":
@@ -1226,36 +1239,36 @@ func HasDuplicateAgentComment(comments []Comment, agentID, commentType, content 
 
 func (e *TaskExecutor) buildHandoffComment(taskID int32, node TaskNode, summary string, gitReady bool) string {
 	var sb strings.Builder
-	sb.WriteString("## 节点交接\n\n")
-	sb.WriteString(fmt.Sprintf("- 来源节点：%s (%s)\n", node.Name, node.ID))
-	sb.WriteString(fmt.Sprintf("- 执行者：%s\n", e.cfg.Agent.Name))
+	sb.WriteString("## Node Handoff\n\n")
+	sb.WriteString(fmt.Sprintf("- Source Node: %s (%s)\n", node.Name, node.ID))
+	sb.WriteString(fmt.Sprintf("- Executor: %s\n", e.cfg.Agent.Name))
 	if gitReady {
-		sb.WriteString(fmt.Sprintf("- Git 分支：%s\n", BranchName(taskID)))
+		sb.WriteString(fmt.Sprintf("- Git Branch: %s\n", BranchName(taskID)))
 	}
 	if summary != "" {
-		sb.WriteString("\n### 执行摘要\n")
+		sb.WriteString("\n### Execution Summary\n")
 		sb.WriteString(summary)
 		sb.WriteString("\n")
 	} else {
-		sb.WriteString("\n### 执行摘要\n当前节点已完成，但未生成额外摘要。\n")
+		sb.WriteString("\n### Execution Summary\nCurrent node has completed, but no additional summary was generated.\n")
 	}
-	sb.WriteString("\n### 下个节点注意事项\n请基于当前仓库状态和本交接信息继续执行；代码状态以 Git 工作区为准，非代码上下文以当前节点评论区为准。")
+	sb.WriteString("\n### Notes for Next Node\nPlease continue execution based on the current repository state and this handoff information. Code state is subject to the Git working directory, and non-code context is subject to the current node's comment area.")
 	return sb.String()
 }
 
-// buildPromptWithClient 使用上下文注入层级构建执行上下文 prompt。
+// buildPromptWithClient builds the execution context prompt using the context injection layer.
 func (e *TaskExecutor) buildPromptWithClient(taskID int32, node TaskNode, task Task, isResume bool, caps PromptCapabilities) (string, error) {
 	context, err := BuildExecutionContextWithCapabilities(e.client, e.cfg, task, node, isResume, caps)
 	if err != nil {
 		return "", fmt.Errorf("build execution context: %w", err)
 	}
 
-	// 追加协作工具说明
+	// Append collaboration tool instructions
 	context += "\n## Collaboration Tools\n"
 	context += "You can use the following tool to communicate with your team:\n"
 	context += "- Request human input: output `<needs_input>your question here</needs_input>` to pause the task and let Teammate post the question once.\n"
 
-	// 追加输出要求
+	// Append output requirements
 	context += "\n## Output Requirements\n"
 	context += "- All task results MUST be written to files in the working directory.\n"
 	context += "- Do not just output results to the terminal — they will not be saved.\n"
@@ -1265,12 +1278,13 @@ func (e *TaskExecutor) buildPromptWithClient(taskID int32, node TaskNode, task T
 	return context, nil
 }
 
-// reportFailure 将执行失败信息上报为 manual_intervention 状态，请求人工介入处理。
+// reportFailure reports the execution failure as a manual_intervention status, requesting
+// human intervention.
 //
-// 参数:
-//   - taskID: 任务 ID
-//   - nodeID: 节点 ID
-//   - err: 导致失败的错误
+// Args:
+//   - taskID: task ID
+//   - nodeID: node ID
+//   - err: the error that caused the failure
 func (e *TaskExecutor) reportFailure(taskID int32, nodeID string, err error) {
 	comment := fmt.Sprintf("Execution failed: %v\nManual intervention required.", err)
 	if reportErr := e.client.ManualIntervention(context.Background(), e.agentID, taskID, nodeID, comment); reportErr != nil {
@@ -1278,17 +1292,17 @@ func (e *TaskExecutor) reportFailure(taskID int32, nodeID string, err error) {
 	}
 }
 
-// ParseNodeOrder 从节点名称中提取节点序号（例如 "1. 需求分析" 返回 1）。
+// ParseNodeOrder extracts the node sequence number from the node name (e.g. "1. Requirements Analysis" returns 1).
 func ParseNodeOrder(name string) int {
 	order := 0
 	fmt.Sscanf(name, "%d.", &order)
 	return order
 }
 
-// generateSummary 为已完成的节点生成工作摘要，
-// 复用同一编码工具会话以保留执行过程的完整上下文。
+// generateSummary generates a work summary for the completed node,
+// reusing the same coding tool session to retain the full context of the execution process.
 func (e *TaskExecutor) generateSummary(workDir string, t tool.Tool, taskID int32, node TaskNode) string {
-	// 设置会话恢复，使摘要调用延续同一个会话
+	// Set up session recovery so the summary call continues the same session
 	if claudeTool, ok := t.(*tool.ClaudeTool); ok {
 		e.mu.Lock()
 		sid := e.sessionID
@@ -1326,7 +1340,7 @@ func (e *TaskExecutor) generateSummary(workDir string, t tool.Tool, taskID int32
 	}
 
 	summary := strings.TrimSpace(result.Output)
-	// 清理：必要时从 stream-json 中提取文本
+	// Cleanup: extract text from stream-json if necessary
 	summary = cleanSummaryOutput(summary)
 	if len(summary) > 500 {
 		summary = summary[:497] + "..."
@@ -1334,20 +1348,20 @@ func (e *TaskExecutor) generateSummary(workDir string, t tool.Tool, taskID int32
 	return summary
 }
 
-// cleanSummaryOutput 从可能包含 JSON 格式的输出中提取纯文本。
+// cleanSummaryOutput extracts plain text from output that may contain JSON formatting.
 func cleanSummaryOutput(output string) string {
-	// 如果输出看起来像 stream-json，尝试从 "result" 类型行提取文本
+	// If the output looks like stream-json, try to extract text from "result" type lines
 	var texts []string
 	for _, line := range strings.Split(output, "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" || !strings.HasPrefix(line, "{") {
-			// 纯文本行
+			// Plain text line
 			if line != "" {
 				texts = append(texts, line)
 			}
 			continue
 		}
-		// 尝试解析为 JSON 并提取文本
+		// Try to parse as JSON and extract text
 		var obj map[string]json.RawMessage
 		if err := json.Unmarshal([]byte(line), &obj); err != nil {
 			texts = append(texts, line)
@@ -1370,19 +1384,19 @@ func cleanSummaryOutput(output string) string {
 	return strings.Join(texts, "\n")
 }
 
-// needsInputRegex 用于匹配 <needs_input> 标签中的内容。
+// needsInputRegex is used to match the content inside <needs_input> tags.
 var needsInputRegex = regexp.MustCompile(`(?s)<needs_input>(.*?)</needs_input>`)
 
-// extractNeedsInputComment 从 <needs_input>...</needs_input> 块中提取评论内容。
+// extractNeedsInputComment extracts the comment content from a <needs_input>...</needs_input> block.
 func extractNeedsInputComment(output string) string {
 	matches := needsInputRegex.FindStringSubmatch(output)
 	if len(matches) > 1 {
 		return strings.TrimSpace(matches[1])
 	}
-	// 如果没有闭合标签，尝试获取 <needs_input> 之后的文本
+	// If there is no closing tag, try to get the text after <needs_input>
 	if idx := strings.Index(output, "<needs_input>"); idx >= 0 {
 		remaining := strings.TrimSpace(output[idx+len("<needs_input>"):])
-		// 最多取 500 个字符
+		// Take at most 500 characters
 		if len(remaining) > 500 {
 			remaining = remaining[:500]
 		}
@@ -1391,17 +1405,17 @@ func extractNeedsInputComment(output string) string {
 	return ""
 }
 
-// checkDiskQuota 检查工作目录的磁盘使用量是否超过配额限制。
-// 默认配额为 10GB，可通过 TEAMMATE_DISK_QUOTA_GB 环境变量配置。
-// 达到 80% 配额时发出警告，超过配额时返回错误。
+// checkDiskQuota checks whether the disk usage of the working directory exceeds the quota limit.
+// The default quota is 10GB, configurable via the TEAMMATE_DISK_QUOTA_GB environment variable.
+// A warning is issued at 80% of the quota; an error is returned when the quota is exceeded.
 //
-// 参数:
-//   - workDir: 要检查的工作目录路径
+// Args:
+//   - workDir: the working directory path to check
 //
-// 返回:
-//   - error: 磁盘配额超限时返回错误
+// Returns:
+//   - error: returns an error when the disk quota is exceeded
 func (e *TaskExecutor) checkDiskQuota(workDir string) error {
-	maxSizeGB := int64(10) // 默认 10GB
+	maxSizeGB := int64(10) // default 10GB
 	if maxStr := os.Getenv("TEAMMATE_DISK_QUOTA_GB"); maxStr != "" {
 		if max, err := strconv.ParseInt(maxStr, 10, 64); err == nil {
 			maxSizeGB = max

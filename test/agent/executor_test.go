@@ -1,4 +1,4 @@
-// Package agent_test 包含 agent 包的测试，涵盖 shell 转义、执行上下文构建、Git 操作和代理守护进程使用的 Token 估算。
+// Package agent_test contains tests for the agent package, covering shell escaping, execution context construction, Git operations, and Token estimation used by the agent daemon.
 package agent_test
 
 import (
@@ -8,18 +8,18 @@ import (
 	"github.com/teammate/agentd/internal/agent"
 )
 
-// TestParseNodeOrder 验证 ParseNodeOrder 能从节点名称中正确提取数字前缀（例如 "3. 代码实现" → 3），并在无数字前缀时返回 0。
+// TestParseNodeOrder verifies that ParseNodeOrder correctly extracts a numeric prefix from a node name (e.g. "3. Implementation" → 3), and returns 0 when there is no numeric prefix.
 func TestParseNodeOrder(t *testing.T) {
 	tests := []struct {
 		name  string
 		input string
 		want  int
 	}{
-		{"numbered", "1. 需求分析", 1},
-		{"numbered2", "3. 代码实现", 3},
+		{"numbered", "1. Requirement Analysis", 1},
+		{"numbered2", "3. Implementation", 3},
 		{"no number", "review", 0},
 		{"empty", "", 0},
-		{"double digit", "12. 测试", 12},
+		{"double digit", "12. Test", 12},
 	}
 
 	for _, tt := range tests {
@@ -32,7 +32,7 @@ func TestParseNodeOrder(t *testing.T) {
 	}
 }
 
-// TestTaskExecutor_IsRunning 验证新创建的 TaskExecutor 在开始任务执行前 IsRunning() 返回 false。
+// TestTaskExecutor_IsRunning verifies that a newly created TaskExecutor returns false from IsRunning() before task execution begins.
 func TestTaskExecutor_IsRunning(t *testing.T) {
 	cfg := &agent.Config{
 		Workspace: agent.WorkspaceConfig{Root: t.TempDir()},
@@ -46,7 +46,7 @@ func TestTaskExecutor_IsRunning(t *testing.T) {
 	}
 }
 
-// TestTaskExecutor_CurrentTask_NotRunning 验证在未运行的 executor 上调用 CurrentTask 返回 ok=false，以及零值任务 ID 和 nil 节点。
+// TestTaskExecutor_CurrentTask_NotRunning verifies that calling CurrentTask on a non-running executor returns ok=false, along with a zero-value task ID and a nil node.
 func TestTaskExecutor_CurrentTask_NotRunning(t *testing.T) {
 	cfg := &agent.Config{
 		Workspace: agent.WorkspaceConfig{Root: t.TempDir()},
@@ -62,7 +62,7 @@ func TestTaskExecutor_CurrentTask_NotRunning(t *testing.T) {
 	if taskID != 0 {
 		t.Errorf("taskID = %d, want 0", taskID)
 	}
-	_ = node // 仅确保它能编译通过
+	_ = node // just ensure it compiles
 }
 
 func TestTaskExecutorObserverReportsExecutionLifecycle(t *testing.T) {

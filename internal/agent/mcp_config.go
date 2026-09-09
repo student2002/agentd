@@ -1,4 +1,4 @@
-// mcp_config.go 生成 MCP 服务器配置文件并管理其生命周期。
+// mcp_config.go generates the MCP server config file and manages its lifecycle.
 package agent
 
 import (
@@ -23,8 +23,10 @@ type MCPServerToolConfig struct {
 
 var invalidMCPNameChars = regexp.MustCompile(`[^A-Za-z0-9_.-]+`)
 
-// WriteAgentMCPConfig 获取代理已启用的 MCP 绑定并写入本地工具配置文件。
-// 文件以 0600 权限写入，因为环境变量可能包含凭据。
+// WriteAgentMCPConfig fetches the agent's enabled MCP bindings and writes them to
+// the local tool config file.
+// The file is written with 0600 permissions because the environment variables
+// may contain credentials.
 func WriteAgentMCPConfig(ctx context.Context, client *Client, cfg *Config, workDir string) (string, []AgentMcpServerContext, error) {
 	if client == nil || cfg == nil || cfg.Workspace.ID == "" || cfg.Agent.ID == "" {
 		return "", nil, nil
@@ -54,7 +56,7 @@ func WriteAgentMCPConfig(ctx context.Context, client *Client, cfg *Config, workD
 	if err := os.WriteFile(path, data, 0600); err != nil {
 		return "", enabled, fmt.Errorf("write mcp config: %w", err)
 	}
-	// 将 .teammate/mcp.json 加入 git exclude，避免提交到仓库（best-effort，不阻断）
+	// Add .teammate/mcp.json to git exclude to avoid committing it to the repo (best-effort, non-blocking)
 	_ = appendToGitExclude(workDir, ".teammate/mcp.json")
 	return path, enabled, nil
 }
@@ -147,49 +149,51 @@ func inferMCPTransport(server AgentMcpServerContext) string {
 	return "http"
 }
 
-// appendToGitExclude 将指定模式添加到仓库的 .git/info/exclude 文件中。
-// 如果模式已存在，则不重复添加。
-// 如果 .git/info/exclude 文件不存在或无法写入，则静默忽略——这是一个
-// best-effort 操作，失败不应阻断 MCP config 生成。
+// appendToGitExclude adds the specified pattern to the repository's
+// .git/info/exclude file.
+// If the pattern already exists, it is not added again.
+// If the .git/info/exclude file does not exist or cannot be written, it is
+// silently ignored — this is a best-effort operation, and failure should not
+// block MCP config generation.
 //
-// 参数：
-//   - workDir: 工作目录（仓库根目录）
-//   - pattern: 要排除的文件模式（如 ".teammate/mcp.json"）
+// Parameters:
+//   - workDir: the work directory (repository root)
+//   - pattern: the file pattern to exclude (e.g. ".teammate/mcp.json")
 func appendToGitExclude(workDir, pattern string) error {
 	gitDir := filepath.Join(workDir, ".git")
 	infoDir := filepath.Join(gitDir, "info")
 	excludeFile := filepath.Join(infoDir, "exclude")
 
-	// .git 可能是 worktree 文件（内容为 "gitdir: ..."），不是目录
+	// .git may be a worktree file (content "gitdir: ..."), not a directory
 	gitStat, err := os.Stat(gitDir)
 	if err != nil {
-		return nil // 非 Git 仓库，静默忽略
+		return nil // not a Git repository, silently ignore
 	}
 	if !gitStat.IsDir() {
-		return nil // git worktree 场景，info/exclude 不可写
+		return nil // git worktree scenario, info/exclude is not writable
 	}
 	if _, err := os.Stat(infoDir); os.IsNotExist(err) {
-		return nil // info/ 不存在，跳过
+		return nil // info/ does not exist, skip
 	}
 
 	data, err := os.ReadFile(excludeFile)
 	if err != nil {
-		return nil // exclude 文件不可读，静默忽略
+		return nil // exclude file not readable, silently ignore
 	}
 
 	patternLine := pattern + "\n"
 	if strings.Contains(string(data), patternLine) {
-		return nil // 已存在，不重复添加
+		return nil // already exists, do not add again
 	}
 
 	f, err := os.OpenFile(excludeFile, os.O_APPEND|os.O_WRONLY, 0644)
 	if err != nil {
-		return nil // 无法写入，静默忽略
+		return nil // not writable, silently ignore
 	}
 	defer f.Close()
 
 	if _, err := f.WriteString(patternLine); err != nil {
-		return nil // 写入失败，静默忽略
+		return nil // write failed, silently ignore
 	}
 	return nil
 }

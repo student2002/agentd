@@ -1,4 +1,4 @@
-// config.go 提供 Agent Daemon 的配置管理功能。
+// config.go provides config management for the Agent Daemon.
 package agent
 
 import (
@@ -11,7 +11,7 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// Config 表示守护进程的完整配置。
+// Config represents the complete configuration of the daemon.
 type Config struct {
 	Server    ServerConfig    `yaml:"server"`
 	Agent     AgentInfo       `yaml:"agent"`
@@ -22,13 +22,13 @@ type Config struct {
 	Debug     bool            `yaml:"debug,omitempty"`
 }
 
-// ServerConfig 表示服务器连接配置。
+// ServerConfig represents the server connection configuration.
 type ServerConfig struct {
 	URL      string `yaml:"url"`
 	APIToken string `yaml:"api_token"`
 }
 
-// AgentInfo 表示代理的基本信息。
+// AgentInfo represents the basic information of the agent.
 type AgentInfo struct {
 	ID            string `yaml:"id"`
 	Name          string `yaml:"name"`
@@ -36,13 +36,13 @@ type AgentInfo struct {
 	Provider      string `yaml:"provider"`
 }
 
-// WorkspaceConfig 表示工作区配置。
+// WorkspaceConfig represents the workspace configuration.
 type WorkspaceConfig struct {
 	ID   string `yaml:"id"`
 	Root string `yaml:"root"`
 }
 
-// ToolsConfig 表示编码工具配置。
+// ToolsConfig represents the coding tools configuration.
 type ToolsConfig struct {
 	Claude   ToolConfig `yaml:"claude"`
 	OpenClaw ToolConfig `yaml:"openclaw"`
@@ -51,17 +51,17 @@ type ToolsConfig struct {
 	MiMoCode ToolConfig `yaml:"mimocode"`
 }
 
-// ToolConfig 表示单个编码工具的配置。
+// ToolConfig represents the configuration of a single coding tool.
 type ToolConfig struct {
 	Path string `yaml:"path"`
 }
 
-// GitConfig 表示 Git 相关配置。
+// GitConfig represents the Git-related configuration.
 type GitConfig struct {
 	BaseBranch string `yaml:"base_branch"`
 }
 
-// LocalConfig 表示本机控制 API 配置。
+// LocalConfig represents the local control API configuration.
 type LocalConfig struct {
 	Enabled    bool   `yaml:"enabled"`
 	BindAddr   string `yaml:"bind_addr"`
@@ -69,7 +69,7 @@ type LocalConfig struct {
 	InstanceID string `yaml:"instance_id"`
 }
 
-// DefaultConfigPath 返回默认配置文件路径。
+// DefaultConfigPath returns the default config file path.
 func DefaultConfigPath() string {
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -78,7 +78,7 @@ func DefaultConfigPath() string {
 	return filepath.Join(home, ".teammate", "config.yaml")
 }
 
-// LoadConfig 从 YAML 文件加载配置并设置运行时默认值。
+// LoadConfig loads the config from a YAML file and applies runtime defaults.
 func LoadConfig(path string) (*Config, error) {
 	if path == "" {
 		path = DefaultConfigPath()
@@ -227,7 +227,7 @@ func boolValue(raw map[string]interface{}, key string) bool {
 	return ok && value
 }
 
-// ValidateConfig 校验 daemon 启动所需的必填配置。
+// ValidateConfig validates the required config needed to start the daemon.
 func ValidateConfig(cfg *Config) error {
 	if cfg.Agent.Provider == "" {
 		return fmt.Errorf("agent.provider is required; supported providers: claude, openclaw, opencode, atomcode, mimocode")
@@ -249,7 +249,7 @@ func ValidateConfig(cfg *Config) error {
 	return nil
 }
 
-// SaveConfig 将配置以稀疏 YAML 写入文件。
+// SaveConfig writes the config to a file as sparse YAML.
 func SaveConfig(cfg *Config, path string) error {
 	if path == "" {
 		path = DefaultConfigPath()
@@ -266,7 +266,7 @@ func SaveConfig(cfg *Config, path string) error {
 	return os.WriteFile(path, data, 0600)
 }
 
-// MarshalConfigYAML 将配置转换为不包含无意义空字段的 YAML。
+// MarshalConfigYAML converts the config to YAML without meaningless empty fields.
 func MarshalConfigYAML(cfg *Config) ([]byte, error) {
 	return yaml.Marshal(sparseConfigMap(cfg))
 }
@@ -354,7 +354,7 @@ func addMap(parent map[string]interface{}, key string, value map[string]interfac
 	}
 }
 
-// expandHome 将路径中的 ~/ 前缀展开为用户实际主目录路径。
+// expandHome expands the ~/ prefix in a path to the user's actual home directory path.
 func expandHome(path string) string {
 	if strings.HasPrefix(path, "~/") {
 		home, err := os.UserHomeDir()

@@ -1,6 +1,6 @@
 //go:build windows
 
-// manager_windows.go 提供 Windows 平台的进程管理实现。
+// manager_windows.go provides the Windows process management implementation.
 package process
 
 import (

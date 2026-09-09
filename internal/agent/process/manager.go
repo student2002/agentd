@@ -1,4 +1,4 @@
-// Package process 提供用于管理工具进程的跨平台辅助函数。
+// Package process provides cross-platform helpers for managing tool processes.
 package process
 
 import (
@@ -8,12 +8,12 @@ import (
 
 const DefaultTerminateTimeout = 5 * time.Second
 
-// PrepareCommand 在 Start 之前应用平台特定的进程属性。
+// PrepareCommand applies platform-specific process attributes before Start.
 func PrepareCommand(cmd *exec.Cmd) {
 	prepareCommand(cmd)
 }
 
-// TerminateTree 终止 cmd 及其子进程。
+// TerminateTree terminates cmd and its child processes.
 func TerminateTree(cmd *exec.Cmd, timeout time.Duration) error {
 	if timeout <= 0 {
 		timeout = DefaultTerminateTimeout

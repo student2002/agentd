@@ -1,6 +1,6 @@
 //go:build !windows
 
-// manager_unix.go 提供 Unix 平台的进程管理实现。
+// manager_unix.go provides the Unix process management implementation.
 package process
 
 import (

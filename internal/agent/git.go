@@ -1,15 +1,21 @@
-// git.go 封装 Git 版本控制操作，为任务执行提供完整的仓库管理能力。
+// git.go encapsulates Git version control operations, providing full repository
+// management capabilities for task execution.
 //
-// 本文件提供 Agent Daemon 执行任务时所需的 Git 操作，主要包括：
-//   - GitManager 结构体：封装工作目录级别的 Git 操作，支持凭据管理和标签追踪
-//   - Clone / FetchAndCheckout：仓库克隆和分支检出，处理空仓库和分支不存在等边界情况
-//   - ConfigureCredential / CleanupCredential：临时 askpass 脚本管理，安全注入 Git PAT
-//   - PushBranch / PushTag / CommitAll：代码提交和推送操作
-//   - TagNodeStart / ResetToNode：节点级别的标签创建和状态回退
-//   - BranchName / NodeStartTag：分支和标签命名规范生成
+// This file provides the Git operations required by the Agent Daemon when
+// executing tasks, mainly including:
+//   - GitManager struct: encapsulates workdir-level Git operations, supporting
+//     credential management and tag tracking
+//   - Clone / FetchAndCheckout: repository cloning and branch checkout, handling
+//     edge cases such as empty repos and missing branches
+//   - ConfigureCredential / CleanupCredential: temporary askpass script
+//     management, safely injecting the Git PAT
+//   - PushBranch / PushTag / CommitAll: code commit and push operations
+//   - TagNodeStart / ResetToNode: node-level tag creation and state rollback
+//   - BranchName / NodeStartTag: branch and tag naming convention generation
 //
-// 分支命名规范：teammate/task-{taskID}
-// 标签命名规范：teammate/task-{taskID}/node-{order}/attempt-{attempt}/start
+// Branch naming convention: teammate/task-{taskID}
+// Tag naming convention:
+// teammate/task-{taskID}/node-{order}/attempt-{attempt}/start
 package agent
 
 import (
@@ -23,35 +29,38 @@ import (
 	"github.com/teammate/agentd/internal/clock"
 )
 
-// GitManager 封装 Git 操作，为任务执行提供仓库克隆、分支管理、
-// 凭据配置、标签创建和代码重置等功能。
+// GitManager encapsulates Git operations, providing repository cloning, branch
+// management, credential configuration, tag creation, and code reset for task
+// execution.
 type GitManager struct {
 	workDir     string
-	env         []string // 额外环境变量（如 GIT_ASKPASS）
+	env         []string // extra environment variables (e.g. GIT_ASKPASS)
 	askpassPath string
 	clk         clock.Clock
 }
 
-// NewGitManager 创建一个新的 Git 管理器。
+// NewGitManager creates a new Git manager.
 func NewGitManager(workDir string) *GitManager {
 	return &GitManager{workDir: workDir, clk: clock.RealClock{}}
 }
 
-// Clone 将远程仓库克隆到工作目录。
-// 如果工作目录已包含 Git 仓库则确保远程 origin 可用并 fetch。
-// 克隆后确保 master 分支存在：远程没有 master 则从远程默认分支创建一个。
+// Clone clones the remote repository into the work directory.
+// If the work directory already contains a Git repository, it ensures the remote
+// origin is available and fetches.
+// After cloning it ensures the master branch exists: if the remote has no
+// master, one is created from the remote default branch.
 func (g *GitManager) Clone(repoURL, baseBranch string) error {
 	if g.IsGitRepo() {
-		// 仓库已存在——确保远程 origin 已配置且可 fetch
+		// Repository already exists — ensure the remote origin is configured and fetchable
 		return g.ensureRemoteOrigin(repoURL, baseBranch)
 	}
 
-	// 确保父目录存在
+	// Ensure the parent directory exists
 	if err := os.MkdirAll(g.workDir, 0755); err != nil {
 		return fmt.Errorf("mkdir %s: %w", g.workDir, err)
 	}
 
-	// 先尝试用 master 克隆
+	// First try to clone using master
 	args := []string{"clone", "--branch", baseBranch, repoURL, g.workDir}
 	cmd := exec.Command("git", args...)
 	cmd.Env = append(os.Environ(), g.env...)
@@ -59,17 +68,21 @@ func (g *GitManager) Clone(repoURL, baseBranch string) error {
 		g.ensureGitignore()
 		return nil
 	}
-	// 指定分支克隆失败可能是远程没有该分支，也可能是仓库根本不存在 / 无权限。
-	// 后者由下面的不带 --branch 克隆捕获——若该次也失败，则原样返回错误。
+	// Cloning with a specified branch may fail because the remote lacks that
+	// branch, or because the repository does not exist / no permission.
+	// The latter is caught by the clone without --branch below — if that also
+	// fails, the error is returned as-is.
 
-	// 降级方案：不带 --branch 克隆（远程没有 master 或为空）
+	// Fallback: clone without --branch (the remote has no master or is empty)
 	args = []string{"clone", repoURL, g.workDir}
 	cmd = exec.Command("git", args...)
 	cmd.Env = append(os.Environ(), g.env...)
 	if err := cmd.Run(); err != nil {
-		// 克隆彻底失败（仓库不存在 / 无访问权限）——直接返回错误，不要降级到
-		// initEmptyRepo。否则会在本地建一个空仓库，ConfigureCredential 注入的 PAT
-		// 在后续 push origin master 时再次失败，错误被静默吞掉。
+		// Clone completely failed (repo does not exist / no access) — return the
+		// error directly, do not fall back to initEmptyRepo. Otherwise an empty
+		// repo would be created locally, and the PAT injected by
+		// ConfigureCredential would fail again on the subsequent push origin
+		// master, with the error silently swallowed.
 		return fmt.Errorf("git clone %s: %w", repoURL, err)
 	}
 
@@ -77,20 +90,21 @@ func (g *GitManager) Clone(repoURL, baseBranch string) error {
 		return g.initEmptyRepo(repoURL, baseBranch)
 	}
 
-	// 确保 master 分支存在——缺失时从远程默认分支创建
+	// Ensure the master branch exists — if missing, create it from the remote default branch
 	g.ensureGitignore()
 	return g.ensureMasterBranch(baseBranch)
 }
 
-// initEmptyRepo 初始化一个全新的 Git 仓库并推送基础分支，用于远程仓库完全为空的情况。
+// initEmptyRepo initializes a brand-new Git repository and pushes the base
+// branch, used when the remote repository is completely empty.
 func (g *GitManager) initEmptyRepo(repoURL, baseBranch string) error {
-	// 清理不完整的克隆
+	// Clean up the incomplete clone
 	os.RemoveAll(g.workDir)
 	if err := os.MkdirAll(g.workDir, 0755); err != nil {
 		return fmt.Errorf("mkdir %s: %w", g.workDir, err)
 	}
 
-	// 初始化新仓库
+	// Initialize a new repository
 	cmd := exec.Command("git", "init")
 	cmd.Dir = g.workDir
 	cmd.Env = append(os.Environ(), g.env...)
@@ -98,7 +112,7 @@ func (g *GitManager) initEmptyRepo(repoURL, baseBranch string) error {
 		return fmt.Errorf("git init: %s: %w", string(out), err)
 	}
 
-	// 添加远程 origin
+	// Add the remote origin
 	cmd = exec.Command("git", "remote", "add", "origin", repoURL)
 	cmd.Dir = g.workDir
 	cmd.Env = append(os.Environ(), g.env...)
@@ -106,7 +120,7 @@ func (g *GitManager) initEmptyRepo(repoURL, baseBranch string) error {
 		return fmt.Errorf("git remote add: %s: %w", string(out), err)
 	}
 
-	// 创建初始提交以确保基础分支存在
+	// Create an initial commit to ensure the base branch exists
 	g.ensureGitignore()
 	placeholder := filepath.Join(g.workDir, ".gitkeep")
 	if err := os.WriteFile(placeholder, []byte(""), 0644); err != nil {
@@ -127,7 +141,7 @@ func (g *GitManager) initEmptyRepo(repoURL, baseBranch string) error {
 		return fmt.Errorf("git commit: %s: %w", string(out), err)
 	}
 
-	// 将当前分支重命名为基础分支
+	// Rename the current branch to the base branch
 	cmd = exec.Command("git", "branch", "-M", baseBranch)
 	cmd.Dir = g.workDir
 	cmd.Env = append(os.Environ(), g.env...)
@@ -135,7 +149,7 @@ func (g *GitManager) initEmptyRepo(repoURL, baseBranch string) error {
 		return fmt.Errorf("git branch -M %s: %s: %w", baseBranch, string(out), err)
 	}
 
-	// 将基础分支推送到 origin
+	// Push the base branch to origin
 	cmd = exec.Command("git", "push", "-u", "origin", baseBranch)
 	cmd.Dir = g.workDir
 	cmd.Env = append(os.Environ(), g.env...)
@@ -146,7 +160,8 @@ func (g *GitManager) initEmptyRepo(repoURL, baseBranch string) error {
 	return nil
 }
 
-// initBaseBranch 在已克隆但无分支的仓库中创建基础分支。
+// initBaseBranch creates the base branch in an already-cloned repository that
+// has no branches.
 func (g *GitManager) initBaseBranch(baseBranch string) error {
 	cmd := exec.Command("git", "checkout", "-b", baseBranch)
 	cmd.Dir = g.workDir
@@ -165,14 +180,15 @@ func (g *GitManager) initBaseBranch(baseBranch string) error {
 	return nil
 }
 
-// ensureRemoteOrigin 确保已有仓库的远程 origin 配置正确、可 fetch，且 master 分支存在。
+// ensureRemoteOrigin ensures that an existing repository has the remote origin
+// correctly configured and fetchable, and that the master branch exists.
 func (g *GitManager) ensureRemoteOrigin(repoURL, baseBranch string) error {
-	// 检查远程 origin 是否存在
+	// Check whether the remote origin exists
 	cmd := exec.Command("git", "remote", "get-url", "origin")
 	cmd.Dir = g.workDir
 	cmd.Env = append(os.Environ(), g.env...)
 	if out, err := cmd.CombinedOutput(); err != nil {
-		// 没有远程 origin——添加它
+		// No remote origin — add it
 		cmd = exec.Command("git", "remote", "add", "origin", repoURL)
 		cmd.Dir = g.workDir
 		cmd.Env = append(os.Environ(), g.env...)
@@ -180,7 +196,7 @@ func (g *GitManager) ensureRemoteOrigin(repoURL, baseBranch string) error {
 			return fmt.Errorf("git remote add origin %s: %s: %w", repoURL, string(out), err)
 		}
 	} else {
-		// 远程 origin 存在——如果 URL 不同则更新
+		// Remote origin exists — update it if the URL differs
 		currentURL := strings.TrimSpace(string(out))
 		if currentURL != repoURL {
 			cmd = exec.Command("git", "remote", "set-url", "origin", repoURL)
@@ -192,7 +208,7 @@ func (g *GitManager) ensureRemoteOrigin(repoURL, baseBranch string) error {
 		}
 	}
 
-	// Fetch 以确保远程跟踪引用存在
+	// Fetch to ensure the remote tracking refs exist
 	cmd = exec.Command("git", "fetch", "--tags", "origin")
 	cmd.Dir = g.workDir
 	cmd.Env = append(os.Environ(), g.env...)
@@ -200,22 +216,23 @@ func (g *GitManager) ensureRemoteOrigin(repoURL, baseBranch string) error {
 		return fmt.Errorf("git fetch origin: %s: %w", string(out), err)
 	}
 
-	// 确保 master 分支存在
+	// Ensure the master branch exists
 	return g.ensureMasterBranch(baseBranch)
 }
 
-// ensureMasterBranch 确保 master 分支存在。
-// 如果远程没有 master，则从远程默认分支（origin/HEAD）创建 master 并推送。
+// ensureMasterBranch ensures the master branch exists.
+// If the remote has no master, it creates master from the remote default branch
+// (origin/HEAD) and pushes it.
 func (g *GitManager) ensureMasterBranch(baseBranch string) error {
-	// 检查 origin/master 是否已存在
+	// Check whether origin/master already exists
 	cmd := exec.Command("git", "rev-parse", "--verify", "origin/"+baseBranch)
 	cmd.Dir = g.workDir
 	cmd.Env = append(os.Environ(), g.env...)
 	if cmd.Run() == nil {
-		return nil // master 已存在于远程
+		return nil // master already exists on the remote
 	}
 
-	// 查找远程默认分支作为起始点
+	// Find the remote default branch as the starting point
 	startPoint := ""
 	cmd = exec.Command("git", "rev-parse", "--abbrev-ref", "origin/HEAD")
 	cmd.Dir = g.workDir
@@ -227,7 +244,7 @@ func (g *GitManager) ensureMasterBranch(baseBranch string) error {
 		}
 	}
 
-	// 降级方案：选择第一个可用的远程分支
+	// Fallback: pick the first available remote branch
 	if startPoint == "" {
 		cmd = exec.Command("git", "branch", "-r")
 		cmd.Dir = g.workDir
@@ -244,11 +261,11 @@ func (g *GitManager) ensureMasterBranch(baseBranch string) error {
 	}
 
 	if startPoint == "" {
-		// 完全没有远程分支——这是一个空仓库，由 initBaseBranch 处理
+		// No remote branch at all — this is an empty repo, handled by initBaseBranch
 		return g.initBaseBranch(baseBranch)
 	}
 
-	// 从远程默认分支创建 master
+	// Create master from the remote default branch
 	cmd = exec.Command("git", "checkout", "-b", baseBranch, startPoint)
 	cmd.Dir = g.workDir
 	cmd.Env = append(os.Environ(), g.env...)
@@ -256,7 +273,7 @@ func (g *GitManager) ensureMasterBranch(baseBranch string) error {
 		return fmt.Errorf("git checkout -b %s %s: %s: %w", baseBranch, startPoint, string(out), err)
 	}
 
-	// 将 master 推送到远程
+	// Push master to the remote
 	cmd = exec.Command("git", "push", "-u", "origin", baseBranch)
 	cmd.Dir = g.workDir
 	cmd.Env = append(os.Environ(), g.env...)
@@ -267,13 +284,14 @@ func (g *GitManager) ensureMasterBranch(baseBranch string) error {
 	return nil
 }
 
-// FetchAndCheckout 从远程拉取并检出（或创建）任务分支。
-// 用于工作目录已包含 Git 仓库的情况。
+// FetchAndCheckout fetches from the remote and checks out (or creates) the task
+// branch.
+// Used when the work directory already contains a Git repository.
 func (g *GitManager) FetchAndCheckout(taskID int32, baseBranch string) error {
 	branch := BranchName(taskID)
 	remoteBranch := fmt.Sprintf("origin/%s", branch)
 
-	// 从 origin 获取所有标签和分支
+	// Fetch all tags and branches from origin
 	cmds := [][]string{
 		{"fetch", "--tags", "origin"},
 	}
@@ -287,7 +305,7 @@ func (g *GitManager) FetchAndCheckout(taskID int32, baseBranch string) error {
 		}
 	}
 
-	// 检查远程任务分支是否已存在
+	// Check whether the remote task branch already exists
 	remoteBranchExists := false
 	checkRemoteCmd := exec.Command("git", "rev-parse", "--verify", remoteBranch)
 	checkRemoteCmd.Dir = g.workDir
@@ -296,7 +314,7 @@ func (g *GitManager) FetchAndCheckout(taskID int32, baseBranch string) error {
 		remoteBranchExists = true
 	}
 
-	// 检查任务分支是否已存在于本地
+	// Check whether the task branch already exists locally
 	localBranchExists := false
 	checkLocalCmd := exec.Command("git", "rev-parse", "--verify", branch)
 	checkLocalCmd.Dir = g.workDir
@@ -306,7 +324,7 @@ func (g *GitManager) FetchAndCheckout(taskID int32, baseBranch string) error {
 	}
 
 	if localBranchExists {
-		// 分支已存在于本地，检出并与远程同步
+		// Branch already exists locally; check it out and sync with the remote
 		cmd := exec.Command("git", "checkout", branch)
 		cmd.Dir = g.workDir
 		cmd.Env = append(os.Environ(), g.env...)
@@ -314,13 +332,13 @@ func (g *GitManager) FetchAndCheckout(taskID int32, baseBranch string) error {
 			return fmt.Errorf("git checkout %s: %s: %w", branch, string(out), err)
 		}
 
-		// 如果远程分支存在，将本地快进到与远程一致
+		// If the remote branch exists, fast-forward the local branch to match the remote
 		if remoteBranchExists {
 			cmd = exec.Command("git", "merge", "--ff-only", remoteBranch)
 			cmd.Dir = g.workDir
 			cmd.Env = append(os.Environ(), g.env...)
 			if _, err := cmd.CombinedOutput(); err != nil {
-				// ff-only 失败（已分叉），重置到远程以确保一致
+				// ff-only failed (already diverged); reset to the remote to ensure consistency
 				cmd = exec.Command("git", "reset", "--hard", remoteBranch)
 				cmd.Dir = g.workDir
 				cmd.Env = append(os.Environ(), g.env...)
@@ -330,7 +348,7 @@ func (g *GitManager) FetchAndCheckout(taskID int32, baseBranch string) error {
 			}
 		}
 	} else if remoteBranchExists {
-		// 远程分支存在但本地没有——从远程任务分支检出
+		// Remote branch exists but not locally — check out from the remote task branch
 		cmd := exec.Command("git", "checkout", "-b", branch, remoteBranch)
 		cmd.Dir = g.workDir
 		cmd.Env = append(os.Environ(), g.env...)
@@ -338,7 +356,7 @@ func (g *GitManager) FetchAndCheckout(taskID int32, baseBranch string) error {
 			return fmt.Errorf("git checkout -b %s %s: %s: %w", branch, remoteBranch, string(out), err)
 		}
 	} else {
-		// 本地和远程任务分支都不存在——从 master 创建
+		// Neither local nor remote task branch exists — create from master
 		cmd := exec.Command("git", "checkout", "-b", branch, fmt.Sprintf("origin/%s", baseBranch))
 		cmd.Dir = g.workDir
 		cmd.Env = append(os.Environ(), g.env...)
@@ -347,7 +365,7 @@ func (g *GitManager) FetchAndCheckout(taskID int32, baseBranch string) error {
 		}
 	}
 
-	// 验证我们处于任务分支——绝不允许在基础分支上操作
+	// Verify that we are on the task branch — never allow operating on the base branch
 	currentBranch, err := g.CurrentBranch()
 	if err != nil {
 		return fmt.Errorf("verify current branch: %w", err)
@@ -359,7 +377,8 @@ func (g *GitManager) FetchAndCheckout(taskID int32, baseBranch string) error {
 	return nil
 }
 
-// ConfigureCredential 配置 Git 凭据助手，使用临时 askpass 脚本处理认证。
+// ConfigureCredential configures the Git credential helper, using a temporary
+// askpass script to handle authentication.
 func (g *GitManager) ConfigureCredential(username, pat, gitName, gitEmail string) error {
 	if pat == "" {
 		return nil
@@ -372,10 +391,10 @@ func (g *GitManager) ConfigureCredential(username, pat, gitName, gitEmail string
 
 	g.env = append(g.env, env...)
 
-	// 保存脚本路径以备清理
+	// Save the script path for later cleanup
 	g.askpassPath = scriptPath
 
-	// 设置 git 身份——代理必须配置 git_name/git_email
+	// Set the git identity — the agent must configure git_name/git_email
 	if gitEmail == "" {
 		return fmt.Errorf("agent git_email is required for git operations")
 	}
@@ -389,7 +408,7 @@ func (g *GitManager) ConfigureCredential(username, pat, gitName, gitEmail string
 	return nil
 }
 
-// SetGitConfig 在本地仓库中设置 Git 配置项。
+// SetGitConfig sets a Git config item in the local repository.
 func (g *GitManager) SetGitConfig(key, value string) error {
 	cmd := exec.Command("git", "config", key, value)
 	cmd.Dir = g.workDir
@@ -400,7 +419,7 @@ func (g *GitManager) SetGitConfig(key, value string) error {
 	return nil
 }
 
-// CleanupCredential 删除临时 askpass 脚本。
+// CleanupCredential deletes the temporary askpass script.
 func (g *GitManager) CleanupCredential() {
 	if g.askpassPath != "" {
 		os.Remove(g.askpassPath)
@@ -444,7 +463,7 @@ func createAskPass(username, pat string) (string, []string, error) {
 	return scriptPath, env, nil
 }
 
-// PushBranch 将当前分支推送到远程仓库。
+// PushBranch pushes the current branch to the remote repository.
 func (g *GitManager) PushBranch(taskID int32) error {
 	cmd := exec.Command("git", "push", "-u", "origin", BranchName(taskID))
 	cmd.Dir = g.workDir
@@ -456,7 +475,8 @@ func (g *GitManager) PushBranch(taskID int32) error {
 	return nil
 }
 
-// TagNodeStart 创建标记节点开始的标签，attempt 参数用于防止节点重新执行时的标签冲突。
+// TagNodeStart creates a tag marking the start of a node; the attempt parameter
+// prevents tag conflicts when a node is re-executed.
 func (g *GitManager) TagNodeStart(taskID int32, nodeOrder, attempt int) error {
 	tag := NodeStartTag(taskID, nodeOrder, attempt)
 	cmd := exec.Command("git", "tag", tag)
@@ -468,8 +488,9 @@ func (g *GitManager) TagNodeStart(taskID int32, nodeOrder, attempt int) error {
 	return nil
 }
 
-// TagNodeComplete 创建标记节点完成的标签，与 TagNodeStart 对应，标记节点执行结束。
-// attempt 参数用于防止节点重新执行时的标签冲突。
+// TagNodeComplete creates a tag marking the completion of a node, corresponding
+// to TagNodeStart and marking the end of node execution.
+// The attempt parameter prevents tag conflicts when a node is re-executed.
 func (g *GitManager) TagNodeComplete(taskID int32, nodeOrder, attempt int) error {
 	tag := NodeCompleteTag(taskID, nodeOrder, attempt)
 	cmd := exec.Command("git", "tag", tag)
@@ -481,7 +502,7 @@ func (g *GitManager) TagNodeComplete(taskID int32, nodeOrder, attempt int) error
 	return nil
 }
 
-// PushTag 将标签推送到远程仓库。
+// PushTag pushes a tag to the remote repository.
 func (g *GitManager) PushTag(tag string) error {
 	cmd := exec.Command("git", "push", "origin", tag)
 	cmd.Dir = g.workDir
@@ -493,7 +514,7 @@ func (g *GitManager) PushTag(tag string) error {
 	return nil
 }
 
-// CreateTag 创建本地 Git 标签。
+// CreateTag creates a local Git tag.
 func (g *GitManager) CreateTag(tag string) error {
 	cmd := exec.Command("git", "tag", tag)
 	cmd.Dir = g.workDir
@@ -505,29 +526,30 @@ func (g *GitManager) CreateTag(tag string) error {
 	return nil
 }
 
-// tagExists 检查指定的 Git 标签是否存在于本地仓库中。
+// tagExists checks whether the specified Git tag exists in the local repository.
 //
-// 参数:
-//   - tag: 要检查的标签名称
+// Parameters:
+//   - tag: the name of the tag to check
 //
-// 返回:
-//   - bool: 标签存在返回 true，否则返回 false
+// Returns:
+//   - bool: true if the tag exists, false otherwise
 func (g *GitManager) tagExists(tag string) bool {
 	cmd := exec.Command("git", "rev-parse", "--verify", tag)
 	cmd.Dir = g.workDir
 	return cmd.Run() == nil
 }
 
-// ResetToNode 将工作树重置到指定节点开始时的状态，attempt 参数与 TagNodeStart 中使用的一致。
+// ResetToNode resets the working tree to the state at the start of the specified
+// node; the attempt parameter matches the one used in TagNodeStart.
 func (g *GitManager) ResetToNode(taskID int32, nodeOrder, attempt int) error {
 	tag := NodeStartTag(taskID, nodeOrder, attempt)
 
-	// 验证标签存在
+	// Verify the tag exists
 	if !g.tagExists(tag) {
 		return fmt.Errorf("tag %s does not exist", tag)
 	}
 
-	// 执行重置
+	// Perform the reset
 	cmd := exec.Command("git", "reset", "--hard", tag)
 	cmd.Dir = g.workDir
 	cmd.Env = append(os.Environ(), g.env...)
@@ -538,7 +560,7 @@ func (g *GitManager) ResetToNode(taskID int32, nodeOrder, attempt int) error {
 	return nil
 }
 
-// SnapshotBeforeReject 在拒绝节点前创建快照标签。
+// SnapshotBeforeReject creates a snapshot tag before rejecting a node.
 func (g *GitManager) SnapshotBeforeReject(taskID int32) (string, error) {
 	tag := fmt.Sprintf("%s/before-reject-%d", BranchName(taskID), g.CurrentTime())
 	cmd := exec.Command("git", "tag", tag)
@@ -550,14 +572,16 @@ func (g *GitManager) SnapshotBeforeReject(taskID int32) (string, error) {
 	return tag, nil
 }
 
-// CommitAll 暂存所有变更并提交。
-// 提交成功或无变更时返回 nil，真正的失败（如缺少 Git 身份、钩子、权限等）返回错误。
+// CommitAll stages all changes and commits.
+// Returns nil on success or when there are no changes; genuine failures (such
+// as missing Git identity, hooks, permissions) return an error.
 func (g *GitManager) CommitAll(message string) error {
 	_, err := g.CommitAllWithResult(message)
 	return err
 }
 
-// CommitAllWithResult 暂存所有变更并提交，返回是否实际创建了新提交。
+// CommitAllWithResult stages all changes and commits, returning whether a new
+// commit was actually created.
 func (g *GitManager) CommitAllWithResult(message string) (bool, error) {
 	cmd := exec.Command("git", "add", "-A")
 	cmd.Dir = g.workDir
@@ -569,7 +593,7 @@ func (g *GitManager) CommitAllWithResult(message string) (bool, error) {
 	cmd = exec.Command("git", "commit", "-m", message)
 	cmd.Dir = g.workDir
 	cmd.Env = append(os.Environ(), g.env...)
-	// 强制英文输出，避免 locale 导致 "nothing to commit" 检查失败
+	// Force English output to avoid the "nothing to commit" check failing due to locale
 	cmd.Env = append(cmd.Env, "LC_ALL=C")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -582,7 +606,7 @@ func (g *GitManager) CommitAllWithResult(message string) (bool, error) {
 	return true, nil
 }
 
-// HeadCommit 返回当前 HEAD 提交哈希。
+// HeadCommit returns the current HEAD commit hash.
 func (g *GitManager) HeadCommit() (string, error) {
 	cmd := exec.Command("git", "rev-parse", "HEAD")
 	cmd.Dir = g.workDir
@@ -594,8 +618,9 @@ func (g *GitManager) HeadCommit() (string, error) {
 	return strings.TrimSpace(string(out)), nil
 }
 
-// ensureGitignore 确保本地 Git exclude 包含 .teammate/ 排除规则，
-// 防止框架注入的工具脚本被提交到仓库，同时不污染用户工作树。
+// ensureGitignore ensures the local Git exclude contains a .teammate/ exclusion
+// rule, preventing framework-injected tool scripts from being committed to the
+// repository without polluting the user's working tree.
 func (g *GitManager) ensureGitignore() {
 	excludePath := filepath.Join(g.workDir, ".git", "info", "exclude")
 	content := ""
@@ -612,17 +637,18 @@ func (g *GitManager) ensureGitignore() {
 	_ = os.WriteFile(excludePath, []byte(content), 0644)
 }
 
-// IsGitRepo 检查工作目录是否为 Git 仓库，仅检查 workDir 内的 .git 目录。
+// IsGitRepo checks whether the work directory is a Git repository, checking only
+// the .git directory inside workDir.
 func (g *GitManager) IsGitRepo() bool {
 	gitDir := filepath.Join(g.workDir, ".git")
 	info, err := os.Stat(gitDir)
 	if err != nil {
 		return false
 	}
-	return info.IsDir() || info.Mode().IsRegular() // .git 可以是目录或文件（worktree）
+	return info.IsDir() || info.Mode().IsRegular() // .git can be a directory or a file (worktree)
 }
 
-// CurrentBranch 返回当前 Git 分支名称。
+// CurrentBranch returns the current Git branch name.
 func (g *GitManager) CurrentBranch() (string, error) {
 	cmd := exec.Command("git", "rev-parse", "--abbrev-ref", "HEAD")
 	cmd.Dir = g.workDir
@@ -634,23 +660,27 @@ func (g *GitManager) CurrentBranch() (string, error) {
 	return strings.TrimSpace(string(out)), nil
 }
 
-// BranchName 根据任务 ID 生成任务分支名称，格式为 "teammate/task-{taskID}"。
+// BranchName generates the task branch name from the task ID, in the format
+// "teammate/task-{taskID}".
 func BranchName(taskID int32) string {
 	return fmt.Sprintf("teammate/task-%d", taskID)
 }
 
-// NodeStartTag 生成节点开始标签，格式为 "teammate/task-{taskID}/node-{order}/attempt-{attempt}/start"。
+// NodeStartTag generates the node start tag, in the format
+// "teammate/task-{taskID}/node-{order}/attempt-{attempt}/start".
 func NodeStartTag(taskID int32, nodeOrder, attempt int) string {
 	return fmt.Sprintf("%s/node-%d/attempt-%d/start", BranchName(taskID), nodeOrder, attempt)
 }
 
-// NodeCompleteTag 生成节点完成标签，格式为 "teammate/task-{taskID}/node-{order}/attempt-{attempt}/complete"。
-// 与 NodeStartTag 对应，标记节点执行结束的提交。
+// NodeCompleteTag generates the node complete tag, in the format
+// "teammate/task-{taskID}/node-{order}/attempt-{attempt}/complete".
+// Corresponding to NodeStartTag, it marks the commit at the end of node
+// execution.
 func NodeCompleteTag(taskID int32, nodeOrder, attempt int) string {
 	return fmt.Sprintf("%s/node-%d/attempt-%d/complete", BranchName(taskID), nodeOrder, attempt)
 }
 
-// CurrentTime 返回用于标签的 Unix 时间戳。
+// CurrentTime returns the Unix timestamp used for tags.
 func (g *GitManager) CurrentTime() int64 {
 	return g.clk.Now().Unix()
 }

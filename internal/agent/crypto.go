@@ -1,10 +1,16 @@
-// crypto.go 实现 RSA 非对称加密功能，用于 Git 凭据的安全传输。
+// crypto.go implements RSA asymmetric encryption for secure transport of Git
+// credentials.
 //
-// 本文件提供 Agent Daemon 与 Server 之间的安全凭据传输机制，主要包括：
-//   - GenerateRSAKeyPair：生成 2048 位 RSA 密钥对（PEM 编码），公钥发给服务端加密凭据
-//   - DecryptWithPrivateKey：使用私钥解密服务端 RSA-OAEP 加密的 Git 凭据（PAT）
+// This file provides a secure credential transport mechanism between the Agent
+// Daemon and the Server, mainly including:
+//   - GenerateRSAKeyPair: generates a 2048-bit RSA key pair (PEM-encoded); the
+//     public key is sent to the server to encrypt credentials
+//   - DecryptWithPrivateKey: uses the private key to decrypt Git credentials
+//     (PAT) RSA-OAEP-encrypted by the server
 //
-// 加密流程：Server 使用 Agent 的公钥加密 Git PAT → Agent 使用本地私钥解密 → 注入 Git askpass 脚本。
+// Encryption flow: the Server encrypts the Git PAT using the Agent's public key
+// -> the Agent decrypts it with the local private key -> injected into the Git
+// askpass script.
 package agent
 
 import (
@@ -17,27 +23,29 @@ import (
 	"fmt"
 )
 
-// GenerateRSAKeyPair 生成 2048 位 RSA 密钥对，返回 PEM 编码的公钥和私钥。
-// 公钥用于发送给服务端加密 Git 凭据，私钥在本地用于解密。
+// GenerateRSAKeyPair generates a 2048-bit RSA key pair and returns the
+// PEM-encoded public and private keys.
+// The public key is sent to the server to encrypt Git credentials; the private
+// key is kept locally for decryption.
 //
-// 返回：
-//   - publicKeyPEM: PEM 编码的公钥
-//   - privateKeyPEM: PEM 编码的私钥
-//   - error: 生成失败时返回错误
+// Returns:
+//   - publicKeyPEM: PEM-encoded public key
+//   - privateKeyPEM: PEM-encoded private key
+//   - error: returned on generation failure
 func GenerateRSAKeyPair() (publicKeyPEM string, privateKeyPEM string, err error) {
 	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
 		return "", "", fmt.Errorf("generate RSA key: %w", err)
 	}
 
-	// 将私钥编码为 PEM 格式
+	// Encode the private key to PEM format
 	privBytes := x509.MarshalPKCS1PrivateKey(privateKey)
 	privPEM := pem.EncodeToMemory(&pem.Block{
 		Type:  "RSA PRIVATE KEY",
 		Bytes: privBytes,
 	})
 
-	// 将公钥编码为 PEM 格式
+	// Encode the public key to PEM format
 	pubBytes, err := x509.MarshalPKIXPublicKey(&privateKey.PublicKey)
 	if err != nil {
 		return "", "", fmt.Errorf("marshal public key: %w", err)
@@ -50,16 +58,18 @@ func GenerateRSAKeyPair() (publicKeyPEM string, privateKeyPEM string, err error)
 	return string(pubPEM), string(privPEM), nil
 }
 
-// DecryptWithPrivateKey 使用给定的私钥 PEM 解密 base64 编码的 RSA-OAEP 密文。
-// 用于解密服务端加密的 Git 凭据（个人访问令牌）。
+// DecryptWithPrivateKey uses the given private key PEM to decrypt base64-encoded
+// RSA-OAEP ciphertext.
+// Used to decrypt Git credentials (personal access tokens) encrypted by the
+// server.
 //
-// 参数：
-//   - privateKeyPEM: PEM 编码的 RSA 私钥
-//   - ciphertextBase64: base64 编码的密文
+// Parameters:
+//   - privateKeyPEM: PEM-encoded RSA private key
+//   - ciphertextBase64: base64-encoded ciphertext
 //
-// 返回：
-//   - string: 解密后的明文
-//   - error: 解密失败时返回错误
+// Returns:
+//   - string: the decrypted plaintext
+//   - error: returned on decryption failure
 func DecryptWithPrivateKey(privateKeyPEM string, ciphertextBase64 string) (string, error) {
 	block, _ := pem.Decode([]byte(privateKeyPEM))
 	if block == nil {

@@ -1,4 +1,4 @@
-// config_test.go 覆盖 config.go 配置加载逻辑的测试。
+// config_test.go covers tests of the config loading logic in config.go.
 package main
 
 import (

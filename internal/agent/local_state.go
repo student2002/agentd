@@ -1,4 +1,4 @@
-// local_state.go 管理本地模式的运行状态。
+// local_state.go manages the runtime state in local mode.
 package agent
 
 import (

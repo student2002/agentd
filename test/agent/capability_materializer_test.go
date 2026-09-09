@@ -1,4 +1,4 @@
-// capability_materializer_test.go 覆盖能力物化逻辑的测试。
+// capability_materializer_test.go covers tests for the capability materialization logic.
 package agent_test
 
 import (

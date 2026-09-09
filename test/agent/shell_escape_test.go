@@ -1,4 +1,4 @@
-// Package agent_test 包含 agent 包的测试，涵盖 shell 转义、执行上下文构建、Git 操作和代理守护进程使用的 Token 估算。
+// Package agent_test contains tests for the agent package, covering shell escaping, execution context construction, Git operations, and Token estimation used by the agent daemon.
 package agent_test
 
 import (
@@ -7,7 +7,7 @@ import (
 	"github.com/teammate/agentd/internal/agent"
 )
 
-// TestShellEscapeViaPublicAPI 通过 ConfigureCredential 间接测试 Shell 转义，该方法内部使用 shellEscape 编写 askpass 脚本。由于 shellEscape 未导出，通过确保含特殊字符（单引号等）的凭证能正确处理来验证正确性。
+// TestShellEscapeViaPublicAPI indirectly tests shell escaping through ConfigureCredential, which internally uses shellEscape to write the askpass script. Since shellEscape is unexported, correctness is verified by ensuring credentials containing special characters (such as single quotes) are handled properly.
 func TestShellEscapeViaPublicAPI(t *testing.T) {
 	tests := []struct {
 		name string
@@ -22,7 +22,7 @@ func TestShellEscapeViaPublicAPI(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			tmpDir := t.TempDir()
 			gm := agent.NewGitManager(tmpDir)
-			// ConfigureCredential 内部为 PAT 调用 shellEscape
+			// ConfigureCredential internally calls shellEscape for the PAT
 			err := gm.ConfigureCredential("user", tt.pat, "Test", "test@test.com")
 			if err != nil {
 				t.Fatalf("ConfigureCredential(%q) failed: %v", tt.pat, err)

@@ -1,4 +1,4 @@
-// local_server_test.go 覆盖本地模式 HTTP 服务端的测试。
+// local_server_test.go covers tests for the local-mode HTTP server.
 package agent_test
 
 import (

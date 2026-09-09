@@ -1,4 +1,4 @@
-// local_server.go 提供本地模式下的 HTTP 服务端。
+// local_server.go provides the HTTP server in local mode.
 package agent
 
 import (

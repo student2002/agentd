@@ -1,4 +1,4 @@
-// mcp_config_test.go 覆盖 MCP 配置文件生成的测试。
+// mcp_config_test.go covers tests for MCP config file generation.
 package agent_test
 
 import (

@@ -1,4 +1,4 @@
-// config.go 提供 Agent Daemon 的配置加载与解析。
+// config.go provides config loading and parsing for the Agent Daemon.
 package main
 
 import (
@@ -33,7 +33,7 @@ var configInitCmd = &cobra.Command{
 			path = agent.DefaultConfigPath()
 		}
 
-		// 覆盖保护：文件已存在且未指定 --force 时拒绝覆盖
+		// Overwrite protection: refuse to overwrite an existing file when --force is not specified
 		if !forceOverwrite {
 			if _, err := os.Stat(path); err == nil {
 				return fmt.Errorf("config file already exists at %s; use --force to overwrite, or use --profile to create a separate config", path)

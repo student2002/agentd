@@ -1,4 +1,5 @@
-// capability_materializer.go 为不同编码工具物化生成技能与 MCP 的本地配置文件。
+// capability_materializer.go materializes local config files for skills and
+// MCP for different coding tools.
 package agent
 
 import (
@@ -24,10 +25,12 @@ type PromptCapabilities struct {
 	IncludeMCP    bool
 }
 
-// MaterializeAgentCapabilities 为技能和 MCP 服务器准备特定提供方的本地文件。
-// Claude Code 和 AtomCode 使用项目本地的技能文件。没有已知原生技能机制的
-// 工具保持 prompt 回退启用。所有 Teammate 生成的文件在每次执行时都会刷新，
-// 因此被禁用或移除的绑定不会通过过期文件泄漏。
+// MaterializeAgentCapabilities prepares provider-specific local files for
+// skills and MCP servers.
+// Claude Code and AtomCode use project-local skill files. Tools with no known
+// native skill mechanism keep the prompt fallback enabled. All Teammate-generated
+// files are refreshed on every execution, so disabled or removed bindings do
+// not leak through stale files.
 func MaterializeAgentCapabilities(ctx context.Context, client *Client, cfg *Config, workDir, toolName string) (CapabilityInjection, error) {
 	injection := CapabilityInjection{
 		PromptCapabilities: PromptCapabilities{IncludeSkills: true, IncludeMCP: true},
@@ -61,7 +64,7 @@ func MaterializeAgentCapabilities(ctx context.Context, client *Client, cfg *Conf
 			}
 		}
 		injection.PromptCapabilities.IncludeSkills = false
-		// 在 prompt 中保留非敏感的 MCP 名称/URL 以便发现；密钥保留在配置文件中。
+		// Keep non-sensitive MCP names/URLs in the prompt for discoverability; secrets stay in the config file.
 		injection.PromptCapabilities.IncludeMCP = true
 	case "atomcode":
 		if len(skills) > 0 {
@@ -97,8 +100,9 @@ func enabledSkills(skills []SkillContext) []SkillContext {
 	return enabled
 }
 
-// ResetGeneratedCapabilities 只删除 Teammate 拥有的文件。它有意保留
-// 用户自行编写的提供方配置文件（如 AGENTS.md、.atomcode.md）以及非 teammate 技能。
+// ResetGeneratedCapabilities only removes Teammate-owned files. It intentionally
+// preserves user-authored provider config files (e.g. AGENTS.md, .atomcode.md)
+// and non-teammate skills.
 func ResetGeneratedCapabilities(workDir string) error {
 	paths := []string{
 		filepath.Join(workDir, ".teammate", "capabilities"),
@@ -129,7 +133,7 @@ func ResetGeneratedCapabilities(workDir string) error {
 	return nil
 }
 
-// WriteClaudeSkillFiles 写入项目本地的 Claude Code 技能文件。
+// WriteClaudeSkillFiles writes project-local Claude Code skill files.
 func WriteClaudeSkillFiles(workDir string, skills []SkillContext) error {
 	baseDir := filepath.Join(workDir, ".claude", "skills")
 	if err := ensureGeneratedCapabilityExclude(workDir); err != nil {
@@ -218,9 +222,9 @@ func formatFrontmatterString(value string) string {
 	return strconv.Quote(value)
 }
 
-// WriteAtomCodeSkillFiles 写入项目本地的 AtomCode 技能文件。
-// AtomCode 从 .atomcode/skills 加载项目技能；Teammate 只在那里写入 teammate-* 文件，
-// 绝不修改根目录的 AGENTS.md 或 .atomcode.md。
+// WriteAtomCodeSkillFiles writes project-local AtomCode skill files.
+// AtomCode loads project skills from .atomcode/skills; Teammate only writes
+// teammate-* files there and never modifies the root AGENTS.md or .atomcode.md.
 func WriteAtomCodeSkillFiles(workDir string, skills []SkillContext) error {
 	if err := ensureGeneratedCapabilityExclude(workDir); err != nil {
 		return err
@@ -245,9 +249,9 @@ func WriteAtomCodeSkillFiles(workDir string, skills []SkillContext) error {
 	return nil
 }
 
-// WriteMiMoCodeSkillFiles 写入项目本地的 MiMoCode 技能文件。
-// MiMoCode 从 .mimocode/ 目录读取项目配置。
-// 技能以 markdown 文件形式写入 .mimocode/skills/ 目录。
+// WriteMiMoCodeSkillFiles writes project-local MiMoCode skill files.
+// MiMoCode reads project config from the .mimocode/ directory.
+// Skills are written as markdown files into the .mimocode/skills/ directory.
 func WriteMiMoCodeSkillFiles(workDir string, skills []SkillContext) error {
 	if err := ensureGeneratedCapabilityExclude(workDir); err != nil {
 		return err

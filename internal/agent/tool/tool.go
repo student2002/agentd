@@ -1,15 +1,16 @@
-// tool.go 定义编码工具的抽象接口和多种工具适配器的实现。
+// tool.go defines the abstract interface for coding tools and the implementation of multiple tool adapters.
 //
-// 本文件提供 Agent Daemon 执行编码任务时的工具抽象层，主要包括：
-//   - Tool 接口：定义 Name / Execute / Stop / IsInstalled 四个核心方法
-//   - ClaudeTool：适配 Claude Code，支持 stream-json 输出解析和 --resume 会话恢复
-//   - OpenClawTool：适配 OpenClaw 编码工具
-//   - OpenCodeTool：适配 OpenCode 编码工具
-//   - ExecutionResult：执行结果结构，包含输出内容、退出码、Token 用量和会话 ID
-//   - GetTool 工厂函数：根据 provider 名称返回对应的工具适配器
+// This file provides the tool abstraction layer used by the Agent Daemon when executing
+// coding tasks, mainly including:
+//   - Tool interface: defines four core methods Name / Execute / Stop / IsInstalled
+//   - ClaudeTool: adapts Claude Code, supports stream-json output parsing and --resume session recovery
+//   - OpenClawTool: adapts the OpenClaw coding tool
+//   - OpenCodeTool: adapts the OpenCode coding tool
+//   - ExecutionResult: execution result struct, containing output content, exit code, Token usage and session ID
+//   - GetTool factory function: returns the corresponding tool adapter based on the provider name
 //
-// 所有工具适配器均通过 internal/agent/process 管理子进程树，支持跨平台中断。
-// 日志输出自动进行敏感信息脱敏处理。
+// All tool adapters manage the child process tree via internal/agent/process, supporting cross-platform interruption.
+// Log output is automatically desensitized for sensitive information.
 package tool
 
 import (
@@ -34,34 +35,34 @@ import (
 	"unicode/utf8"
 )
 
-// ExecutionResult 包含编码工具执行的结果。
+// ExecutionResult contains the result of a coding tool execution.
 type ExecutionResult struct {
 	Output       string
 	ExitCode     int
 	InputTokens  int
 	OutputTokens int
 	TotalTokens  int
-	SessionID    string // Claude Code 会话 ID，用于 --resume
+	SessionID    string // Claude Code session ID, used for --resume
 }
 
-// ExecuteOptions 包含传递给编码工具的可选运行时配置。
+// ExecuteOptions contains the optional runtime configuration passed to the coding tool.
 type ExecuteOptions struct {
 	MCPConfigPath string
 }
 
-// Tool 定义了编码工具的接口，所有编码工具适配器必须实现此接口。
+// Tool defines the interface for a coding tool; all coding tool adapters must implement this interface.
 type Tool interface {
-	// Name 返回工具名称（如 "claude"、"openclaw"）。
+	// Name returns the tool name (e.g. "claude", "openclaw").
 	Name() string
 
-	// Execute 在工作目录中使用给定的 prompt 运行编码工具。
-	// onOutput 在每行 stdout/stderr 输出时被调用。
+	// Execute runs the coding tool in the working directory with the given prompt.
+	// onOutput is called for each line of stdout/stderr output.
 	Execute(ctx context.Context, workDir, prompt string, options ExecuteOptions, onOutput func(string)) (*ExecutionResult, error)
 
-	// Stop 终止当前执行。
+	// Stop terminates the current execution.
 	Stop() error
 
-	// IsInstalled 检查工具是否在系统上可用。
+	// IsInstalled checks whether the tool is available on the system.
 	IsInstalled() bool
 }
 
@@ -84,58 +85,58 @@ func stopCommand(cmd *exec.Cmd, done <-chan struct{}) error {
 
 // --- Claude Code Tool ---
 
-// ClaudeTool 实现了 Tool 接口，适配 Claude Code 编码工具。
+// ClaudeTool implements the Tool interface, adapting the Claude Code coding tool.
 type ClaudeTool struct {
 	path            string
 	cmd             *exec.Cmd
 	mu              sync.Mutex
-	done            chan struct{} // Execute 完成时关闭
-	resumeSessionID string        // 如果设置，下次 Execute 调用将使用 --resume
-	onSessionID     func(string)  // 捕获到 session_id 时的回调
+	done            chan struct{} // closed when Execute completes
+	resumeSessionID string        // if set, the next Execute call will use --resume
+	onSessionID     func(string)  // callback when a session_id is captured
 }
 
-// NewClaudeTool 创建一个新的 Claude Code 工具适配器。
+// NewClaudeTool creates a new Claude Code tool adapter.
 func NewClaudeTool(path string) *ClaudeTool {
 	return &ClaudeTool{path: path}
 }
 
-// Name 返回 "claude"。
+// Name returns "claude".
 func (t *ClaudeTool) Name() string { return "claude" }
 
-// IsInstalled 检查 claude 是否可用。
+// IsInstalled checks whether claude is available.
 func (t *ClaudeTool) IsInstalled() bool {
 	_, err := exec.LookPath(t.path)
 	return err == nil
 }
 
-// SetResumeSession 设置下次 Execute 调用时恢复的 Claude 会话 ID。
+// SetResumeSession sets the Claude session ID to resume on the next Execute call.
 func (t *ClaudeTool) SetResumeSession(sessionID string) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.resumeSessionID = sessionID
 }
 
-// SetSessionCallback 设置当捕获到 Claude session_id 时的回调函数。
+// SetSessionCallback sets the callback function invoked when a Claude session_id is captured.
 func (t *ClaudeTool) SetSessionCallback(cb func(string)) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.onSessionID = cb
 }
 
-// Execute 运行 Claude Code。
+// Execute runs Claude Code.
 func (t *ClaudeTool) Execute(ctx context.Context, workDir, prompt string, options ExecuteOptions, onOutput func(string)) (*ExecutionResult, error) {
 	t.mu.Lock()
 	t.done = make(chan struct{})
 	started := false
 	var stopOnce sync.Once
 
-	// 持锁时捕获并清除恢复会话 ID
+	// Capture and clear the resume session ID while holding the lock
 	resumeID := t.resumeSessionID
 	t.resumeSessionID = ""
 
 	defer func() {
 		if !started {
-			// Start() 从未成功——在清理前解锁以避免死锁
+			// Start() never succeeded — unlock before cleanup to avoid deadlock
 			t.mu.Unlock()
 		}
 		t.mu.Lock()
@@ -173,31 +174,31 @@ func (t *ClaudeTool) Execute(ctx context.Context, workDir, prompt string, option
 		return nil, fmt.Errorf("claude start: %w", err)
 	}
 	started = true
-	t.mu.Unlock() // 在 Start() 后释放锁，使 Stop() 能访问 t.cmd
+	t.mu.Unlock() // release the lock after Start() so Stop() can access t.cmd
 
 	go func() {
 		select {
 		case <-ctx.Done():
 			stopOnce.Do(func() { t.Stop() })
 		case <-t.done:
-			// Execute 正常完成，无需 Stop
+			// Execute completed normally, no Stop needed
 		}
 	}()
 
-	// 逐行读取 stdout（stream-json：每行是一个 JSON 对象）
+	// Read stdout line by line (stream-json: each line is a JSON object)
 	var outputLines []string
 	var fullOutput strings.Builder
 	var sessionIDMu sync.Mutex
 	var capturedSessionID string
 	go func() {
 		scanner := bufio.NewScanner(stdout)
-		scanner.Buffer(make([]byte, 0, 1024*1024), 1024*1024) // 1MB 缓冲区
+		scanner.Buffer(make([]byte, 0, 1024*1024), 1024*1024) // 1MB buffer
 		for scanner.Scan() {
 			line := scanner.Text()
 			fullOutput.WriteString(line)
 			fullOutput.WriteByte('\n')
 			log.Printf("[tool:stdout] raw line: %s", line[:min(200, len(line))])
-			// 从 stream-json 行提取可显示的文本
+			// Extract displayable text from the stream-json line
 			displayText := extractStreamJSONText(line)
 			if displayText != "" {
 				sanitized := sanitizeLog(displayText)
@@ -209,7 +210,7 @@ func (t *ClaudeTool) Execute(ctx context.Context, workDir, prompt string, option
 			} else {
 				log.Printf("[tool:stdout] no text extracted from line")
 			}
-			// 从系统初始化事件中提取 session_id
+			// Extract the session_id from the system init event
 			if sid := extractSessionID(line); sid != "" {
 				sessionIDMu.Lock()
 				capturedSessionID = sid
@@ -222,10 +223,10 @@ func (t *ClaudeTool) Execute(ctx context.Context, workDir, prompt string, option
 		log.Printf("[tool:stdout] scanner finished, total output lines: %d", len(outputLines))
 	}()
 
-	// 逐行读取 stderr
+	// Read stderr line by line
 	go func() {
 		scanner := bufio.NewScanner(stderr)
-		scanner.Buffer(make([]byte, 0, 1024*1024), 1024*1024) // 1MB 缓冲区
+		scanner.Buffer(make([]byte, 0, 1024*1024), 1024*1024) // 1MB buffer
 		for scanner.Scan() {
 			line := sanitizeLog(scanner.Text())
 			log.Printf("[tool:stderr] %s", line)
@@ -253,14 +254,15 @@ func (t *ClaudeTool) Execute(ctx context.Context, workDir, prompt string, option
 	result.SessionID = capturedSessionID
 	sessionIDMu.Unlock()
 
-	// 尝试从 JSON 输出解析 token 用量
+	// Try to parse token usage from the JSON output
 	result.InputTokens, result.OutputTokens = extractTokenUsage(result.Output)
 	result.TotalTokens = result.InputTokens + result.OutputTokens
 
 	return result, nil
 }
 
-// Stop 终止 Claude Code 当前执行，向进程组发送 SIGTERM 后等待 5 秒再 SIGKILL。
+// Stop terminates the current Claude Code execution: sends SIGTERM to the process group,
+// then waits 5 seconds before SIGKILL.
 func (t *ClaudeTool) Stop() error {
 	t.mu.Lock()
 	cmd := t.cmd
@@ -276,31 +278,31 @@ func (t *ClaudeTool) Stop() error {
 
 // --- OpenClaw Tool ---
 
-// OpenClawTool 实现了 Tool 接口，适配 OpenClaw 编码工具。
-// OpenClaw 使用 openclaw agent --message "..." 命令执行无头模式。
+// OpenClawTool implements the Tool interface, adapting the OpenClaw coding tool.
+// OpenClaw uses the command `openclaw agent --message "..."` to run in headless mode.
 type OpenClawTool struct {
 	path string
 	cmd  *exec.Cmd
 	mu   sync.Mutex
-	done chan struct{} // Execute 完成时关闭
+	done chan struct{} // closed when Execute completes
 }
 
-// NewOpenClawTool 创建一个新的 OpenClaw 工具适配器。
+// NewOpenClawTool creates a new OpenClaw tool adapter.
 func NewOpenClawTool(path string) *OpenClawTool {
 	return &OpenClawTool{path: path}
 }
 
-// Name 返回 "openclaw"。
+// Name returns "openclaw".
 func (t *OpenClawTool) Name() string { return "openclaw" }
 
-// IsInstalled 检查 openclaw 是否可用。
+// IsInstalled checks whether openclaw is available.
 func (t *OpenClawTool) IsInstalled() bool {
 	_, err := exec.LookPath(t.path)
 	return err == nil
 }
 
-// Execute 运行 OpenClaw。
-// 使用 openclaw agent --message "..." --thinking high 进行无头模式执行。
+// Execute runs OpenClaw.
+// Uses `openclaw agent --message "..." --thinking high` for headless mode execution.
 func (t *OpenClawTool) Execute(ctx context.Context, workDir, prompt string, options ExecuteOptions, onOutput func(string)) (*ExecutionResult, error) {
 	t.mu.Lock()
 	t.done = make(chan struct{})
@@ -334,14 +336,14 @@ func (t *OpenClawTool) Execute(ctx context.Context, workDir, prompt string, opti
 		return nil, fmt.Errorf("openclaw start: %w", err)
 	}
 	started = true
-	t.mu.Unlock() // 在 Start() 后释放锁，使 Stop() 能访问 t.cmd
+	t.mu.Unlock() // release the lock after Start() so Stop() can access t.cmd
 
 	go func() {
 		select {
 		case <-ctx.Done():
 			stopOnce.Do(func() { t.Stop() })
 		case <-t.done:
-			// Execute 正常完成，无需 Stop
+			// Execute completed normally, no Stop needed
 		}
 	}()
 
@@ -388,7 +390,7 @@ func (t *OpenClawTool) Execute(ctx context.Context, workDir, prompt string, opti
 	return result, nil
 }
 
-// Stop 终止 OpenClaw 当前执行。
+// Stop terminates the current OpenClaw execution.
 func (t *OpenClawTool) Stop() error {
 	t.mu.Lock()
 	cmd := t.cmd
@@ -404,29 +406,29 @@ func (t *OpenClawTool) Stop() error {
 
 // --- OpenCode Tool ---
 
-// OpenCodeTool 实现了 Tool 接口，适配 OpenCode 编码工具。
+// OpenCodeTool implements the Tool interface, adapting the OpenCode coding tool.
 type OpenCodeTool struct {
 	path string
 	cmd  *exec.Cmd
 	mu   sync.Mutex
-	done chan struct{} // Execute 完成时关闭
+	done chan struct{} // closed when Execute completes
 }
 
-// NewOpenCodeTool 创建一个新的 OpenCode 工具适配器。
+// NewOpenCodeTool creates a new OpenCode tool adapter.
 func NewOpenCodeTool(path string) *OpenCodeTool {
 	return &OpenCodeTool{path: path}
 }
 
-// Name 返回 "opencode"。
+// Name returns "opencode".
 func (t *OpenCodeTool) Name() string { return "opencode" }
 
-// IsInstalled 检查 opencode 是否可用。
+// IsInstalled checks whether opencode is available.
 func (t *OpenCodeTool) IsInstalled() bool {
 	_, err := exec.LookPath(t.path)
 	return err == nil
 }
 
-// Execute 运行 OpenCode。
+// Execute runs OpenCode.
 func (t *OpenCodeTool) Execute(ctx context.Context, workDir, prompt string, options ExecuteOptions, onOutput func(string)) (*ExecutionResult, error) {
 	t.mu.Lock()
 	t.done = make(chan struct{})
@@ -459,14 +461,14 @@ func (t *OpenCodeTool) Execute(ctx context.Context, workDir, prompt string, opti
 		return nil, fmt.Errorf("opencode start: %w", err)
 	}
 	started = true
-	t.mu.Unlock() // 在 Start() 后释放锁，使 Stop() 能访问 t.cmd
+	t.mu.Unlock() // release the lock after Start() so Stop() can access t.cmd
 
 	go func() {
 		select {
 		case <-ctx.Done():
 			stopOnce.Do(func() { t.Stop() })
 		case <-t.done:
-			// Execute 正常完成，无需 Stop
+			// Execute completed normally, no Stop needed
 		}
 	}()
 
@@ -513,7 +515,7 @@ func (t *OpenCodeTool) Execute(ctx context.Context, workDir, prompt string, opti
 	return result, nil
 }
 
-// Stop 终止 OpenCode 当前执行。
+// Stop terminates the current OpenCode execution.
 func (t *OpenCodeTool) Stop() error {
 	t.mu.Lock()
 	cmd := t.cmd
@@ -529,41 +531,43 @@ func (t *OpenCodeTool) Stop() error {
 
 // --- AtomCode Tool ---
 
-// AtomCodeTool 实现了 Tool 接口，适配 AtomCode 编码工具。
-// AtomCode 是 Rust 编写的终端 AI 编码代理，支持无头模式 (-p) 和会话恢复 (--continue)。
+// AtomCodeTool implements the Tool interface, adapting the AtomCode coding tool.
+// AtomCode is a terminal AI coding agent written in Rust, supporting headless mode (-p)
+// and session recovery (--continue).
 // CLI: atomcode -p "prompt" [--continue] [-C workdir] [--model model]
 type AtomCodeTool struct {
 	path            string
 	cmd             *exec.Cmd
 	mu              sync.Mutex
-	done            chan struct{} // Execute 完成时关闭
-	continueSession bool          // 下次 Execute 使用 --continue 恢复会话
+	done            chan struct{} // closed when Execute completes
+	continueSession bool          // next Execute uses --continue to resume the session
 }
 
-// NewAtomCodeTool 创建一个新的 AtomCode 工具适配器。
+// NewAtomCodeTool creates a new AtomCode tool adapter.
 func NewAtomCodeTool(path string) *AtomCodeTool {
 	return &AtomCodeTool{path: path}
 }
 
-// Name 返回 "atomcode"。
+// Name returns "atomcode".
 func (t *AtomCodeTool) Name() string { return "atomcode" }
 
-// IsInstalled 检查 atomcode 是否可用。
+// IsInstalled checks whether atomcode is available.
 func (t *AtomCodeTool) IsInstalled() bool {
 	_, err := exec.LookPath(t.path)
 	return err == nil
 }
 
-// SetContinueSession 设置下次 Execute 调用时使用 --continue 恢复会话。
+// SetContinueSession sets the next Execute call to use --continue to resume the session.
 func (t *AtomCodeTool) SetContinueSession(continueSession bool) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.continueSession = continueSession
 }
 
-// Execute 运行 AtomCode。
-// 使用 atomcode -p "prompt" 进行无头模式执行。
-// AtomCode 无头模式下自动批准 bash 调用，其他工具需要批准的被拒绝。
+// Execute runs AtomCode.
+// Uses `atomcode -p "prompt"` for headless mode execution.
+// In AtomCode headless mode, bash calls are auto-approved; other tools that require
+// approval are rejected.
 func (t *AtomCodeTool) Execute(ctx context.Context, workDir, prompt string, options ExecuteOptions, onOutput func(string)) (*ExecutionResult, error) {
 	t.mu.Lock()
 	t.done = make(chan struct{})
@@ -604,14 +608,14 @@ func (t *AtomCodeTool) Execute(ctx context.Context, workDir, prompt string, opti
 		return nil, fmt.Errorf("atomcode start: %w", err)
 	}
 	started = true
-	t.mu.Unlock() // 在 Start() 后释放锁，使 Stop() 能访问 t.cmd
+	t.mu.Unlock() // release the lock after Start() so Stop() can access t.cmd
 
 	go func() {
 		select {
 		case <-ctx.Done():
 			stopOnce.Do(func() { t.Stop() })
 		case <-t.done:
-			// Execute 正常完成，无需 Stop
+			// Execute completed normally, no Stop needed
 		}
 	}()
 
@@ -658,7 +662,7 @@ func (t *AtomCodeTool) Execute(ctx context.Context, workDir, prompt string, opti
 	return result, nil
 }
 
-// Stop 终止 AtomCode 当前执行。
+// Stop terminates the current AtomCode execution.
 func (t *AtomCodeTool) Stop() error {
 	t.mu.Lock()
 	cmd := t.cmd
@@ -674,32 +678,33 @@ func (t *AtomCodeTool) Stop() error {
 
 // --- MiMoCode Tool ---
 
-// MiMoCodeTool 实现了 Tool 接口，适配 MiMoCode 编码工具。
-// MiMoCode 是基于 OpenCode fork 的带记忆 AI 编码代理，CLI 接口与 OpenCode 兼容。
-// CLI: mimocode --prompt "prompt" (无头模式)
+// MiMoCodeTool implements the Tool interface, adapting the MiMoCode coding tool.
+// MiMoCode is a memory-enabled AI coding agent forked from OpenCode; its CLI is compatible
+// with OpenCode.
+// CLI: mimocode --prompt "prompt" (headless mode)
 type MiMoCodeTool struct {
 	path string
 	cmd  *exec.Cmd
 	mu   sync.Mutex
-	done chan struct{} // Execute 完成时关闭
+	done chan struct{} // closed when Execute completes
 }
 
-// NewMiMoCodeTool 创建一个新的 MiMoCode 工具适配器。
+// NewMiMoCodeTool creates a new MiMoCode tool adapter.
 func NewMiMoCodeTool(path string) *MiMoCodeTool {
 	return &MiMoCodeTool{path: path}
 }
 
-// Name 返回 "mimocode"。
+// Name returns "mimocode".
 func (t *MiMoCodeTool) Name() string { return "mimocode" }
 
-// IsInstalled 检查 mimocode 是否可用。
+// IsInstalled checks whether mimocode is available.
 func (t *MiMoCodeTool) IsInstalled() bool {
 	_, err := exec.LookPath(t.path)
 	return err == nil
 }
 
-// Execute 运行 MiMoCode。
-// MiMoCode 基于 OpenCode fork，使用 --prompt 参数进行无头模式执行。
+// Execute runs MiMoCode.
+// MiMoCode is based on an OpenCode fork and uses the --prompt argument for headless mode execution.
 func (t *MiMoCodeTool) Execute(ctx context.Context, workDir, prompt string, options ExecuteOptions, onOutput func(string)) (*ExecutionResult, error) {
 	t.mu.Lock()
 	t.done = make(chan struct{})
@@ -732,14 +737,14 @@ func (t *MiMoCodeTool) Execute(ctx context.Context, workDir, prompt string, opti
 		return nil, fmt.Errorf("mimocode start: %w", err)
 	}
 	started = true
-	t.mu.Unlock() // 在 Start() 后释放锁，使 Stop() 能访问 t.cmd
+	t.mu.Unlock() // release the lock after Start() so Stop() can access t.cmd
 
 	go func() {
 		select {
 		case <-ctx.Done():
 			stopOnce.Do(func() { t.Stop() })
 		case <-t.done:
-			// Execute 正常完成，无需 Stop
+			// Execute completed normally, no Stop needed
 		}
 	}()
 
@@ -786,7 +791,7 @@ func (t *MiMoCodeTool) Execute(ctx context.Context, workDir, prompt string, opti
 	return result, nil
 }
 
-// Stop 终止 MiMoCode 当前执行。
+// Stop terminates the current MiMoCode execution.
 func (t *MiMoCodeTool) Stop() error {
 	t.mu.Lock()
 	cmd := t.cmd
@@ -802,8 +807,8 @@ func (t *MiMoCodeTool) Stop() error {
 
 // --- Stream JSON Text Extraction ---
 
-// extractStreamJSONText 解析 Claude stream-json 输出的单行数据，返回可显示的文本内容。
-// 每行是一个 JSON 对象，包含 "type" 字段标识事件类型。
+// extractStreamJSONText parses a single line of Claude stream-json output and returns the displayable text.
+// Each line is a JSON object containing a "type" field that identifies the event type.
 func extractStreamJSONText(line string) string {
 	line = strings.TrimSpace(line)
 	if line == "" || !strings.HasPrefix(line, "{") {
@@ -812,10 +817,10 @@ func extractStreamJSONText(line string) string {
 
 	var obj map[string]json.RawMessage
 	if err := json.Unmarshal([]byte(line), &obj); err != nil {
-		return line // 不是有效的 JSON，原样返回
+		return line // not valid JSON, return as-is
 	}
 
-	// 提取类型
+	// Extract the type
 	var eventType string
 	if t, ok := obj["type"]; ok {
 		_ = json.Unmarshal(t, &eventType)
@@ -823,7 +828,7 @@ func extractStreamJSONText(line string) string {
 
 	switch eventType {
 	case "assistant":
-		// Assistant 消息：{"type":"assistant","message":{"content":[{"type":"text","text":"..."}]}}
+		// Assistant message: {"type":"assistant","message":{"content":[{"type":"text","text":"..."}]}}
 		var msg struct {
 			Content []struct {
 				Type string `json:"type"`
@@ -842,7 +847,7 @@ func extractStreamJSONText(line string) string {
 		return strings.Join(texts, "\n")
 
 	case "content_block_start":
-		// 新的内容块开始
+		// A new content block starts
 		var cb struct {
 			Type string `json:"type"`
 			Text string `json:"text"`
@@ -856,7 +861,7 @@ func extractStreamJSONText(line string) string {
 		return ""
 
 	case "content_block_delta":
-		// 增量文本 delta
+		// Incremental text delta
 		var delta struct {
 			Type string `json:"type"`
 			Text string `json:"text"`
@@ -870,7 +875,7 @@ func extractStreamJSONText(line string) string {
 		return ""
 
 	case "result":
-		// 最终结果：{"type":"result","result":"...","usage":{...}}
+		// Final result: {"type":"result","result":"...","usage":{...}}
 		var resultStr string
 		if r, ok := obj["result"]; ok {
 			_ = json.Unmarshal(r, &resultStr)
@@ -878,17 +883,17 @@ func extractStreamJSONText(line string) string {
 		return resultStr
 
 	case "system":
-		// 系统消息（init 等）——跳过显示文本
+		// System message (init, etc.) — skip displaying text
 		return ""
 
 	default:
-		// 未知事件类型——跳过
+		// Unknown event type — skip
 		return ""
 	}
 }
 
-// extractSessionID 从系统初始化事件中提取 Claude Code 会话 ID。
-// 如果行不是系统初始化事件或没有 session_id，则返回空字符串。
+// extractSessionID extracts the Claude Code session ID from the system init event.
+// Returns an empty string if the line is not a system init event or has no session_id.
 func extractSessionID(line string) string {
 	line = strings.TrimSpace(line)
 	if line == "" || !strings.HasPrefix(line, "{") {
@@ -921,27 +926,30 @@ func extractSessionID(line string) string {
 
 // --- Log Sanitization ---
 
-// sensitivePatterns 匹配日志中的常见密钥格式，用于脱敏处理。
+// sensitivePatterns matches common key formats in logs, used for desensitization.
 var sensitivePatterns = regexp.MustCompile(`(?i)(sk-[a-zA-Z0-9]{20,}|ghp_[a-zA-Z0-9]{20,}|tm_[a-zA-Z0-9]{20,}|Bearer\s+\S+|api_key[=:]\s*\S+)`)
 
-// sanitizeLog 对日志行进行脱敏处理。
+// sanitizeLog desensitizes a log line.
 func sanitizeLog(line string) string {
 	return sensitivePatterns.ReplaceAllString(line, "***REDACTED***")
 }
 
 // --- Encoding Normalization ---
 
-// decodeLine 将工具 stdout/stderr 的一行文本规范化为 UTF-8。
+// decodeLine normalizes a single line of tool stdout/stderr text to UTF-8.
 //
-// 背景：中文 Windows 控制台默认代码页为 GBK(936)。AtomCode/OpenClaw/OpenCode 等
-// 原生程序直接以 GBK 字节输出到管道，Go 的 bufio.Scanner.Text() 仅做字节→string
-// 的拷贝而不做编码转换，非法 UTF-8 字节原样进入 string。这些字节随后通过
-// PostNodeComment / <needs_input> 写入数据库的 UTF-8 文本列，前端按 UTF-8 渲染即
-// 出现乱码（部分字节还可能在某个中间环节被强制 UTF-8 解码而变成 U+FFFD，造成不可
-// 逆损坏）。Claude Code 走 stream-json，输出本身就是 UTF-8，不受影响。
+// Background: the default code page of the Chinese Windows console is GBK(936). Native
+// programs such as AtomCode/OpenClaw/OpenCode write GBK bytes directly to the pipe; Go's
+// bufio.Scanner.Text() only copies bytes into a string without any encoding conversion, so
+// invalid UTF-8 bytes enter the string as-is. These bytes are then written via
+// PostNodeComment / <needs_input> into UTF-8 text columns in the database; the frontend
+// renders them as UTF-8 and garbled text appears (some bytes may also be force-decoded to
+// UTF-8 at some intermediate stage and become U+FFFD, causing irreversible corruption).
+// Claude Code uses stream-json, and its output is already UTF-8, so it is unaffected.
 //
-// 策略：若该行已是合法 UTF-8，原样返回（零开销快路径）；否则按 GBK 解码为 UTF-8。
-// 解码仍失败则退回到 utf8.RuneError 的 ToValidUTF8 清洗，避免遗留非法字节。
+// Strategy: if the line is already valid UTF-8, return it as-is (zero-cost fast path);
+// otherwise decode it from GBK to UTF-8. If decoding still fails, fall back to ToValidUTF8
+// cleansing with utf8.RuneError to avoid leaving invalid bytes behind.
 func decodeLine(line string) string {
 	if utf8.ValidString(line) {
 		return line
@@ -953,15 +961,18 @@ func decodeLine(line string) string {
 			return ds
 		}
 	}
-	// GBK 解码失败或仍含非法字节：用替换字符清洗，保证下游接收的是合法 UTF-8。
+	// GBK decoding failed or still contains invalid bytes: cleanse with replacement
+	// characters to guarantee the downstream receives valid UTF-8.
 	return strings.ToValidUTF8(line, "�")
 }
 
-// scanLines 从 reader 逐行读取，每行经 decodeLine 规范化为 UTF-8 后通过 fn 回调。
-// 抽取自各工具适配器中重复的 bufio.Scanner 读取逻辑，统一处理编码兜底。
+// scanLines reads from the reader line by line; each line is normalized to UTF-8 via
+// decodeLine and then passed through the fn callback.
+// Extracted from the duplicated bufio.Scanner reading logic across tool adapters to unify
+// the encoding fallback handling.
 func scanLines(reader io.Reader, fn func(line string)) {
 	scanner := bufio.NewScanner(reader)
-	scanner.Buffer(make([]byte, 0, 1024*1024), 1024*1024) // 1MB 缓冲区
+	scanner.Buffer(make([]byte, 0, 1024*1024), 1024*1024) // 1MB buffer
 	for scanner.Scan() {
 		fn(decodeLine(scanner.Text()))
 	}
@@ -969,9 +980,9 @@ func scanLines(reader io.Reader, fn func(line string)) {
 
 // --- Token Usage Extraction ---
 
-// extractTokenUsage 从输出中提取 Token 用量信息。
+// extractTokenUsage extracts Token usage information from the output.
 func extractTokenUsage(output string) (int, int) {
-	// 尝试解析 JSON 输出以获取 token 用量
+	// Try to parse the JSON output to obtain token usage
 	var result struct {
 		Usage struct {
 			InputTokens  int `json:"input_tokens"`
@@ -979,12 +990,12 @@ func extractTokenUsage(output string) (int, int) {
 		} `json:"usage"`
 	}
 
-	// 尝试作为单个 JSON 对象解析
+	// Try to parse as a single JSON object
 	if err := json.Unmarshal([]byte(output), &result); err == nil {
 		return result.Usage.InputTokens, result.Usage.OutputTokens
 	}
 
-	// 尝试查找包含用量信息的 JSON 行
+	// Try to find a JSON line containing usage information
 	for _, line := range strings.Split(output, "\n") {
 		line = strings.TrimSpace(line)
 		if strings.HasPrefix(line, "{") && strings.Contains(line, "usage") {
@@ -1001,7 +1012,7 @@ func extractTokenUsage(output string) (int, int) {
 
 // --- Tool Factory ---
 
-// GetTool 根据提供者名称返回对应的编码工具适配器。
+// GetTool returns the coding tool adapter corresponding to the provider name.
 func GetTool(provider string, path string) Tool {
 	switch strings.ToLower(provider) {
 	case "claude":
@@ -1015,6 +1026,6 @@ func GetTool(provider string, path string) Tool {
 	case "mimocode":
 		return NewMiMoCodeTool(path)
 	default:
-		return NewClaudeTool(path) // 默认使用 Claude
+		return NewClaudeTool(path) // use Claude by default
 	}
 }

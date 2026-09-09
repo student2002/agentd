@@ -1,4 +1,4 @@
-// comment_dedupe_test.go 覆盖评论去重逻辑的测试。
+// comment_dedupe_test.go covers tests for the comment dedupation logic.
 package agent_test
 
 import (

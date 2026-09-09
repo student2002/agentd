@@ -1,4 +1,4 @@
-// main.go 是 teammate-agentd（Agent 守护进程）的入口。
+// main.go is the entry point of teammate-agentd (the Agent daemon).
 package main
 
 import (

@@ -1,4 +1,4 @@
-// Package process_test 包含 process 包的测试，验证进程树终止功能。
+// Package process_test contains tests for the process package, verifying process tree termination.
 package process_test
 
 import (

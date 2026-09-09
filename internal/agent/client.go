@@ -1,15 +1,17 @@
-// Package agent 提供 AI 代理守护进程的核心功能。
+// Package agent provides the core functionality of the AI agent daemon.
 //
-// 本包实现了 Agent Daemon 的完整生命周期，包括：
-//   - 运行时注册和心跳维持
-//   - SSE 事件监听和响应
-//   - 节点认领和任务执行
-//   - Git 操作和凭据管理
-//   - 上下文构建和工具调用
-//   - RSA 加密通信
+// This package implements the full lifecycle of the Agent Daemon, including:
+//   - runtime registration and heartbeat maintenance
+//   - SSE event listening and response
+//   - node claiming and task execution
+//   - Git operations and credential management
+//   - context construction and tool invocation
+//   - RSA encrypted communication
 //
-// Client 是与 Server 通信的 HTTP 客户端，封装了所有 API 调用。
-// 客户端支持两种认证方式：API Token（永久）和 Session Token（7 天有效期）。
+// Client is the HTTP client that communicates with the Server and encapsulates
+// all API calls.
+// The client supports two authentication methods: API Token (permanent) and
+// Session Token (7-day validity).
 package agent
 
 import (
@@ -23,47 +25,47 @@ import (
 	"time"
 )
 
-// Client 是与 Teammate Server 通信的 HTTP 客户端。
+// Client is the HTTP client that communicates with the Teammate Server.
 //
-// 客户端封装了所有与 Server 的 REST API 交互，包括：
-//   - 运行时注册和心跳
-//   - 节点认领和状态上报
-//   - Git 凭据拉取
-//   - 评论和日志发送
-//   - Token 交换和刷新
+// The client encapsulates all REST API interactions with the Server, including:
+//   - runtime registration and heartbeat
+//   - node claiming and status reporting
+//   - Git credential retrieval
+//   - comment and log sending
+//   - token exchange and refresh
 //
-// 使用方式：
+// Usage:
 //
 //	client := NewClient("http://localhost:8080", "tm_xxx_xxx")
 //	runtime, _ := client.RegisterRuntime(ctx, workspaceID, agentID, "claude", "1.0.0", pubKey)
 type Client struct {
-	// BaseURL 是 Server 的基础 URL 地址。
+	// BaseURL is the base URL of the Server.
 	BaseURL string
 
-	// APIToken 是用于初始认证的 API Token（tm_ 前缀）。
+	// APIToken is the API Token (tm_ prefix) used for initial authentication.
 	APIToken string
 
-	// SessionToken 是交换后的会话 Token（st_ 前缀），7 天有效期。
+	// SessionToken is the exchanged session Token (st_ prefix), valid for 7 days.
 	SessionToken string
 
-	// SessionExpiry 是 Session Token 的过期时间。
+	// SessionExpiry is the expiry time of the Session Token.
 	SessionExpiry time.Time
 
-	// PrivateKeyPEM 是 RSA 私钥的 PEM 编码，用于解密 Git 凭据。
+	// PrivateKeyPEM is the PEM-encoded RSA private key, used to decrypt Git credentials.
 	PrivateKeyPEM string
 
-	// HTTP 是底层的 HTTP 客户端实例。
+	// HTTP is the underlying HTTP client instance.
 	HTTP *http.Client
 }
 
-// NewClient 创建一个新的 Server 通信客户端。
+// NewClient creates a new Server communication client.
 //
-// 参数：
-//   - baseURL: Server 的基础 URL 地址（如 "http://localhost:8080"）
-//   - apiToken: 用于初始认证的 API Token
+// Parameters:
+//   - baseURL: the base URL of the Server (e.g. "http://localhost:8080")
+//   - apiToken: the API Token used for initial authentication
 //
-// 返回：
-//   - *Client: 初始化完成的客户端实例
+// Returns:
+//   - *Client: the initialized client instance
 func NewClient(baseURL, apiToken string) *Client {
 	return &Client{
 		BaseURL:  baseURL,
@@ -74,8 +76,9 @@ func NewClient(baseURL, apiToken string) *Client {
 	}
 }
 
-// do 执行一个 HTTP 请求，自动设置认证头和 JSON 序列化。
-// 如果 body 不为 nil，则将其序列化为 JSON 并设置 Content-Type 头。
+// do executes an HTTP request, automatically setting auth headers and JSON
+// serialization.
+// If body is not nil, it serializes it to JSON and sets the Content-Type header.
 func (c *Client) do(ctx context.Context, method, path string, body interface{}) (*http.Response, error) {
 	var bodyReader io.Reader
 	if body != nil {
@@ -98,8 +101,9 @@ func (c *Client) do(ctx context.Context, method, path string, body interface{}) 
 	return c.HTTP.Do(req)
 }
 
-// authToken 返回当前最佳的认证令牌。
-// 优先使用会话令牌（如果存在且未接近过期），否则回退到 API 令牌。
+// authToken returns the best available auth token.
+// It prefers the session token (if present and not close to expiry), otherwise
+// falls back to the API token.
 func (c *Client) authToken() string {
 	if c.SessionToken != "" && !c.SessionExpiry.IsZero() && time.Now().Before(c.SessionExpiry.Add(-5*time.Minute)) {
 		return c.SessionToken
@@ -107,8 +111,10 @@ func (c *Client) authToken() string {
 	return c.APIToken
 }
 
-// doJSON 执行一个 JSON API 请求，自动处理请求体序列化和响应体反序列化。
-// 如果响应状态码 >= 300，返回包含状态码和响应体的错误。
+// doJSON executes a JSON API request, automatically handling request body
+// serialization and response body deserialization.
+// If the response status code is >= 300, it returns an error containing the
+// status code and response body.
 func (c *Client) doJSON(ctx context.Context, method, path string, reqBody, respBody interface{}) error {
 	resp, err := c.do(ctx, method, path, reqBody)
 	if err != nil {
@@ -127,7 +133,7 @@ func (c *Client) doJSON(ctx context.Context, method, path string, reqBody, respB
 	return nil
 }
 
-// ListAgentSkills 获取当前 Agent 绑定的技能列表。
+// ListAgentSkills retrieves the list of skills bound to the current Agent.
 func (c *Client) ListAgentSkills(ctx context.Context, workspaceID, agentID string) ([]SkillContext, error) {
 	var skills []SkillContext
 	path := fmt.Sprintf("/api/workspaces/%s/agents/%s/skills", workspaceID, agentID)
@@ -137,7 +143,8 @@ func (c *Client) ListAgentSkills(ctx context.Context, workspaceID, agentID strin
 	return skills, nil
 }
 
-// AgentMcpServerContext 表示执行期可注入给 Agent 的 MCP 服务器配置。
+// AgentMcpServerContext represents the MCP server configuration that can be
+// injected into the Agent during execution.
 type AgentMcpServerContext struct {
 	ID         string          `json:"id"`
 	Name       string          `json:"name"`
@@ -150,7 +157,7 @@ type AgentMcpServerContext struct {
 	AssignedAt string          `json:"assigned_at"`
 }
 
-// ListAgentMcpServers 获取当前 Agent 绑定的 MCP 服务器列表（通过 daemon-only 执行端点，返回解密后的 env_vars）。
+// ListAgentMcpServers retrieves the list of MCP servers bound to the current Agent (via the daemon-only execution endpoint, which returns decrypted env_vars).
 func (c *Client) ListAgentMcpServers(ctx context.Context, workspaceID, agentID string) ([]AgentMcpServerContext, error) {
 	var servers []AgentMcpServerContext
 	path := fmt.Sprintf("/api/workspaces/%s/agents/%s/execution/mcp-servers", workspaceID, agentID)
@@ -162,7 +169,8 @@ func (c *Client) ListAgentMcpServers(ctx context.Context, workspaceID, agentID s
 
 // --- Runtime ---
 
-// RegisterRuntimeRequest 表示运行时注册请求体，与服务端 registerRuntimeRequest 结构对应。
+// RegisterRuntimeRequest represents the runtime registration request body,
+// corresponding to the server-side registerRuntimeRequest structure.
 type RegisterRuntimeRequest struct {
 	AgentID          string `json:"agent_id"`
 	DaemonID         string `json:"daemon_id"`
@@ -173,25 +181,27 @@ type RegisterRuntimeRequest struct {
 	PublicKey        string `json:"public_key"`
 }
 
-// RegisterRuntimeResponse 表示运行时注册响应体，包含新创建的运行时 ID。
+// RegisterRuntimeResponse represents the runtime registration response body,
+// containing the newly created runtime ID.
 type RegisterRuntimeResponse struct {
 	ID string `json:"id"`
 }
 
-// RegisterRuntime 将守护进程注册为代理的运行时实例。
-// 注册成功后返回运行时 ID，用于后续的心跳和事件接收。
+// RegisterRuntime registers the daemon as a runtime instance of the agent.
+// On success it returns the runtime ID, used for subsequent heartbeats and
+// event reception.
 //
-// 参数：
-//   - ctx: 上下文，用于控制请求超时和取消
-//   - workspaceID: 工作区 ID
-//   - agentID: 代理 ID
-//   - provider: 编码工具提供者（如 "claude"）
-//   - toolVersion: 编码工具版本号
-//   - publicKeyPEM: RSA 公钥的 PEM 编码，用于服务端加密 Git 凭据
+// Parameters:
+//   - ctx: context, used to control request timeout and cancellation
+//   - workspaceID: workspace ID
+//   - agentID: agent ID
+//   - provider: coding tool provider (e.g. "claude")
+//   - toolVersion: coding tool version
+//   - publicKeyPEM: PEM-encoded RSA public key, used by the server to encrypt Git credentials
 //
-// 返回：
-//   - *RegisterRuntimeResponse: 注册响应，包含运行时 ID
-//   - error: 注册失败时返回错误
+// Returns:
+//   - *RegisterRuntimeResponse: registration response, containing the runtime ID
+//   - error: returned on registration failure
 func (c *Client) RegisterRuntime(ctx context.Context, workspaceID, agentID, provider, toolVersion, publicKeyPEM string) (*RegisterRuntimeResponse, error) {
 	var result RegisterRuntimeResponse
 	err := c.doJSON(ctx, "POST", fmt.Sprintf("/api/workspaces/%s/runtimes", workspaceID), RegisterRuntimeRequest{
@@ -209,28 +219,31 @@ func (c *Client) RegisterRuntime(ctx context.Context, workspaceID, agentID, prov
 
 // --- Session Token Exchange ---
 
-// ExchangeTokenRequest 表示令牌交换请求体，用于将 API 令牌交换为会话令牌。
+// ExchangeTokenRequest represents the token exchange request body, used to
+// exchange an API token for a session token.
 type ExchangeTokenRequest struct {
 	APIToken string `json:"api_token"`
 }
 
-// ExchangeTokenResponse 表示令牌交换响应体，包含新的会话令牌和过期时间。
+// ExchangeTokenResponse represents the token exchange response body,
+// containing the new session token and expiry time.
 type ExchangeTokenResponse struct {
 	SessionToken string    `json:"session_token"`
 	ExpiresAt    time.Time `json:"expires_at"`
 }
 
-// ExchangeToken 将 API 令牌交换为会话令牌。
-// 会话令牌用于后续的 API 调用，比 API 令牌更安全（短期有效）。
+// ExchangeToken exchanges an API token for a session token.
+// The session token is used for subsequent API calls and is more secure than
+// the API token (short-lived).
 //
-// 参数：
-//   - ctx: 上下文，用于控制请求超时和取消
-//   - apiToken: 用于交换的 API 令牌
+// Parameters:
+//   - ctx: context, used to control request timeout and cancellation
+//   - apiToken: the API token to exchange
 //
-// 返回：
-//   - sessionToken: 新的会话令牌
-//   - expiresAt: 会话令牌的过期时间
-//   - error: 交换失败时返回错误
+// Returns:
+//   - sessionToken: the new session token
+//   - expiresAt: the expiry time of the session token
+//   - error: returned on exchange failure
 func (c *Client) ExchangeToken(ctx context.Context, apiToken string) (sessionToken string, expiresAt time.Time, err error) {
 	var result ExchangeTokenResponse
 	err = c.doJSON(ctx, "POST", "/api/auth/token-exchange", ExchangeTokenRequest{
@@ -242,14 +255,15 @@ func (c *Client) ExchangeToken(ctx context.Context, apiToken string) (sessionTok
 	return result.SessionToken, result.ExpiresAt, nil
 }
 
-// RefreshSessionToken 尝试用 API 令牌重新交换新的会话令牌。
-// 交换成功后更新客户端的 SessionToken 和 SessionExpiry 字段。
+// RefreshSessionToken attempts to re-exchange a new session token using the
+// API token.
+// On success it updates the client's SessionToken and SessionExpiry fields.
 //
-// 参数：
-//   - ctx: 上下文，用于控制请求超时和取消
+// Parameters:
+//   - ctx: context, used to control request timeout and cancellation
 //
-// 返回：
-//   - error: 交换失败时返回错误
+// Returns:
+//   - error: returned on exchange failure
 func (c *Client) RefreshSessionToken(ctx context.Context) error {
 	token, expiresAt, err := c.ExchangeToken(ctx, c.APIToken)
 	if err != nil {
@@ -260,11 +274,13 @@ func (c *Client) RefreshSessionToken(ctx context.Context) error {
 	return nil
 }
 
-// StartSessionTokenRefresher 启动后台协程，在会话令牌过期前自动刷新。
-// 刷新时机为过期前 5 分钟，失败后 30 秒重试一次。
+// StartSessionTokenRefresher starts a background goroutine that automatically
+// refreshes the session token before it expires.
+// Refresh happens 5 minutes before expiry; on failure it retries once after 30
+// seconds.
 //
-// 参数：
-//   - stopCh: 停止信号通道，关闭时协程退出
+// Parameters:
+//   - stopCh: stop signal channel; closing it makes the goroutine exit
 func (c *Client) StartSessionTokenRefresher(stopCh <-chan struct{}) {
 	go func() {
 		for {
@@ -277,7 +293,7 @@ func (c *Client) StartSessionTokenRefresher(stopCh <-chan struct{}) {
 				}
 			}
 
-			// 在过期前 5 分钟刷新
+			// Refresh 5 minutes before expiry
 			refreshAt := c.SessionExpiry.Add(-5 * time.Minute)
 			waitDuration := time.Until(refreshAt)
 			if waitDuration < 0 {
@@ -287,7 +303,7 @@ func (c *Client) StartSessionTokenRefresher(stopCh <-chan struct{}) {
 			select {
 			case <-time.After(waitDuration):
 				if err := c.RefreshSessionToken(context.Background()); err != nil {
-					// 失败后 30 秒重试
+					// Retry 30 seconds after failure
 					select {
 					case <-time.After(30 * time.Second):
 						_ = c.RefreshSessionToken(context.Background())
@@ -302,22 +318,23 @@ func (c *Client) StartSessionTokenRefresher(stopCh <-chan struct{}) {
 	}()
 }
 
-// Heartbeat 向 Server 发送心跳，维持运行时的在线状态。
+// Heartbeat sends a heartbeat to the Server to keep the runtime online.
 //
-// 参数：
-//   - ctx: 上下文，用于控制请求超时和取消
-//   - workspaceID: 工作区 ID
-//   - runtimeID: 运行时 ID
+// Parameters:
+//   - ctx: context, used to control request timeout and cancellation
+//   - workspaceID: workspace ID
+//   - runtimeID: runtime ID
 //
-// 返回：
-//   - error: 发送失败时返回错误
+// Returns:
+//   - error: returned on send failure
 func (c *Client) Heartbeat(ctx context.Context, workspaceID, runtimeID string) error {
 	return c.doJSON(ctx, "POST", fmt.Sprintf("/api/workspaces/%s/runtimes/%s/heartbeat", workspaceID, runtimeID), nil, nil)
 }
 
 // --- Node Operations ---
 
-// TaskNode 表示从 API 获取的任务节点信息，包含节点状态、类型和执行信息。
+// TaskNode represents task node information obtained from the API, including
+// node status, type, and execution information.
 type TaskNode struct {
 	ID              string          `json:"id"`
 	TaskID          int32           `json:"task_id"`
@@ -329,11 +346,12 @@ type TaskNode struct {
 	RejectCount     int32           `json:"reject_count"`
 	Description     string          `json:"description"`
 	Summary         string          `json:"summary"`
-	ReadonlyDirs    json.RawMessage `json:"readonly_dirs"`     // 只读目录（JSON 数组），模板节点配置
-	FullControlDirs json.RawMessage `json:"full_control_dirs"` // 完全控制目录（JSON 数组），模板节点配置
+	ReadonlyDirs    json.RawMessage `json:"readonly_dirs"`     // read-only directories (JSON array), template node config
+	FullControlDirs json.RawMessage `json:"full_control_dirs"` // full-control directories (JSON array), template node config
 }
 
-// Comment 表示任务或节点评论，用于执行上下文和节点交接。
+// Comment represents a comment on a task or node, used for execution context
+// and node handoff.
 type Comment struct {
 	ID           string  `json:"id"`
 	TaskID       int32   `json:"task_id"`
@@ -345,9 +363,9 @@ type Comment struct {
 	CommentType  string  `json:"comment_type"`
 }
 
-// UnmarshalJSON 实现 TaskNode 的自定义 JSON 反序列化。
-// 服务端返回的 sql.NullString 字段格式为 {"String":"...","Valid":true}，
-// 标准字符串反序列化无法处理，需要特殊处理。
+// UnmarshalJSON implements custom JSON deserialization for TaskNode.
+// The server returns sql.NullString fields in the form {"String":"...","Valid":true},
+// which standard string deserialization cannot handle, so special handling is needed.
 func (n *TaskNode) UnmarshalJSON(data []byte) error {
 	type Alias TaskNode
 	aux := &struct {
@@ -365,19 +383,22 @@ func (n *TaskNode) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-// boardResponse 表示看板 API 的响应格式，包含按状态分组的任务列。
+// boardResponse represents the response format of the board API, containing
+// task columns grouped by status.
 type boardResponse struct {
 	Columns []boardColumn `json:"columns"`
 }
 
-// boardColumn 表示看板的一列，包含列标识、标签和任务列表。
+// boardColumn represents a board column, containing a column key, label, and
+// task list.
 type boardColumn struct {
 	Key   string            `json:"key"`
 	Label string            `json:"label"`
 	Tasks []boardColumnTask `json:"tasks"`
 }
 
-// boardColumnTask 表示看板列中的一个任务条目，包含任务基本信息和当前节点状态。
+// boardColumnTask represents a task entry in a board column, containing basic
+// task information and the current node status.
 type boardColumnTask struct {
 	ID                int32       `json:"id"`
 	Title             string      `json:"title"`
@@ -388,16 +409,18 @@ type boardColumnTask struct {
 	AssigneeID        interface{} `json:"assignee_id"`
 }
 
-// ListPendingNodes 返回项目中可认领的 pending 节点列表。
-// 先通过看板 API 获取有 pending 节点的任务，再调用节点 API 获取完整的节点信息（包括节点 ID）。
+// ListPendingNodes returns the list of pending nodes in the project that can be
+// claimed.
+// It first obtains tasks with pending nodes via the board API, then calls the
+// node API to get the full node information (including node ID).
 //
-// 参数：
-//   - ctx: 上下文，用于控制请求超时和取消
-//   - projectID: 项目 ID
+// Parameters:
+//   - ctx: context, used to control request timeout and cancellation
+//   - projectID: project ID
 //
-// 返回：
-//   - []TaskNode: 可认领的 pending 节点列表
-//   - error: 查询失败时返回错误
+// Returns:
+//   - []TaskNode: the list of pending nodes that can be claimed
+//   - error: returned on query failure
 func (c *Client) ListPendingNodes(ctx context.Context, projectID string) ([]TaskNode, error) {
 	var result boardResponse
 	err := c.doJSON(ctx, "GET", fmt.Sprintf("/api/projects/%s/board", projectID), nil, &result)
@@ -405,7 +428,7 @@ func (c *Client) ListPendingNodes(ctx context.Context, projectID string) ([]Task
 		return nil, err
 	}
 
-	// 从 pending 列收集任务 ID（review 节点现已合并到同一列中）
+	// Collect task IDs from the pending column (review nodes are now merged into the same column)
 	var pendingTaskIDs []int32
 	for _, col := range result.Columns {
 		if col.Key == "pending" {
@@ -419,7 +442,7 @@ func (c *Client) ListPendingNodes(ctx context.Context, projectID string) ([]Task
 		return nil, nil
 	}
 
-	// 为每个 pending 任务获取完整节点详情以得到节点 ID
+	// For each pending task, fetch full node details to obtain the node ID
 	var nodes []TaskNode
 	for _, taskID := range pendingTaskIDs {
 		select {
@@ -440,37 +463,39 @@ func (c *Client) ListPendingNodes(ctx context.Context, projectID string) ([]Task
 	return nodes, nil
 }
 
-// ListTaskNodes 获取指定任务的所有节点。
-// 接口：GET /api/tasks/{taskId}/nodes
+// ListTaskNodes retrieves all nodes of the specified task.
+// Endpoint: GET /api/tasks/{taskId}/nodes
 //
-// 参数：
-//   - ctx: 上下文，用于控制请求超时和取消
-//   - taskID: 任务 ID
+// Parameters:
+//   - ctx: context, used to control request timeout and cancellation
+//   - taskID: task ID
 //
-// 返回：
-//   - []TaskNode: 任务节点列表
-//   - error: 查询失败时返回错误
+// Returns:
+//   - []TaskNode: the task node list
+//   - error: returned on query failure
 func (c *Client) ListTaskNodes(ctx context.Context, taskID int32) ([]TaskNode, error) {
 	var result []TaskNode
 	err := c.doJSON(ctx, "GET", fmt.Sprintf("/api/tasks/%d/nodes", taskID), nil, &result)
 	return result, err
 }
 
-// ListExecutionContextComments 获取执行指定节点时应注入的评论上下文。
+// ListExecutionContextComments retrieves the comment context that should be
+// injected when executing the specified node.
 func (c *Client) ListExecutionContextComments(ctx context.Context, taskID int32, nodeID string) ([]Comment, error) {
 	var result []Comment
 	err := c.doJSON(ctx, "GET", fmt.Sprintf("/api/tasks/%d/comments?node_id=%s&scope=execution_context", taskID, nodeID), nil, &result)
 	return result, err
 }
 
-// ListNodeComments 获取指定节点评论区中的评论。
+// ListNodeComments retrieves comments in the specified node's comment area.
 func (c *Client) ListNodeComments(ctx context.Context, taskID int32, nodeID string) ([]Comment, error) {
 	var result []Comment
 	err := c.doJSON(ctx, "GET", fmt.Sprintf("/api/tasks/%d/comments?node_id=%s", taskID, nodeID), nil, &result)
 	return result, err
 }
 
-// InProgressNode 表示 Agent 认领但未完成的节点，用于重启后恢复执行。
+// InProgressNode represents a node claimed by the Agent but not yet completed,
+// used to resume execution after a restart.
 type InProgressNode struct {
 	ID              string          `json:"id"`
 	TaskID          int32           `json:"task_id"`
@@ -478,42 +503,44 @@ type InProgressNode struct {
 	SortOrder       int32           `json:"sort_order"`
 	NodeType        string          `json:"node_type"`
 	Status          string          `json:"status"`
-	ReadonlyDirs    json.RawMessage `json:"readonly_dirs"`     // 只读目录（JSON 数组）
-	FullControlDirs json.RawMessage `json:"full_control_dirs"` // 完全控制目录（JSON 数组）
+	ReadonlyDirs    json.RawMessage `json:"readonly_dirs"`     // read-only directories (JSON array)
+	FullControlDirs json.RawMessage `json:"full_control_dirs"` // full-control directories (JSON array)
 	ProjectID       string          `json:"project_id"`
 }
 
-// GetInProgressNodes 查询当前 Agent 认领但未完成（in_progress）的节点。
-// 用于 Agent 重启后恢复未完成的执行。
-// 接口：GET /api/workspaces/{workspaceID}/agents/{agentID}/in-progress-nodes
+// GetInProgressNodes queries the nodes claimed by the current Agent that are
+// not yet completed (in_progress).
+// Used to resume unfinished execution after the Agent restarts.
+// Endpoint: GET /api/workspaces/{workspaceID}/agents/{agentID}/in-progress-nodes
 //
-// 参数：
-//   - ctx: 上下文
-//   - workspaceID: 工作区 ID
-//   - agentID: 代理 ID
+// Parameters:
+//   - ctx: context
+//   - workspaceID: workspace ID
+//   - agentID: agent ID
 //
-// 返回：
-//   - []InProgressNode: in_progress 节点列表
-//   - error: 查询失败时返回错误
+// Returns:
+//   - []InProgressNode: the in_progress node list
+//   - error: returned on query failure
 func (c *Client) GetInProgressNodes(ctx context.Context, workspaceID, agentID string) ([]InProgressNode, error) {
 	var result []InProgressNode
 	err := c.doJSON(ctx, "GET", fmt.Sprintf("/api/workspaces/%s/agents/%s/in-progress-nodes", workspaceID, agentID), nil, &result)
 	return result, err
 }
 
-// ClaimNode 认领一个 pending 节点，将其分配给指定代理。
-// 使用乐观锁实现并发控制，如果节点已被其他代理认领则返回 409 Conflict。
-// 接口：POST /api/tasks/{taskId}/nodes/{nodeId}/claim
+// ClaimNode claims a pending node, assigning it to the specified agent.
+// Uses optimistic locking for concurrency control; if the node has already
+// been claimed by another agent it returns 409 Conflict.
+// Endpoint: POST /api/tasks/{taskId}/nodes/{nodeId}/claim
 //
-// 参数：
-//   - ctx: 上下文，用于控制请求超时和取消
-//   - agentID: 要认领节点的代理 ID
-//   - taskID: 任务 ID
-//   - nodeID: 节点 ID
+// Parameters:
+//   - ctx: context, used to control request timeout and cancellation
+//   - agentID: the ID of the agent claiming the node
+//   - taskID: task ID
+//   - nodeID: node ID
 //
-// 返回：
-//   - *TaskNode: 认领成功后的节点信息
-//   - error: 认领失败时返回错误（如 409 Conflict）
+// Returns:
+//   - *TaskNode: the node information after a successful claim
+//   - error: returned on claim failure (e.g. 409 Conflict)
 func (c *Client) ClaimNode(ctx context.Context, agentID string, taskID int32, nodeID string) (*TaskNode, error) {
 	var result TaskNode
 	err := c.doJSON(ctx, "POST", fmt.Sprintf("/api/tasks/%d/nodes/%s/claim", taskID, nodeID), map[string]string{
@@ -522,18 +549,18 @@ func (c *Client) ClaimNode(ctx context.Context, agentID string, taskID int32, no
 	return &result, err
 }
 
-// ApproveNode 审批通过（完成）当前节点。
-// 接口：POST /api/tasks/{taskId}/nodes/{nodeId}/approve
+// ApproveNode approves (completes) the current node.
+// Endpoint: POST /api/tasks/{taskId}/nodes/{nodeId}/approve
 //
-// 参数：
-//   - ctx: 上下文，用于控制请求超时和取消
-//   - agentID: 审批者代理 ID
-//   - taskID: 任务 ID
-//   - nodeID: 节点 ID
-//   - comment: 审批意见
+// Parameters:
+//   - ctx: context, used to control request timeout and cancellation
+//   - agentID: the approver agent ID
+//   - taskID: task ID
+//   - nodeID: node ID
+//   - comment: approval comment
 //
-// 返回：
-//   - error: 审批失败时返回错误
+// Returns:
+//   - error: returned on approval failure
 func (c *Client) ApproveNode(ctx context.Context, agentID string, taskID int32, nodeID, comment string) error {
 	return c.doJSON(ctx, "POST", fmt.Sprintf("/api/tasks/%d/nodes/%s/approve", taskID, nodeID), map[string]string{
 		"operator_id":   agentID,
@@ -542,37 +569,39 @@ func (c *Client) ApproveNode(ctx context.Context, agentID string, taskID int32, 
 	}, nil)
 }
 
-// CompleteNode 完成一个标准节点（仅代理调用，不需要 task:approve 权限）。
-// 接口：POST /api/tasks/{taskId}/nodes/{nodeId}/complete
+// CompleteNode completes a standard node (agent-only call, does not require
+// task:approve permission).
+// Endpoint: POST /api/tasks/{taskId}/nodes/{nodeId}/complete
 //
-// 参数：
-//   - ctx: 上下文，用于控制请求超时和取消
-//   - agentID: 执行代理 ID
-//   - taskID: 任务 ID
-//   - nodeID: 节点 ID
-//   - summary: 节点执行摘要
+// Parameters:
+//   - ctx: context, used to control request timeout and cancellation
+//   - agentID: the executing agent ID
+//   - taskID: task ID
+//   - nodeID: node ID
+//   - summary: node execution summary
 //
-// 返回：
-//   - error: 完成失败时返回错误
+// Returns:
+//   - error: returned on completion failure
 func (c *Client) CompleteNode(ctx context.Context, agentID string, taskID int32, nodeID, summary string) error {
 	return c.doJSON(ctx, "POST", fmt.Sprintf("/api/tasks/%d/nodes/%s/complete", taskID, nodeID), map[string]string{
 		"summary": summary,
 	}, nil)
 }
 
-// RejectNode 驳回当前节点，将其回退到指定的目标节点。
-// 接口：POST /api/tasks/{taskId}/nodes/{nodeId}/reject
+// RejectNode rejects the current node, rolling it back to the specified target
+// node.
+// Endpoint: POST /api/tasks/{taskId}/nodes/{nodeId}/reject
 //
-// 参数：
-//   - ctx: 上下文，用于控制请求超时和取消
-//   - agentID: 驳回者代理 ID
-//   - taskID: 任务 ID
-//   - nodeID: 被驳回的节点 ID
-//   - targetNodeID: 回退目标节点 ID
-//   - comment: 驳回意见
+// Parameters:
+//   - ctx: context, used to control request timeout and cancellation
+//   - agentID: the rejecter agent ID
+//   - taskID: task ID
+//   - nodeID: the ID of the rejected node
+//   - targetNodeID: the rollback target node ID
+//   - comment: rejection comment
 //
-// 返回：
-//   - error: 驳回失败时返回错误
+// Returns:
+//   - error: returned on rejection failure
 func (c *Client) RejectNode(ctx context.Context, agentID string, taskID int32, nodeID, targetNodeID, comment string) error {
 	return c.doJSON(ctx, "POST", fmt.Sprintf("/api/tasks/%d/nodes/%s/reject", taskID, nodeID), map[string]interface{}{
 		"operator_id":    agentID,
@@ -582,18 +611,18 @@ func (c *Client) RejectNode(ctx context.Context, agentID string, taskID int32, n
 	}, nil)
 }
 
-// ManualIntervention 将节点标记为需要人工干预。
-// 接口：POST /api/tasks/{taskId}/nodes/{nodeId}/manual
+// ManualIntervention marks the node as requiring manual intervention.
+// Endpoint: POST /api/tasks/{taskId}/nodes/{nodeId}/manual
 //
-// 参数：
-//   - ctx: 上下文，用于控制请求超时和取消
-//   - agentID: 操作者代理 ID
-//   - taskID: 任务 ID
-//   - nodeID: 节点 ID
-//   - comment: 干预原因说明
+// Parameters:
+//   - ctx: context, used to control request timeout and cancellation
+//   - agentID: the operator agent ID
+//   - taskID: task ID
+//   - nodeID: node ID
+//   - comment: explanation of the intervention reason
 //
-// 返回：
-//   - error: 操作失败时返回错误
+// Returns:
+//   - error: returned on operation failure
 func (c *Client) ManualIntervention(ctx context.Context, agentID string, taskID int32, nodeID, comment string) error {
 	return c.doJSON(ctx, "POST", fmt.Sprintf("/api/tasks/%d/nodes/%s/manual", taskID, nodeID), map[string]string{
 		"operator_id":   agentID,
@@ -602,17 +631,18 @@ func (c *Client) ManualIntervention(ctx context.Context, agentID string, taskID 
 	}, nil)
 }
 
-// SkipClaim 放弃节点的续约权，允许其他代理认领后续节点。
-// 接口：POST /api/tasks/{taskId}/nodes/{nodeId}/skip-claim
+// SkipClaim relinquishes the node's continuation right, allowing other agents
+// to claim subsequent nodes.
+// Endpoint: POST /api/tasks/{taskId}/nodes/{nodeId}/skip-claim
 //
-// 参数：
-//   - ctx: 上下文，用于控制请求超时和取消
-//   - agentID: 放弃续约权的代理 ID
-//   - taskID: 任务 ID
-//   - nodeID: 节点 ID
+// Parameters:
+//   - ctx: context, used to control request timeout and cancellation
+//   - agentID: the ID of the agent relinquishing the continuation right
+//   - taskID: task ID
+//   - nodeID: node ID
 //
-// 返回：
-//   - error: 操作失败时返回错误
+// Returns:
+//   - error: returned on operation failure
 func (c *Client) SkipClaim(ctx context.Context, agentID string, taskID int32, nodeID string) error {
 	return c.doJSON(ctx, "POST", fmt.Sprintf("/api/tasks/%d/nodes/%s/skip-claim", taskID, nodeID), map[string]string{
 		"agent_id": agentID,
@@ -621,25 +651,26 @@ func (c *Client) SkipClaim(ctx context.Context, agentID string, taskID int32, no
 
 // --- Token Usage ---
 
-// TokenUsageRequest 表示 Token 用量上报请求体，包含输入、输出和总 Token 数。
+// TokenUsageRequest represents the token usage report request body,
+// containing input, output, and total token counts.
 type TokenUsageRequest struct {
 	InputTokens  int `json:"input_tokens"`
 	OutputTokens int `json:"output_tokens"`
 	TotalTokens  int `json:"total_tokens"`
 }
 
-// ReportTokenUsage 上报已完成节点的 Token 用量。
-// 接口：POST /api/tasks/{taskId}/token-usage
+// ReportTokenUsage reports the token usage of a completed node.
+// Endpoint: POST /api/tasks/{taskId}/token-usage
 //
-// 参数：
-//   - ctx: 上下文，用于控制请求超时和取消
-//   - taskID: 任务 ID
-//   - nodeID: 节点 ID
-//   - agentID: 执行代理 ID
-//   - usage: Token 用量信息
+// Parameters:
+//   - ctx: context, used to control request timeout and cancellation
+//   - taskID: task ID
+//   - nodeID: node ID
+//   - agentID: the executing agent ID
+//   - usage: token usage information
 //
-// 返回：
-//   - error: 上报失败时返回错误
+// Returns:
+//   - error: returned on report failure
 func (c *Client) ReportTokenUsage(ctx context.Context, taskID int32, nodeID, agentID string, usage TokenUsageRequest) error {
 	return c.doJSON(ctx, "POST", fmt.Sprintf("/api/tasks/%d/token-usage", taskID), map[string]interface{}{
 		"task_node_id":  nodeID,
@@ -652,35 +683,37 @@ func (c *Client) ReportTokenUsage(ctx context.Context, taskID int32, nodeID, age
 
 // --- Git Credentials ---
 
-// GitCredentials 表示解密后的 Git 凭据，包含仓库 URL、用户名和个人访问令牌。
+// GitCredentials represents the decrypted Git credentials, containing the
+// repository URL, username, and personal access token.
 type GitCredentials struct {
 	RepoURL  string `json:"repo_url"`
 	Username string `json:"username"`
-	PAT      string `json:"pat"` // 解密后的个人访问令牌（RSA 解密后）
+	PAT      string `json:"pat"` // decrypted personal access token (after RSA decryption)
 }
 
-// gitCredentialsResponse 表示 Git 凭据 API 的响应格式。
+// gitCredentialsResponse represents the response format of the Git credentials API.
 type gitCredentialsResponse struct {
 	Credentials []gitCredentialEntry `json:"credentials"`
 }
 
-// gitCredentialEntry 表示服务端返回的单个凭据条目，包含加密的个人访问令牌。
+// gitCredentialEntry represents a single credential entry returned by the
+// server, containing the encrypted personal access token.
 type gitCredentialEntry struct {
 	RepoURL      string `json:"repo_url"`
 	Username     string `json:"username"`
 	EncryptedPAT string `json:"encrypted_pat"`
 }
 
-// GetGitCredentials 获取并解密项目的 Git 凭据。
-// 返回凭据列表（每个配置的 repo_url 一个）。
+// GetGitCredentials retrieves and decrypts the project's Git credentials.
+// Returns a list of credentials (one per configured repo_url).
 //
-// 参数：
-//   - ctx: 上下文，用于控制请求超时和取消
-//   - projectID: 项目 ID
+// Parameters:
+//   - ctx: context, used to control request timeout and cancellation
+//   - projectID: project ID
 //
-// 返回：
-//   - []GitCredentials: 解密后的凭据列表
-//   - error: 获取或解密失败时返回错误
+// Returns:
+//   - []GitCredentials: the decrypted credential list
+//   - error: returned on retrieval or decryption failure
 func (c *Client) GetGitCredentials(ctx context.Context, projectID string) ([]GitCredentials, error) {
 	var result gitCredentialsResponse
 	err := c.doJSON(ctx, "GET", fmt.Sprintf("/api/projects/%s/git-credentials", projectID), nil, &result)
@@ -691,7 +724,7 @@ func (c *Client) GetGitCredentials(ctx context.Context, projectID string) ([]Git
 	creds := make([]GitCredentials, 0, len(result.Credentials))
 	for _, entry := range result.Credentials {
 		pat := entry.EncryptedPAT
-		// 如果有私钥，则解密 PAT
+		// If a private key is available, decrypt the PAT
 		if c.PrivateKeyPEM != "" && entry.EncryptedPAT != "" {
 			decrypted, err := DecryptWithPrivateKey(c.PrivateKeyPEM, entry.EncryptedPAT)
 			if err != nil {
@@ -712,7 +745,8 @@ func (c *Client) GetGitCredentials(ctx context.Context, projectID string) ([]Git
 
 // --- Projects ---
 
-// Project 表示从 API 获取的项目信息，包含项目 ID 和名称。
+// Project represents project information obtained from the API, containing the
+// project ID and name.
 type Project struct {
 	ID          string `json:"id"`
 	Name        string `json:"name"`
@@ -720,23 +754,24 @@ type Project struct {
 	RepoURL     string `json:"repo_url"`
 }
 
-// ListProjects 获取工作区中的所有项目。
-// 接口：GET /api/workspaces/{workspaceID}/projects
+// ListProjects retrieves all projects in the workspace.
+// Endpoint: GET /api/workspaces/{workspaceID}/projects
 //
-// 参数：
-//   - ctx: 上下文，用于控制请求超时和取消
-//   - workspaceID: 工作区 ID
+// Parameters:
+//   - ctx: context, used to control request timeout and cancellation
+//   - workspaceID: workspace ID
 //
-// 返回：
-//   - []Project: 项目列表
-//   - error: 查询失败时返回错误
+// Returns:
+//   - []Project: the project list
+//   - error: returned on query failure
 func (c *Client) ListProjects(ctx context.Context, workspaceID string) ([]Project, error) {
 	var result []Project
 	err := c.doJSON(ctx, "GET", fmt.Sprintf("/api/workspaces/%s/projects", workspaceID), nil, &result)
 	return result, err
 }
 
-// GetProject 获取单个项目信息，包括项目级仓库配置。
+// GetProject retrieves a single project's information, including project-level
+// repository configuration.
 func (c *Client) GetProject(ctx context.Context, workspaceID, projectID string) (*Project, error) {
 	var result Project
 	err := c.doJSON(ctx, "GET", fmt.Sprintf("/api/workspaces/%s/projects/%s", workspaceID, projectID), nil, &result)
@@ -748,33 +783,35 @@ func (c *Client) GetProject(ctx context.Context, workspaceID, projectID string) 
 
 // --- Task Messages ---
 
-// SendMessage 发送任务日志消息，内容在上传前会进行脱敏处理。
-// 接口：POST /api/tasks/{taskId}/messages
+// SendMessage sends a task log message; the content is desensitized before
+// upload.
+// Endpoint: POST /api/tasks/{taskId}/messages
 //
-// 参数：
-//   - ctx: 上下文，用于控制请求超时和取消
-//   - taskID: 任务 ID
-//   - nodeID: 节点 ID
-//   - content: 日志内容
+// Parameters:
+//   - ctx: context, used to control request timeout and cancellation
+//   - taskID: task ID
+//   - nodeID: node ID
+//   - content: log content
 //
-// 返回：
-//   - error: 发送失败时返回错误
+// Returns:
+//   - error: returned on send failure
 func (c *Client) SendMessage(ctx context.Context, taskID int32, nodeID, content string) error {
 	return c.SendMessageWithType(ctx, taskID, nodeID, "stdout", content)
 }
 
-// SendMessageWithType 发送指定类型的任务日志消息，内容在上传前会进行脱敏处理。
-// 接口：POST /api/tasks/{taskId}/messages
+// SendMessageWithType sends a task log message of the specified type; the
+// content is desensitized before upload.
+// Endpoint: POST /api/tasks/{taskId}/messages
 //
-// 参数：
-//   - ctx: 上下文，用于控制请求超时和取消
-//   - taskID: 任务 ID
-//   - nodeID: 节点 ID
-//   - msgType: 消息类型 ("stdout"、"stderr"、"system")
-//   - content: 日志内容
+// Parameters:
+//   - ctx: context, used to control request timeout and cancellation
+//   - taskID: task ID
+//   - nodeID: node ID
+//   - msgType: message type ("stdout", "stderr", "system")
+//   - content: log content
 //
-// 返回：
-//   - error: 发送失败时返回错误
+// Returns:
+//   - error: returned on send failure
 func (c *Client) SendMessageWithType(ctx context.Context, taskID int32, nodeID, msgType, content string) error {
 	desensitized := DesensitizeLog(content)
 	log.Printf("[client:SendMessage] task=%d node=%s type=%s content_len=%d", taskID, nodeID, msgType, len(desensitized))
@@ -793,16 +830,17 @@ func (c *Client) SendMessageWithType(ctx context.Context, taskID int32, nodeID, 
 
 // --- Interrupt ---
 
-// ReportInterrupt 确认已处理任务节点的中断请求。
-// 接口：POST /api/tasks/{taskId}/nodes/{nodeId}/interrupt-ack
+// ReportInterrupt acknowledges that an interrupt request for a task node has
+// been processed.
+// Endpoint: POST /api/tasks/{taskId}/nodes/{nodeId}/interrupt-ack
 //
-// 参数：
-//   - ctx: 上下文，用于控制请求超时和取消
-//   - taskID: 任务 ID
-//   - nodeID: 节点 ID
+// Parameters:
+//   - ctx: context, used to control request timeout and cancellation
+//   - taskID: task ID
+//   - nodeID: node ID
 //
-// 返回：
-//   - error: 确认失败时返回错误
+// Returns:
+//   - error: returned on acknowledgment failure
 func (c *Client) ReportInterrupt(ctx context.Context, taskID int32, nodeID string) error {
 	return c.doJSON(ctx, "POST", fmt.Sprintf("/api/tasks/%d/nodes/%s/interrupt-ack", taskID, nodeID), map[string]string{
 		"comment": "interrupt acknowledged by agent",
@@ -811,17 +849,17 @@ func (c *Client) ReportInterrupt(ctx context.Context, taskID int32, nodeID strin
 
 // --- Task Details ---
 
-// GetTask 根据任务 ID 获取任务详情。
-// 接口：GET /api/projects/{projectID}/tasks/{taskID}
+// GetTask retrieves task details by task ID.
+// Endpoint: GET /api/projects/{projectID}/tasks/{taskID}
 //
-// 参数：
-//   - ctx: 上下文，用于控制请求超时和取消
-//   - projectID: 项目 ID
-//   - taskID: 任务 ID
+// Parameters:
+//   - ctx: context, used to control request timeout and cancellation
+//   - projectID: project ID
+//   - taskID: task ID
 //
-// 返回：
-//   - *Task: 任务详情
-//   - error: 查询失败时返回错误
+// Returns:
+//   - *Task: task details
+//   - error: returned on query failure
 func (c *Client) GetTask(ctx context.Context, projectID string, taskID int32) (*Task, error) {
 	var result Task
 	err := c.doJSON(ctx, "GET", fmt.Sprintf("/api/projects/%s/tasks/%d", projectID, taskID), nil, &result)
@@ -831,58 +869,59 @@ func (c *Client) GetTask(ctx context.Context, projectID string, taskID int32) (*
 	return &result, nil
 }
 
-// ReportSummary 更新已完成节点的摘要信息。
-// 接口：POST /api/tasks/{taskId}/nodes/{nodeId}/summary
+// ReportSummary updates the summary information of a completed node.
+// Endpoint: POST /api/tasks/{taskId}/nodes/{nodeId}/summary
 //
-// 参数：
-//   - ctx: 上下文，用于控制请求超时和取消
-//   - taskID: 任务 ID
-//   - nodeID: 节点 ID
-//   - summary: 节点执行摘要
+// Parameters:
+//   - ctx: context, used to control request timeout and cancellation
+//   - taskID: task ID
+//   - nodeID: node ID
+//   - summary: node execution summary
 //
-// 返回：
-//   - error: 更新失败时返回错误
+// Returns:
+//   - error: returned on update failure
 func (c *Client) ReportSummary(ctx context.Context, taskID int32, nodeID, summary string) error {
 	return c.doJSON(ctx, "POST", fmt.Sprintf("/api/tasks/%d/nodes/%s/summary", taskID, nodeID), map[string]string{
 		"summary": summary,
 	}, nil)
 }
 
-// ReportGitBranch 在 Git 工作区初始化成功后，上报任务的 Git 分支名称。
-// 接口：PUT /api/tasks/{taskId}/git-branch
+// ReportGitBranch reports the task's Git branch name after the Git workspace
+// is initialized successfully.
+// Endpoint: PUT /api/tasks/{taskId}/git-branch
 //
-// 参数：
-//   - ctx: 上下文，用于控制请求超时和取消
-//   - taskID: 任务 ID
-//   - gitBranch: Git 分支名称
+// Parameters:
+//   - ctx: context, used to control request timeout and cancellation
+//   - taskID: task ID
+//   - gitBranch: Git branch name
 //
-// 返回：
-//   - error: 上报失败时返回错误
+// Returns:
+//   - error: returned on report failure
 func (c *Client) ReportGitBranch(ctx context.Context, taskID int32, gitBranch string) error {
 	return c.doJSON(ctx, "PUT", fmt.Sprintf("/api/tasks/%d/git-branch", taskID), map[string]string{
 		"git_branch": gitBranch,
 	}, nil)
 }
 
-// PostComment 在任务上发布评论。
-// 接口：POST /api/tasks/{taskId}/comments
+// PostComment posts a comment on a task.
+// Endpoint: POST /api/tasks/{taskId}/comments
 //
-// 参数：
-//   - ctx: 上下文，用于控制请求超时和取消
-//   - taskID: 任务 ID
-//   - content: 评论内容
-//   - authorType: 作者类型（"agent" 或 "human"）
-//   - authorID: 作者 ID
+// Parameters:
+//   - ctx: context, used to control request timeout and cancellation
+//   - taskID: task ID
+//   - content: comment content
+//   - authorType: author type ("agent" or "human")
+//   - authorID: author ID
 //
-// 返回：
-//   - error: 发布失败时返回错误
+// Returns:
+//   - error: returned on post failure
 func (c *Client) PostComment(ctx context.Context, taskID int32, content, authorType, authorID string) error {
 	return c.doJSON(ctx, "POST", fmt.Sprintf("/api/tasks/%d/comments", taskID), map[string]string{
 		"content": content,
 	}, nil)
 }
 
-// PostNodeComment 在指定节点评论区发布评论。
+// PostNodeComment posts a comment in the specified node's comment area.
 func (c *Client) PostNodeComment(ctx context.Context, taskID int32, nodeID, sourceNodeID, commentType, content string) error {
 	body := map[string]string{
 		"node_id":      nodeID,

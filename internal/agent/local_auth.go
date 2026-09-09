@@ -1,4 +1,5 @@
-// local_auth.go 提供本地模式的认证令牌校验与密钥生成。
+// local_auth.go provides authentication token validation and key generation for
+// local mode.
 package agent
 
 import (
@@ -10,7 +11,7 @@ import (
 	"strings"
 )
 
-// GenerateLocalToken 为仅回环访问的本地 API 创建 bearer token。
+// GenerateLocalToken creates a bearer token for the loopback-only local API.
 func GenerateLocalToken() (string, error) {
 	bytes := make([]byte, 32)
 	if _, err := rand.Read(bytes); err != nil {

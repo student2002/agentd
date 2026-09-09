@@ -1,12 +1,16 @@
-// heartbeat.go 管理 Agent Daemon 的周期性心跳发送。
+// heartbeat.go manages the periodic heartbeat sending of the Agent Daemon.
 //
-// 本文件负责维持代理运行时的在线状态，主要包括：
-//   - Heartbeat 结构体：封装心跳循环的配置和生命周期管理
-//   - Start / Stop：启动和停止心跳协程，支持优雅退出
-//   - 心跳间隔：默认 30 秒，可配置
+// This file maintains the online status of the agent runtime, mainly including:
+//   - Heartbeat struct: encapsulates the configuration and lifecycle management
+//     of the heartbeat loop
+//   - Start / Stop: start and stop the heartbeat goroutine, supporting graceful
+//     shutdown
+//   - heartbeat interval: 30 seconds by default, configurable
 //
-// 心跳通过 HTTP POST 发送到 Server 的 /api/workspaces/{id}/runtimes/{id}/heartbeat 端点。
-// 心跳失败时仅记录日志，不中断守护进程运行。
+// The heartbeat is sent via HTTP POST to the Server endpoint
+// /api/workspaces/{id}/runtimes/{id}/heartbeat.
+// On heartbeat failure only a log is recorded; the daemon run is not
+// interrupted.
 package agent
 
 import (
@@ -16,7 +20,8 @@ import (
 	"time"
 )
 
-// Heartbeat 管理周期性心跳发送，维持代理运行时的在线状态。
+// Heartbeat manages periodic heartbeat sending, maintaining the online status of
+// the agent runtime.
 type Heartbeat struct {
 	client      *Client
 	workspaceID string
@@ -32,7 +37,7 @@ type HeartbeatCallbacks struct {
 	OnError   func(error)
 }
 
-// NewHeartbeat 创建一个新的心跳管理器。
+// NewHeartbeat creates a new heartbeat manager.
 func NewHeartbeat(client *Client, workspaceID, runtimeID string, interval time.Duration) *Heartbeat {
 	return NewHeartbeatWithCallbacks(client, workspaceID, runtimeID, interval, HeartbeatCallbacks{})
 }
@@ -48,7 +53,7 @@ func NewHeartbeatWithCallbacks(client *Client, workspaceID, runtimeID string, in
 	}
 }
 
-// Start 启动心跳循环。
+// Start starts the heartbeat loop.
 func (h *Heartbeat) Start() {
 	h.wg.Add(1)
 	go func() {
@@ -76,7 +81,7 @@ func (h *Heartbeat) Start() {
 	}()
 }
 
-// Stop 停止心跳循环并等待协程退出。
+// Stop stops the heartbeat loop and waits for the goroutine to exit.
 func (h *Heartbeat) Stop() {
 	close(h.stopCh)
 	h.wg.Wait()

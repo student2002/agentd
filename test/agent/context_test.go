@@ -1,5 +1,5 @@
-// Package agent_test 包含 agent 包的测试，涵盖 shell 转义、
-// 执行上下文构建、Git 操作以及 agent 守护进程使用的 token 估算。
+// Package agent_test contains tests for the agent package, covering shell escaping,
+// execution context building, Git operations, and token estimation used by the agent daemon.
 package agent_test
 
 import (
@@ -13,19 +13,19 @@ import (
 	"github.com/teammate/agentd/internal/agent"
 )
 
-// TestBuildContext_AllAPIPathsVerified 验证所有 5 个上下文获取
-// 函数调用了正确的 API 路径并成功解析了响应。
+// TestBuildContext_AllAPIPathsVerified verifies that all 5 context-fetching
+// functions call the correct API paths and successfully parse the responses.
 func TestBuildContext_AllAPIPathsVerified(t *testing.T) {
-	// 记录哪些 API 路径被调用过
+	// record which API paths were called
 	calledPaths := make(map[string]bool)
 
-	// 创建一个模拟后端 API 的 mock HTTP 服务器
+	// create a mock HTTP server simulating the backend API
 	mux := http.NewServeMux()
 
 	// 1. GET /api/workspaces/{wsId}
 	mux.HandleFunc("/api/workspaces/", func(w http.ResponseWriter, r *http.Request) {
 		calledPaths["GET /api/workspaces/{wsId}"] = true
-		// 验证路径格式：/api/workspaces/{wsId}
+		// validate the path format: /api/workspaces/{wsId}
 		if r.Method != "GET" {
 			t.Errorf("workspace: expected GET, got %s", r.Method)
 		}
@@ -62,8 +62,8 @@ func TestBuildContext_AllAPIPathsVerified(t *testing.T) {
 
 	// 5. GET /api/workspaces/{wsId}/agents/{agentId}/skills
 	mux.HandleFunc("/api/workspaces/{wsId}/agents/", func(w http.ResponseWriter, r *http.Request) {
-		// 该 handler 同时匹配 agent 信息和技能路径
-		// 检查是否是技能子路径
+		// this handler matches both the agent info and the skills path
+		// check whether it is a skills subpath
 		if r.URL.Path == "/api/workspaces/ws-1/agents/agent-1/skills" {
 			calledPaths["GET /api/workspaces/{wsId}/agents/{agentId}/skills"] = true
 			if r.Method != "GET" {
@@ -84,7 +84,7 @@ func TestBuildContext_AllAPIPathsVerified(t *testing.T) {
 			})
 			return
 		}
-		// Agent 信息路径
+		// agent info path
 		calledPaths["GET /api/workspaces/{wsId}/agents/{agentId}"] = true
 		if r.Method != "GET" {
 			t.Errorf("agent: expected GET, got %s", r.Method)
@@ -97,7 +97,7 @@ func TestBuildContext_AllAPIPathsVerified(t *testing.T) {
 	server := httptest.NewServer(mux)
 	defer server.Close()
 
-	// 创建指向 mock 服务器的客户端
+	// create a client pointing to the mock server
 	client := agent.NewClient(server.URL, "test-token")
 
 	cfg := &agent.Config{
@@ -121,13 +121,13 @@ func TestBuildContext_AllAPIPathsVerified(t *testing.T) {
 		Description: "Implement the core authentication logic",
 	}
 
-	// 构建执行上下文
+	// build the execution context
 	context, err := agent.BuildExecutionContext(client, cfg, task, node, false)
 	if err != nil {
 		t.Fatalf("BuildExecutionContext failed: %v", err)
 	}
 
-	// 验证所有 5 个 API 路径都被调用过
+	// verify that all 5 API paths were called
 	expectedPaths := []string{
 		"GET /api/workspaces/{wsId}",
 		"GET /api/workspaces/{wsId}/projects/{projectId}",
@@ -142,7 +142,7 @@ func TestBuildContext_AllAPIPathsVerified(t *testing.T) {
 		}
 	}
 
-	// 验证 context 包含所有预期的部分
+	// verify that the context contains all expected sections
 	expectedSections := []string{
 		"Workspace Context",
 		"Project Context",
@@ -160,7 +160,7 @@ func TestBuildContext_AllAPIPathsVerified(t *testing.T) {
 		}
 	}
 
-	// 验证来自 mock 响应的特定内容
+	// verify specific content from the mock responses
 	expectedContents := []string{
 		"Test Workspace",
 		"A test workspace for context injection",
@@ -183,7 +183,7 @@ func TestBuildContext_AllAPIPathsVerified(t *testing.T) {
 		}
 	}
 
-	// 验证 context 不为空且不过短（之前仅约 187 个字符）
+	// verify that the context is non-empty and not too short (previously only about 187 characters)
 	if len(context) < 200 {
 		t.Errorf("context is too short (%d chars), expected at least 200", len(context))
 	}
@@ -192,7 +192,8 @@ func TestBuildContext_AllAPIPathsVerified(t *testing.T) {
 	t.Logf("Called API paths: %v", calledPaths)
 }
 
-// TestBuildContext_NullStringDeserialization 验证 Task UnmarshalJSON 正确处理普通字符串和 sql.NullString 格式。
+// TestBuildContext_NullStringDeserialization verifies that Task UnmarshalJSON correctly handles
+// both plain strings and the sql.NullString format.
 func TestBuildContext_NullStringDeserialization(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -230,14 +231,14 @@ func TestBuildContext_NullStringDeserialization(t *testing.T) {
 	}
 }
 
-// TestBuildContext_GetTaskAPIPath 验证 GetTask 使用带有 projectID 前缀的正确 API 路径。
+// TestBuildContext_GetTaskAPIPath verifies that GetTask uses the correct API path prefixed with the project ID.
 func TestBuildContext_GetTaskAPIPath(t *testing.T) {
 	var requestPath string
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/projects/", func(w http.ResponseWriter, r *http.Request) {
 		requestPath = r.URL.Path
-		// 返回一个带有 sql.NullString 格式的任务
+		// return a task with sql.NullString fields
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"id":          1,
 			"title":       "Test Task",
@@ -257,13 +258,13 @@ func TestBuildContext_GetTaskAPIPath(t *testing.T) {
 		t.Fatalf("GetTask failed: %v", err)
 	}
 
-	// 验证调用了正确的 API 路径
+	// verify that the correct API path was called
 	expectedPath := "/api/projects/proj-1/tasks/1"
 	if requestPath != expectedPath {
 		t.Errorf("GetTask called path %q, want %q", requestPath, expectedPath)
 	}
 
-	// 验证任务被正确解析（包括 sql.NullString 字段）
+	// verify that the task was parsed correctly (including the sql.NullString fields)
 	if task.Title != "Test Task" {
 		t.Errorf("Task.Title = %q, want %q", task.Title, "Test Task")
 	}
@@ -275,9 +276,9 @@ func TestBuildContext_GetTaskAPIPath(t *testing.T) {
 	}
 }
 
-// TestBuildContext_SSEEventContainsProjectID 验证 SSE 事件负载包含守护进程所需的 project_id 字段。
+// TestBuildContext_SSEEventContainsProjectID verifies that the SSE event payload contains the project_id field required by the daemon.
 func TestBuildContext_SSEEventContainsProjectID(t *testing.T) {
-	// 模拟守护进程接收到的 SSE 事件负载格式
+	// model the SSE event payload format received by the daemon
 	payload := map[string]interface{}{
 		"task_id":    1,
 		"node_id":    "node-uuid-1",
@@ -289,7 +290,7 @@ func TestBuildContext_SSEEventContainsProjectID(t *testing.T) {
 		t.Fatalf("Failed to marshal payload: %v", err)
 	}
 
-	// 以与 daemon.go 相同的方式解析它
+	// parse it the same way daemon.go does
 	var parsed struct {
 		TaskID    int32  `json:"task_id"`
 		NodeID    string `json:"node_id"`
@@ -310,10 +311,11 @@ func TestBuildContext_SSEEventContainsProjectID(t *testing.T) {
 	}
 }
 
-// TestBuildContext_DirectoryPermissions 验证节点配置的目录权限（readonly/full_control）
-// 会以 Directory Permissions section 注入执行上下文；两者皆空时不注入（零回归）。
+// TestBuildContext_DirectoryPermissions verifies that the node's directory permissions (readonly/full_control)
+// are injected into the execution context as a Directory Permissions section; when both are empty no section
+// is injected (zero regression).
 func TestBuildContext_DirectoryPermissions(t *testing.T) {
-	// 最小 mock：所有 fetch 端点返回空数据，聚焦 Directory Permissions section
+	// minimal mock: all fetch endpoints return empty data, focusing on the Directory Permissions section
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/", func(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(map[string]interface{}{})

@@ -1,4 +1,4 @@
-// config_test.go 覆盖 Agent Daemon 配置加载的测试。
+// config_test.go covers tests for Agent Daemon configuration loading.
 package agent_test
 
 import (

@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="zh-CN">
+<html lang="en">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
@@ -14,40 +14,142 @@
     pre { background: #8882; padding: .75rem; border-radius: 6px; overflow: auto; max-height: 24rem; white-space: pre-wrap; }
     .muted { color: #888; font-size: .85rem; }
     .warn { color: #b00; }
+    #lang-switch { position: absolute; top: 1rem; right: 1rem; }
   </style>
 </head>
 <body>
-  <h1>Teammate Local Control</h1>
-  <p class="muted">本地控制台 — 所有操作仅作用于本机 agentd，服务器保持无感（节点保持 in_progress）。</p>
+  <button id="lang-switch"></button>
+  <h1 data-i18n="title">Teammate Local Control</h1>
+  <p class="muted" data-i18n="subtitle">Local Console — All operations only affect local agentd, server remains unaware (node stays in_progress).</p>
 
   <div class="card">
-    <strong>运行状态</strong>
-    <div id="status">连接中…</div>
+    <strong data-i18n="status">Runtime Status</strong>
+    <div id="status" data-placeholder-i18n="connecting">Connecting...</div>
     <div id="session" class="muted"></div>
     <div>
-      <button id="pause">暂停认领</button>
-      <button id="resume">恢复认领</button>
+      <button id="pause" data-i18n="pause">Pause Claiming</button>
+      <button id="resume" data-i18n="resume">Resume Claiming</button>
     </div>
   </div>
 
   <div class="card">
-    <strong>当前执行节点</strong>
-    <div id="node" class="muted">无运行中的节点</div>
+    <strong data-i18n="current-node">Current Executing Node</strong>
+    <div id="node" class="muted" data-placeholder-i18n="no-node">No node is running</div>
     <div>
-      <button id="soft-interrupt" disabled>接管（软中断）</button>
-      <button id="handback" disabled>交还（继续执行）</button>
-      <button id="complete" disabled>人工完成</button>
+      <button id="soft-interrupt" disabled data-i18n="soft-interrupt">Take Over (Soft Interrupt)</button>
+      <button id="handback" disabled data-i18n="handback">Hand Back (Continue Execution)</button>
+      <button id="complete" disabled data-i18n="complete">Mark Complete</button>
     </div>
-    <input id="message" style="width:100%;margin-top:.5rem;padding:.5rem" placeholder="向当前会话追加一条消息后回车…" />
-    <button id="intervene" disabled>发送并执行一轮</button>
+    <input id="message" style="width:100%;margin-top:.5rem;padding:.5rem" data-placeholder-i18n="input-placeholder" placeholder="Append a message to the current session then press Enter..." />
+    <button id="intervene" disabled data-i18n="intervene">Send & Execute One Round</button>
   </div>
 
   <div class="card">
-    <strong>实时日志</strong>
-    <pre id="logs">（等待日志…）</pre>
+    <strong data-i18n="real-time-logs">Real-time Logs</strong>
+    <pre id="logs" data-placeholder-i18n="waiting-logs">(Waiting for logs...)</pre>
   </div>
 
   <script>
+    // Internationalization dictionary
+    const i18n = {
+      en: {
+        title: "Teammate Local Control",
+        subtitle: "Local Console — All operations only affect local agentd, server remains unaware (node stays in_progress).",
+        status: "Runtime Status",
+        pause: "Pause Claiming",
+        resume: "Resume Claiming",
+        "current-node": "Current Executing Node",
+        "no-node": "No node is running",
+        "soft-interrupt": "Take Over (Soft Interrupt)",
+        handback: "Hand Back (Continue Execution)",
+        complete: "Mark Complete",
+        "input-placeholder": "Append a message to the current session then press Enter...",
+        intervene: "Send & Execute One Round",
+        "real-time-logs": "Real-time Logs",
+        connecting: "Connecting...",
+        "waiting-logs": "(Waiting for logs...)",
+        "connection-failed": "Connection failed: ",
+        "failed-to-get-snapshot": "Failed to get snapshot: ",
+        "disconnected-reconnecting": "(Log connection disconnected, reconnecting...)",
+        execution-failed: "Execution failed: ",
+        "paused-claiming": " (paused claiming)",
+        "task": "Task ",
+        "node": "Node ",
+        "agent": "Agent",
+        "runtime": "Runtime",
+      },
+      zh: {
+        title: "Teammate 本地控制台",
+        subtitle: "本地控制台 — 所有操作仅作用于本机 agentd，服务器保持无感（节点保持 in_progress）。",
+        status: "运行状态",
+        pause: "暂停认领",
+        resume: "恢复认领",
+        "current-node": "当前执行节点",
+        "no-node": "无运行中的节点",
+        "soft-interrupt": "接管（软中断）",
+        handback: "交还（继续执行）",
+        complete: "人工完成",
+        "input-placeholder": "向当前会话追加一条消息后回车…",
+        intervene: "发送并执行一轮",
+        "real-time-logs": "实时日志",
+        connecting: "连接中…",
+        "waiting-logs": "（等待日志…）",
+        "connection-failed": "连接失败：",
+        "failed-to-get-snapshot": "无法获取快照：",
+        "disconnected-reconnecting": "（日志连接中断，重连中…）",
+        execution-failed: "执行失败：",
+        "paused-claiming": "（已暂停认领）",
+        "task": "任务 ",
+        "node": "节点 ",
+        "agent": "代理",
+        "runtime": "运行时",
+      }
+    };
+
+    let currentLang = localStorage.getItem('teammate_lang') || 'en';
+
+    function applyLang() {
+      const lang = i18n[currentLang];
+      // Switch label
+      document.getElementById('lang-switch').textContent = currentLang === 'en' ? '中文' : 'English';
+      document.documentElement.lang = currentLang === 'en' ? 'en' : 'zh-CN';
+      // Translate static elements with data-i18n
+      document.querySelectorAll('[data-i18n]').forEach(el => {
+        const key = el.getAttribute('data-i18n');
+        if (lang[key]) el.textContent = lang[key];
+      });
+      // Translate placeholders
+      document.querySelectorAll('[data-placeholder-i18n]').forEach(el => {
+        const key = el.getAttribute('data-placeholder-i18n');
+        if (lang[key]) el.placeholder = lang[key];
+      });
+      // Update placeholder text if it's currently the placeholder
+      const statusEl = document.getElementById('status');
+      if (statusEl.textContent === i18n.en.connecting || statusEl.textContent === i18n.zh.connecting) {
+        statusEl.textContent = lang.connecting;
+      }
+      const nodeEl = document.getElementById('node');
+      if (nodeEl.textContent === i18n.en['no-node'] || nodeEl.textContent === i18n.zh['no-node']) {
+        nodeEl.textContent = lang['no-node'];
+      }
+      const logsEl = document.getElementById('logs');
+      if (logsEl.textContent === i18n.en['waiting-logs'] || logsEl.textContent === i18n.zh['waiting-logs']) {
+        logsEl.textContent = lang['waiting-logs'];
+      }
+      localStorage.setItem('teammate_lang', currentLang);
+    }
+
+    function getLangText(key) {
+      return (i18n[currentLang][key]) || key;
+    }
+
+    document.getElementById('lang-switch').onclick = () => {
+      currentLang = currentLang === 'en' ? 'zh' : 'en';
+      applyLang();
+      // Refresh snapshot to re-translate dynamic text
+      if (typeof refreshSnapshot === 'function') refreshSnapshot();
+    };
+
     const token = new URLSearchParams(location.search).get("token") || localStorage.getItem("teammate_local_token") || "";
     if (token) localStorage.setItem("teammate_local_token", token);
     const headers = { "Authorization": "Bearer " + token, "Content-Type": "application/json" };
@@ -65,20 +167,23 @@
     async function refreshSnapshot() {
       try {
         const res = await fetch("/api/local/runtime/snapshot", { headers });
-        if (!res.ok) { set("status", "无法获取快照：" + res.status); return; }
+        if (!res.ok) { set("status", getLangText("failed-to-get-snapshot") + res.status); return; }
         const snap = await res.json();
         window.__snap = snap;
-        set("status", "运行时：" + (snap.runtime && snap.runtime.status) + " ｜ 代理：" + (snap.agent && snap.agent.status) + (snap.agent && snap.agent.paused ? "（已暂停认领）" : ""));
+        let statusText = getLangText("runtime") + ": " + (snap.runtime && snap.runtime.status) + " | " + getLangText("agent") + ": " + (snap.agent && snap.agent.status) + (snap.agent && snap.agent.paused ? getLangText("paused-claiming") : "");
+        set("status", statusText);
         const es = snap.execution_session || {};
         const running = es.status === "running" || es.status === "intervening";
-        set("session", "任务 " + (es.task_id || "—") + " / 节点 " + (es.node_id || "—") + "（" + (es.status || "idle") + "）" + (es.tool_session_id_present ? " ｜ 可接管" : ""));
-        set("node", es.node_name ? ("节点：" + es.node_name + "（" + es.status + "）") : "无运行中的节点");
+        let sessionText = getLangText("task") + (es.task_id || "—") + " / " + getLangText("node") + (es.node_id || "—") + " (" + (es.status || "idle") + ")" + (es.tool_session_id_present ? " | can take over" : "");
+        set("session", sessionText);
+        let nodeText = es.node_name ? (getLangText("node") + ": " + es.node_name + " (" + es.status + ")") : getLangText("no-node");
+        set("node", nodeText);
         const allowIntervene = running && es.tool_session_id_present;
         $("soft-interrupt").disabled = !running;
         $("intervene").disabled = !allowIntervene;
         $("handback").disabled = es.status !== "intervening";
         $("complete").disabled = !running;
-      } catch (e) { set("status", "连接失败：" + e); }
+      } catch (e) { set("status", getLangText("connection-failed") + e); }
     }
 
     function currentTask() { return (window.__snap || {}).execution_session && window.__snap.execution_session.task_id; }
@@ -86,8 +191,8 @@
     async function sendIntervene() {
       const msg = $("message").value.trim();
       if (!msg) return;
-      const r = await post("/api/local/control/intervene", { task_id: currentTask(), node_id: currentNode(), message: msg });
-      if (!r.ok) { alert("执行失败：" + (r.text || r.status)); }
+      const r = await post("/api/local/control/intervene", { task_id: currentTask(), node_id: currentNode() });
+      if (!r.ok) { alert(getLangText("execution-failed") + (r.text || r.status)); }
       $("message").value = "";
       refreshSnapshot();
     }
@@ -106,13 +211,16 @@
         try {
           const line = JSON.parse(e.data);
           const el = $("logs");
-          el.textContent = (el.textContent === "（等待日志…）" ? "" : el.textContent) + line.line + "\n";
+          const waitingText = getLangText("waiting-logs");
+          el.textContent = (el.textContent === waitingText ? "" : el.textContent) + line.line + "\n";
           el.scrollTop = el.scrollHeight;
         } catch {}
       });
-      es.onerror = () => { set("logs", "（日志连接中断，重连中…）"); };
+      es.onerror = () => { set("logs", getLangText("disconnected-reconnecting")); };
     }
 
+    // Initialize
+    applyLang();
     refreshSnapshot();
     streamLogs();
     setInterval(refreshSnapshot, 3000);

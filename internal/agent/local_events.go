@@ -1,4 +1,4 @@
-// local_events.go 提供本地模式下的事件发布与订阅。
+// local_events.go provides event publishing and subscription in local mode.
 package agent
 
 import (

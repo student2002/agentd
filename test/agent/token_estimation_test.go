@@ -1,4 +1,6 @@
-// Package agent_test 包含 agent 包的测试，涵盖 shell 转义、执行上下文构建、Git 操作和代理守护进程使用的 Token 估算。
+// Package agent_test contains tests for the agent package, covering shell
+// escaping, execution context building, Git operations, and the token estimation
+// used by the agent daemon.
 package agent_test
 
 import (
@@ -11,9 +13,12 @@ import (
 	"github.com/teammate/agentd/internal/agent"
 )
 
-// TestTokenEstimation_CJKReducesCharBudget 验证中文内容相比英文内容在相同上下文窗口下字符预算更少。通过提供超出预算的内容并检查中文内容被截断得更彻底来测试。
+// TestTokenEstimation_CJKReducesCharBudget verifies that CJK content gets a
+// smaller character budget than English content under the same context window,
+// by providing content that exceeds the budget and checking that CJK content is
+// truncated more aggressively.
 func TestTokenEstimation_CJKReducesCharBudget(t *testing.T) {
-	// 将填满上下文窗口的长描述
+	// A long description that fills the context window
 	englishDesc := strings.Repeat("This is a long English description that fills the context window. ", 200)
 	cjkDesc := strings.Repeat("这是一段很长的中文描述，用来填满上下文窗口，测试 Token 估算算法是否能正确调整字符预算。", 100)
 
@@ -42,10 +47,10 @@ func TestTokenEstimation_CJKReducesCharBudget(t *testing.T) {
 		defer server.Close()
 
 		client := agent.NewClient(server.URL, "test-token")
-		// 使用较小的上下文窗口以强制截断
+		// Use a small context window to force truncation
 		cfg := &agent.Config{
 			Workspace: agent.WorkspaceConfig{ID: "ws-1"},
-			Agent:     agent.AgentInfo{ID: "agent-1", ContextWindow: 1000}, // 小窗口
+			Agent:     agent.AgentInfo{ID: "agent-1", ContextWindow: 1000}, // small window
 		}
 
 		task := agent.Task{
@@ -71,19 +76,19 @@ func TestTokenEstimation_CJKReducesCharBudget(t *testing.T) {
 	englishCtx := buildCtx(t, englishDesc)
 	cjkCtx := buildCtx(t, cjkDesc)
 
-	// 使用较小的上下文窗口时，CJK 内容应被更激进地截断
-	// 因为相同数量的字符会消耗更多 Token
-	// 英文上下文应保留更多内容（更长）
+	// With a smaller context window, CJK content should be truncated more aggressively
+	// because the same number of characters consumes more tokens.
+	// The English context should retain more content (and therefore be longer).
 	if len(cjkCtx) > len(englishCtx) {
 		t.Logf("English context: %d chars, CJK context: %d chars", len(englishCtx), len(cjkCtx))
-		// 如果 CJK 文本每个字符都紧凑得多，就可能出现这种情况
-		// 关键点是：在相同内容长度下，CJK 使用更多 Token
-		// 但 CJK 用更少的字符表达相同的意思
-		// 因此此测试更多是验证算法能正确运行
-		// 而非严格的长度比较
+		// This could happen if CJK text is much more compact per character.
+		// The key point is that, for the same content length, CJK uses more tokens,
+		// but CJK conveys the same meaning with fewer characters.
+		// So this test mainly verifies that the algorithm runs correctly
+		// rather than performing a strict length comparison.
 	}
 
-	// 真正的测试：两个上下文都应被截断（不包含完整描述）
+	// The real test: both contexts should be truncated (and not contain the full description)
 	if strings.Contains(englishCtx, englishDesc) {
 		t.Error("English context should be truncated, not contain the full description")
 	}
@@ -94,7 +99,8 @@ func TestTokenEstimation_CJKReducesCharBudget(t *testing.T) {
 	t.Logf("English context: %d chars, CJK context: %d chars", len(englishCtx), len(cjkCtx))
 }
 
-// TestTokenEstimation_DefaultContextWindow 验证零上下文窗口时回退到 100000 Token。
+// TestTokenEstimation_DefaultContextWindow verifies that a zero context window
+// falls back to 100000 tokens.
 func TestTokenEstimation_DefaultContextWindow(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/workspaces/", func(w http.ResponseWriter, r *http.Request) {
