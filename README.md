@@ -241,6 +241,9 @@ agentd/
 │   │   └── tool/
 │   │       └── tool.go        # 编码工具适配器（Claude/OpenClaw/OpenCode/AtomCode/MimoCode）
 │   └── clock/                 # 可测试的时间抽象层
+├── web/                       # 本地控制台静态前端（与 Go 代码分离）
+│   ├── embed.go               # 前端资源 embed 包
+│   └── control/               # 控制台页面（index.html + assets/control.css|js）
 ├── test/
 │   └── agent/                 # 集成测试（git / executor / context / token 估算 / 本地控制面等）
 ├── docs/                      # 设计文档（中文）

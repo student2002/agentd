@@ -207,6 +207,7 @@ func (d *Daemon) Run() error {
 			}
 		}()
 		log.Printf("[daemon] local control API started on %s", d.cfg.Local.BindAddr)
+		log.Printf("[daemon] local control page: http://%s/api/local/control/page", d.cfg.Local.BindAddr)
 	}
 
 	// 0. Generate an RSA key pair for credential decryption
@@ -268,7 +269,11 @@ func (d *Daemon) Run() error {
 	}
 
 	// 7. Graceful shutdown
-	// First wait for the registration retry goroutine to exit, to avoid it
+	// stopCh is the broadcast channel for every long-lived consumer (registration
+	// retry, session token refresher); it must be closed before waiting on any
+	// of them. Stop is idempotent (sync.Once).
+	d.Stop()
+	// Wait for the registration retry goroutine to exit to avoid it
 	// concurrently reading/writing the SSE/heartbeat components alongside the
 	// shutdown logic
 	retryWG.Wait()

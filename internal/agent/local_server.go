@@ -3,7 +3,6 @@ package agent
 
 import (
 	"context"
-	_ "embed"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -12,10 +11,9 @@ import (
 	"strconv"
 	"strings"
 	"time"
-)
 
-//go:embed local_control_page.html
-var localControlPageHTML []byte
+	"github.com/teammate/agentd/web"
+)
 
 type LocalServerConfig struct {
 	BindAddr   string
@@ -65,6 +63,7 @@ func (s *LocalServer) Handler() http.Handler {
 	mux.HandleFunc("/api/local/control/handback", s.postOnly(s.requireLocalToken(s.handleHandback)))
 	mux.HandleFunc("/api/local/control/complete", s.postOnly(s.requireLocalToken(s.handleComplete)))
 	mux.HandleFunc("/api/local/control/page", s.getOnly(s.handleControlPage))
+	mux.Handle("/api/local/control/assets/", s.getOnlyHandler(http.StripPrefix("/api/local/control/assets/", http.FileServer(http.FS(web.ControlAssets())))))
 	return s.localCORS(mux)
 }
 
@@ -105,6 +104,18 @@ func (s *LocalServer) postOnly(next http.HandlerFunc) http.HandlerFunc {
 		}
 		next(w, r)
 	}
+}
+
+func (s *LocalServer) getOnlyHandler(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			w.Header().Set("Allow", http.MethodGet)
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		w.Header().Set("Cache-Control", "no-cache")
+		next.ServeHTTP(w, r)
+	})
 }
 
 func (s *LocalServer) localCORS(next http.Handler) http.Handler {
@@ -198,7 +209,7 @@ func (s *LocalServer) SetExecutor(e *TaskExecutor) {
 func (s *LocalServer) handleControlPage(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
-	_, _ = w.Write(localControlPageHTML)
+	_, _ = w.Write(web.ControlIndexHTML())
 }
 
 type controlRequest struct {
