@@ -35,6 +35,11 @@ type LogBuffer struct {
 	seq       atomic.Uint64
 }
 
+// LogBufferDefaultCapacity is the ring size used by all production buffers;
+// the local control API clamps its ?limit= parameter against the buffer's
+// own Capacity.
+const LogBufferDefaultCapacity = 2000
+
 // NewLogBuffer creates a LogBuffer holding up to capacity lines. capacity is
 // clamped to a minimum of 1.
 func NewLogBuffer(capacity int) *LogBuffer {
@@ -46,6 +51,14 @@ func NewLogBuffer(capacity int) *LogBuffer {
 		ring:        make([]LogLine, capacity),
 		subscribers: make(map[uint64]chan LogLine),
 	}
+}
+
+// Capacity returns the ring size; 0 for a nil buffer (which is a no-op).
+func (b *LogBuffer) Capacity() int {
+	if b == nil {
+		return 0
+	}
+	return b.capacity
 }
 
 // Append stores a line and broadcasts it to all subscribers. If line.Ts is

@@ -6,12 +6,16 @@
 //   - BuildExecutionContext: builds the full context by priority from high to low,
 //     intelligently truncating when it exceeds 80% of the window
 //   - Context sources: constraints/warnings, node description, task description,
-//     prior node results, agent instructions, skill context, shared memory,
+//     prior node results, agent instructions, skill context,
 //     project context, workspace context
 //   - estimateCharToTokenRatio: estimates the character-to-token conversion ratio
 //     based on the Chinese/English ratio
 //   - nullString compatibility: handles both server-side sql.NullString and plain
 //     string JSON formats
+//
+// Memory is NOT a context source: instance memory and workspace memory are
+// queried on demand through the local MCP server (see mcp_server.go); nothing
+// memory-shaped is injected into the prompt.
 //
 // Context injection follows descending priority: the smaller the value, the
 // higher the priority, and the more it is preserved when the window is insufficient.
@@ -118,25 +122,6 @@ type WorkspaceContext struct {
 	Description string `json:"description"`
 }
 
-// ProjectContext represents project-level context information, containing ID,
-// name, and description.
-type ProjectContext struct {
-	ID          string `json:"id"`
-	Name        string `json:"name"`
-	Description string `json:"description"`
-	RepoURL     string `json:"repo_url"`
-}
-
-// SharedMemory represents a shared memory entry, used for cross-task knowledge
-// transfer.
-// It contains the memory ID, title, content, and relevance score.
-type SharedMemory struct {
-	ID      string  `json:"id"`
-	Title   string  `json:"title"`
-	Content string  `json:"content"`
-	Score   float64 `json:"score"`
-}
-
 // AgentInstructions represents the agent's identity instructions, containing
 // behavior guidance and Git identity information.
 // The instructions are injected into the execution context to guide the agent's
@@ -210,18 +195,18 @@ func estimateCharToTokenRatio(content string) float64 {
 // BuildExecutionContext builds the full execution context of a node in priority
 // order.
 // Priority (high to low): constraints/warnings -> node description ->
-// task description -> agent instructions -> skill context -> shared memory ->
-// project context -> workspace context.
+// task description -> agent instructions -> skill context -> MCP server
+// context -> project context -> workspace context.
 // When it exceeds 80% of the context window, truncation starts from the lowest
 // priority.
 // When isResume is true, only essential sections are included, because --resume
 // preserves the previous context.
-func BuildExecutionContext(client *Client, cfg *Config, task Task, node TaskNode, isResume bool) (string, error) {
-	return BuildExecutionContextWithCapabilities(client, cfg, task, node, isResume, PromptCapabilities{IncludeSkills: true, IncludeMCP: true})
+func BuildExecutionContext(client *Client, workspaceID, agentID string, cfg *Config, task Task, node TaskNode, isResume bool) (string, error) {
+	return BuildExecutionContextWithCapabilities(client, workspaceID, agentID, cfg, task, node, isResume, PromptCapabilities{IncludeSkills: true, IncludeMCP: true})
 }
 
-func BuildExecutionContextWithCapabilities(client *Client, cfg *Config, task Task, node TaskNode, isResume bool, caps PromptCapabilities) (string, error) {
-	sections := buildContextSections(client, cfg, task, node, isResume, caps)
+func BuildExecutionContextWithCapabilities(client *Client, workspaceID, agentID string, cfg *Config, task Task, node TaskNode, isResume bool, caps PromptCapabilities) (string, error) {
+	sections := buildContextSections(client, workspaceID, agentID, cfg, task, node, isResume, caps)
 
 	// Estimate the token count (roughly: 1 token ≈ 4 chars)
 	maxTokens := cfg.Agent.ContextWindow
@@ -292,7 +277,7 @@ func BuildExecutionContextWithCapabilities(client *Client, cfg *Config, task Tas
 	return sb.String(), nil
 }
 
-func buildContextSections(client *Client, cfg *Config, task Task, node TaskNode, isResume bool, caps PromptCapabilities) []ContextSection {
+func buildContextSections(client *Client, workspaceID, agentID string, cfg *Config, task Task, node TaskNode, isResume bool, caps PromptCapabilities) []ContextSection {
 	sections := make([]ContextSection, 0, 8)
 
 	// 1. Constraints/warnings (highest priority, non-truncatable: critical for safety)
@@ -329,7 +314,7 @@ func buildContextSections(client *Client, cfg *Config, task Task, node TaskNode,
 	// Node comment context is still injected because user replies and upstream
 	// handoffs are both delivered via comments.
 	if isResume {
-		commentCtx := fetchExecutionComments(client, task.ID, node.ID)
+		commentCtx := fetchExecutionComments(client, agentID, task.ID, node.ID)
 		sections = append(sections, ContextSection{
 			Name:           "Node Comments",
 			Content:        commentCtx,
@@ -338,7 +323,7 @@ func buildContextSections(client *Client, cfg *Config, task Task, node TaskNode,
 		})
 
 		// 5. Agent instructions (non-truncatable: critical for agent identity)
-		agentCtx := fetchAgentInstructions(client, cfg)
+		agentCtx := fetchAgentInstructions(client, workspaceID, agentID)
 		sections = append(sections, ContextSection{
 			Name:           "Agent Instructions",
 			Content:        agentCtx,
@@ -359,7 +344,7 @@ func buildContextSections(client *Client, cfg *Config, task Task, node TaskNode,
 		Priority: 3,
 	})
 
-	commentCtx := fetchExecutionComments(client, task.ID, node.ID)
+	commentCtx := fetchExecutionComments(client, agentID, task.ID, node.ID)
 	sections = append(sections, ContextSection{
 		Name:           "Node Comments",
 		Content:        commentCtx,
@@ -368,7 +353,7 @@ func buildContextSections(client *Client, cfg *Config, task Task, node TaskNode,
 	})
 
 	// 4. Agent instructions (non-truncatable: critical for agent identity)
-	agentCtx := fetchAgentInstructions(client, cfg)
+	agentCtx := fetchAgentInstructions(client, workspaceID, agentID)
 	sections = append(sections, ContextSection{
 		Name:           "Agent Instructions",
 		Content:        agentCtx,
@@ -378,7 +363,7 @@ func buildContextSections(client *Client, cfg *Config, task Task, node TaskNode,
 
 	// 6. Skill context
 	if caps.IncludeSkills {
-		skillCtx := fetchSkillContext(client, cfg)
+		skillCtx := fetchSkillContext(client, workspaceID, agentID)
 		sections = append(sections, ContextSection{
 			Name:     "Skill Context",
 			Content:  skillCtx,
@@ -388,7 +373,7 @@ func buildContextSections(client *Client, cfg *Config, task Task, node TaskNode,
 
 	// 7. MCP server context
 	if caps.IncludeMCP {
-		mcpCtx := fetchMCPContext(client, cfg)
+		mcpCtx := fetchMCPContext(client, workspaceID, agentID)
 		sections = append(sections, ContextSection{
 			Name:     "MCP Servers",
 			Content:  mcpCtx,
@@ -396,24 +381,16 @@ func buildContextSections(client *Client, cfg *Config, task Task, node TaskNode,
 		})
 	}
 
-	// 8. Shared memory (Top-K relevant)
-	memCtx := fetchSharedMemory(client, task)
-	sections = append(sections, ContextSection{
-		Name:     "Shared Memory",
-		Content:  memCtx,
-		Priority: 8,
-	})
-
-	// 9. Project description
-	projCtx := fetchProjectContext(client, cfg, task.ProjectID)
+	// 8. Project description
+	projCtx := fetchProjectContext(client, agentID, workspaceID, task.ProjectID)
 	sections = append(sections, ContextSection{
 		Name:     "Project Context",
 		Content:  projCtx,
 		Priority: 9,
 	})
 
-	// 10. Workspace description (lowest priority, truncated first)
-	wsCtx := fetchWorkspaceContext(client, cfg)
+	// 9. Workspace description (lowest priority, truncated first)
+	wsCtx := fetchWorkspaceContext(client, workspaceID)
 	sections = append(sections, ContextSection{
 		Name:     "Workspace Context",
 		Content:  wsCtx,
@@ -466,12 +443,12 @@ func parseJSONStringArray(raw json.RawMessage) []string {
 }
 
 // fetchExecutionComments retrieves the comment context required for executing
-// the current node.
-func fetchExecutionComments(client *Client, taskID int32, nodeID string) string {
+// the current node, scoped to the agent instance.
+func fetchExecutionComments(client *Client, agentID string, taskID int32, nodeID string) string {
 	if taskID == 0 || nodeID == "" {
 		return ""
 	}
-	comments, err := client.ListExecutionContextComments(context.Background(), taskID, nodeID)
+	comments, err := client.ListExecutionContextComments(context.Background(), agentID, taskID, nodeID)
 	if err != nil {
 		log.Printf("[context] failed to fetch execution comments: %v", err)
 		return ""
@@ -500,9 +477,9 @@ func fetchExecutionComments(client *Client, taskID int32, nodeID string) string 
 
 // fetchWorkspaceContext retrieves workspace-level context information,
 // returning an empty string on failure.
-func fetchWorkspaceContext(client *Client, cfg *Config) string {
+func fetchWorkspaceContext(client *Client, workspaceID string) string {
 	var ws WorkspaceContext
-	err := client.doJSON(context.Background(), "GET", fmt.Sprintf("/api/workspaces/%s", cfg.Workspace.ID), nil, &ws)
+	err := client.doJSON(context.Background(), "GET", fmt.Sprintf("/api/workspaces/%s", workspaceID), nil, &ws)
 	if err != nil {
 		log.Printf("[context] failed to fetch workspace context: %v", err)
 		return ""
@@ -514,13 +491,14 @@ func fetchWorkspaceContext(client *Client, cfg *Config) string {
 }
 
 // fetchProjectContext retrieves project-level context information, returning an
-// empty string on failure.
-func fetchProjectContext(client *Client, cfg *Config, projectID string) string {
+// empty string on failure. The call is scoped to the agent instance via
+// X-Agent-ID; without the header the request runs as the daemon identity and
+// is rejected by role checks.
+func fetchProjectContext(client *Client, agentID, workspaceID, projectID string) string {
 	if projectID == "" {
 		return ""
 	}
-	var proj ProjectContext
-	err := client.doJSON(context.Background(), "GET", fmt.Sprintf("/api/workspaces/%s/projects/%s", cfg.Workspace.ID, projectID), nil, &proj)
+	proj, err := client.GetProject(context.Background(), agentID, workspaceID, projectID)
 	if err != nil {
 		log.Printf("[context] failed to fetch project context: %v", err)
 		return ""
@@ -531,38 +509,12 @@ func fetchProjectContext(client *Client, cfg *Config, projectID string) string {
 	return proj.Name + "\n" + proj.Description
 }
 
-// fetchSharedMemory retrieves the Top-K related shared memories, fetching only
-// verified or high-confidence memories to prevent low-quality content pollution.
-func fetchSharedMemory(client *Client, task Task) string {
-	if task.WorkspaceID == "" {
-		return ""
-	}
-	var memories []SharedMemory
-	// Fetch only verified or high-confidence memories to prevent low-quality content pollution
-	err := client.doJSON(context.Background(), "GET", fmt.Sprintf("/api/memories?limit=5&verified=true&min_confidence=0.7"), nil, &memories)
-	if err != nil {
-		log.Printf("[context] failed to fetch shared memory: %v", err)
-		return ""
-	}
-	if len(memories) == 0 {
-		return ""
-	}
-	var sb strings.Builder
-	for i, m := range memories {
-		if i > 0 {
-			sb.WriteString("\n---\n")
-		}
-		sb.WriteString(fmt.Sprintf("### %s\n%s", m.Title, m.Content))
-	}
-	return sb.String()
-}
-
-// fetchAgentInstructions retrieves the agent's identity instructions,
-// returning an empty string on failure.
-func fetchAgentInstructions(client *Client, cfg *Config) string {
+// fetchAgentInstructions retrieves the agent instance's identity
+// instructions, returning an empty string on failure. The call is scoped to
+// the instance via X-Agent-ID.
+func fetchAgentInstructions(client *Client, workspaceID, agentID string) string {
 	var agent AgentInstructions
-	err := client.doJSON(context.Background(), "GET", fmt.Sprintf("/api/workspaces/%s/agents/%s", cfg.Workspace.ID, cfg.Agent.ID), nil, &agent)
-	if err != nil {
+	if err := client.GetAgent(context.Background(), workspaceID, agentID, &agent); err != nil {
 		log.Printf("[context] failed to fetch agent instructions: %v", err)
 		return ""
 	}
@@ -571,8 +523,8 @@ func fetchAgentInstructions(client *Client, cfg *Config) string {
 
 // fetchSkillContext retrieves the agent's skill context, returning an empty
 // string on failure.
-func fetchSkillContext(client *Client, cfg *Config) string {
-	skills, err := client.ListAgentSkills(context.Background(), cfg.Workspace.ID, cfg.Agent.ID)
+func fetchSkillContext(client *Client, workspaceID, agentID string) string {
+	skills, err := client.ListAgentSkills(context.Background(), workspaceID, agentID)
 	if err != nil {
 		log.Printf("[context] failed to fetch skill context: %v", err)
 		return ""
@@ -595,8 +547,8 @@ func fetchSkillContext(client *Client, cfg *Config) string {
 
 // fetchMCPContext retrieves the MCP server context bound to the agent, avoiding
 // injecting sensitive env values.
-func fetchMCPContext(client *Client, cfg *Config) string {
-	servers, err := client.ListAgentMcpServers(context.Background(), cfg.Workspace.ID, cfg.Agent.ID)
+func fetchMCPContext(client *Client, workspaceID, agentID string) string {
+	servers, err := client.ListAgentMcpServers(context.Background(), workspaceID, agentID)
 	if err != nil {
 		log.Printf("[context] failed to fetch mcp context: %v", err)
 		return ""

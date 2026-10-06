@@ -35,6 +35,7 @@ import (
 type NodeWatcher struct {
 	client      *Client
 	executor    *TaskExecutor
+	connName    string
 	agentID     string
 	workspaceID string
 	interval    time.Duration
@@ -46,12 +47,14 @@ type NodeWatcher struct {
 	cancel context.CancelFunc
 }
 
-// NewNodeWatcher creates a new node watcher.
-func NewNodeWatcher(client *Client, executor *TaskExecutor, agentID, workspaceID string, interval time.Duration) *NodeWatcher {
+// NewNodeWatcher creates a new node watcher scoped to one (connection,
+// instance) identity.
+func NewNodeWatcher(client *Client, executor *TaskExecutor, connName, agentID, workspaceID string, interval time.Duration) *NodeWatcher {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &NodeWatcher{
 		client:      client,
 		executor:    executor,
+		connName:    connName,
 		agentID:     agentID,
 		workspaceID: workspaceID,
 		interval:    interval,
@@ -134,7 +137,7 @@ func (w *NodeWatcher) poll() {
 	// Recover previously unfinished nodes first (Agent restart scenario)
 	w.recoverInProgressNodes()
 
-	projects, err := w.client.ListProjects(w.ctx, w.workspaceID)
+	projects, err := w.client.ListProjects(w.ctx, w.agentID, w.workspaceID)
 	if err != nil {
 		if w.ctx.Err() != nil {
 			return
@@ -161,8 +164,10 @@ func (w *NodeWatcher) poll() {
 // not completed by the current Agent, and recovers the first such node if the
 // executor is idle.
 // Used to automatically resume interrupted tasks after an Agent restart.
+// Skipped while a local takeover holds the executor: Handback triggers the
+// recovery explicitly when the human hands the node back.
 func (w *NodeWatcher) recoverInProgressNodes() {
-	if w.executor.IsRunning() {
+	if w.executor.IsRunning() || w.executor.IsSoftInterrupted() {
 		return
 	}
 
@@ -186,7 +191,15 @@ func (w *NodeWatcher) recoverInProgressNodes() {
 	}
 
 	log.Printf("[watcher] recovering in-progress node %s (%s) for task %d", node.ID, node.Name, node.TaskID)
-	go w.executor.Execute(node.TaskID, TaskNode{
+	go w.executor.Execute(RunContext{
+		Client:      w.client,
+		ConnName:    w.connName,
+		AgentID:     w.agentID,
+		WorkspaceID: w.workspaceID,
+		ProjectID:   node.ProjectID,
+		TaskID:      node.TaskID,
+		NodeID:      node.ID,
+	}, TaskNode{
 		ID:              node.ID,
 		TaskID:          node.TaskID,
 		Name:            node.Name,
@@ -194,7 +207,7 @@ func (w *NodeWatcher) recoverInProgressNodes() {
 		Status:          node.Status,
 		ReadonlyDirs:    node.ReadonlyDirs,    // preserve directory permissions when resuming
 		FullControlDirs: node.FullControlDirs, // preserve directory permissions when resuming
-	}, node.ProjectID)
+	})
 }
 
 // pollProject checks the pending nodes in a single project, attempts to claim
@@ -207,11 +220,11 @@ func (w *NodeWatcher) recoverInProgressNodes() {
 // Parameters:
 //   - projectID: the project ID to check
 func (w *NodeWatcher) pollProject(projectID string) {
-	if w.executor.IsRunning() {
+	if w.executor.IsRunning() || w.executor.IsSoftInterrupted() {
 		return
 	}
 
-	tasks, err := w.client.ListPendingNodes(w.ctx, projectID)
+	tasks, err := w.client.ListPendingNodes(w.ctx, w.agentID, projectID)
 	if err != nil {
 		if w.ctx.Err() != nil {
 			return
@@ -231,7 +244,7 @@ func (w *NodeWatcher) pollProject(projectID string) {
 		default:
 		}
 
-		nodes, err := w.client.ListTaskNodes(w.ctx, task.TaskID)
+		nodes, err := w.client.ListTaskNodes(w.ctx, w.agentID, task.TaskID)
 		if err != nil {
 			if w.ctx.Err() != nil {
 				return
@@ -282,7 +295,15 @@ func (w *NodeWatcher) pollProject(projectID string) {
 		}
 
 		log.Printf("[watcher] claimed node %s (%s) for task %d", claimed.ID, claimed.Name, task.TaskID)
-		go w.executor.Execute(task.TaskID, *claimed, projectID)
+		go w.executor.Execute(RunContext{
+			Client:      w.client,
+			ConnName:    w.connName,
+			AgentID:     w.agentID,
+			WorkspaceID: w.workspaceID,
+			ProjectID:   projectID,
+			TaskID:      task.TaskID,
+			NodeID:      claimed.ID,
+		}, *claimed)
 	}
 }
 

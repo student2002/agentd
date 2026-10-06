@@ -24,6 +24,7 @@ type fakeTool struct {
 	output          string
 	calls           int
 	lastPrompt      string
+	lastWorkDir     string
 	interventionMode atomic.Bool
 }
 
@@ -38,10 +39,11 @@ func newFakeTool(name string) *fakeTool {
 func (t *fakeTool) Name() string      { return t.name }
 func (t *fakeTool) IsInstalled() bool { return true }
 
-func (t *fakeTool) Execute(ctx context.Context, _ string, prompt string, _ tool.ExecuteOptions, onOutput func(string)) (*tool.ExecutionResult, error) {
+func (t *fakeTool) Execute(ctx context.Context, workDir string, prompt string, _ tool.ExecuteOptions, onOutput func(string)) (*tool.ExecutionResult, error) {
 	t.mu.Lock()
 	t.calls++
 	t.lastPrompt = prompt
+	t.lastWorkDir = workDir
 	output := t.output
 	intervention := t.interventionMode.Load()
 	lines := t.outputLines
@@ -84,6 +86,7 @@ func (t *fakeTool) SetInterventionMode(b bool) { t.interventionMode.Store(b) }
 func (t *fakeTool) SetOutput(s string)         { t.mu.Lock(); t.output = s; t.mu.Unlock() }
 func (t *fakeTool) callCount() int             { t.mu.Lock(); defer t.mu.Unlock(); return t.calls }
 func (t *fakeTool) lastPromptValue() string    { t.mu.Lock(); defer t.mu.Unlock(); return t.lastPrompt }
+func (t *fakeTool) lastWorkDirValue() string   { t.mu.Lock(); defer t.mu.Unlock(); return t.lastWorkDir }
 
 func (t *fakeTool) finish()      { close(t.finishCh) }
 func (t *fakeTool) waitStarted() { <-t.startedCh }

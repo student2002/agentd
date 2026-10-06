@@ -20,6 +20,10 @@ func GenerateLocalToken() (string, error) {
 	return "lt_" + hex.EncodeToString(bytes), nil
 }
 
+// ValidateLocalToken accepts the token via the X-Local-Token header, the
+// Authorization Bearer header, or the "token" query parameter. The query
+// fallback exists because EventSource cannot set request headers, and this
+// API is loopback-only so the token never leaves the machine.
 func ValidateLocalToken(expected string, r *http.Request) bool {
 	if expected == "" {
 		return false
@@ -30,6 +34,9 @@ func ValidateLocalToken(expected string, r *http.Request) bool {
 		if strings.HasPrefix(auth, "Bearer ") {
 			got = strings.TrimSpace(strings.TrimPrefix(auth, "Bearer "))
 		}
+	}
+	if got == "" {
+		got = r.URL.Query().Get("token")
 	}
 	if got == "" {
 		return false

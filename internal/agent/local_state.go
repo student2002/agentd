@@ -29,13 +29,10 @@ const (
 )
 
 type LocalStateConfig struct {
-	InstanceID  string
-	Profile     string
-	ServerURL   string
-	WorkspaceID string
-	AgentID     string
-	AgentName   string
-	Provider    string
+	InstanceID string
+	ServerURL  string
+	AgentName  string
+	Provider   string
 }
 
 type LocalSnapshot struct {
@@ -49,13 +46,15 @@ type LocalSnapshot struct {
 	LastError        LocalError            `json:"last_error"`
 }
 
+// LocalSnapshotConfig carries the instance basics plus its single bound
+// identity (the workspace the owning connection serves and the agent UUID
+// resolved inside it); the identity fields stay empty while pending.
 type LocalSnapshotConfig struct {
-	Profile     string `json:"profile"`
 	ServerURL   string `json:"server_url"`
-	WorkspaceID string `json:"workspace_id"`
-	AgentID     string `json:"agent_id"`
 	AgentName   string `json:"agent_name"`
 	Provider    string `json:"provider"`
+	WorkspaceID string `json:"workspace_id,omitempty"`
+	AgentID     string `json:"agent_id,omitempty"`
 }
 
 type LocalRuntimeStatus struct {
@@ -69,13 +68,13 @@ type LocalRuntimeStatus struct {
 }
 
 type LocalAgentStatus struct {
-	ID     string `json:"id"`
 	Status string `json:"status"`
 	Paused bool   `json:"paused"`
 }
 
 type LocalExecutionSession struct {
 	Status               string    `json:"status"`
+	WorkspaceID          string    `json:"workspace_id"`
 	TaskID               int32     `json:"task_id"`
 	NodeID               string    `json:"node_id"`
 	NodeName             string    `json:"node_name"`
@@ -108,18 +107,14 @@ func NewLocalStateStore(cfg LocalStateConfig) *LocalStateStore {
 			InstanceID: cfg.InstanceID,
 			CapturedAt: time.Now().UTC(),
 			Config: LocalSnapshotConfig{
-				Profile:     cfg.Profile,
-				ServerURL:   cfg.ServerURL,
-				WorkspaceID: cfg.WorkspaceID,
-				AgentID:     cfg.AgentID,
-				AgentName:   cfg.AgentName,
-				Provider:    cfg.Provider,
+				ServerURL: cfg.ServerURL,
+				AgentName: cfg.AgentName,
+				Provider:  cfg.Provider,
 			},
 			Runtime: LocalRuntimeStatus{
 				Status: LocalRuntimeOffline,
 			},
 			Agent: LocalAgentStatus{
-				ID:     cfg.AgentID,
 				Status: LocalAgentOnline,
 			},
 			ExecutionSession: LocalExecutionSession{
@@ -131,6 +126,27 @@ func NewLocalStateStore(cfg LocalStateConfig) *LocalStateStore {
 			},
 		},
 	}
+}
+
+// SetAgentIdentity records the identity the owning connection resolved for
+// this instance, replacing any previous one (the instance was deleted
+// web-side and re-created).
+func (s *LocalStateStore) SetAgentIdentity(workspaceID, agentID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.snapshot.Config.WorkspaceID = workspaceID
+	s.snapshot.Config.AgentID = agentID
+	s.touchLocked()
+}
+
+// ClearAgentIdentity drops the bound identity (the connection was removed or
+// the daemon deleted server-side).
+func (s *LocalStateStore) ClearAgentIdentity() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.snapshot.Config.WorkspaceID = ""
+	s.snapshot.Config.AgentID = ""
+	s.touchLocked()
 }
 
 func (s *LocalStateStore) Snapshot() LocalSnapshot {
@@ -199,7 +215,9 @@ func (s *LocalStateStore) SetExecutionStarted(session LocalExecutionSession) {
 	if session.StartedAt.IsZero() {
 		session.StartedAt = time.Now().UTC()
 	}
-	session.Status = LocalExecutionRunning
+	if session.Status == "" {
+		session.Status = LocalExecutionRunning
+	}
 	s.snapshot.Agent.Status = LocalAgentBusy
 	s.snapshot.ExecutionSession = session
 	s.touchLocked()

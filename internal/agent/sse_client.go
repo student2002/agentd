@@ -1,5 +1,5 @@
 // sse_client.go implements the SSE (Server-Sent Events) client, used to receive
-// real-time event pushes from the Server.
+// real-time event pushes from the Server on the daemon's single event stream.
 //
 // This file provides the long-lived event channel between the Agent Daemon and
 // the Server, mainly including:
@@ -14,9 +14,11 @@
 //   - readStream: parses the SSE event stream, extracting the id, event, and
 //     data fields
 //   - dispatchEvent: dispatches the parsed event to the registered callback
+//     (the supervisor routes by the envelope agent_id)
 //
 // Supported SSE event types: node:pending, node:continuation_invite,
-// task:interrupt, etc.
+// task:interrupt, sync:required, mention:trigger, node:timeout,
+// node:reject_rollback.
 // On reconnection, event replay compensation is achieved via the Last-Event-ID
 // header.
 package agent
@@ -33,12 +35,18 @@ import (
 	"time"
 )
 
-// SSEClient connects to the server's SSE endpoint to receive real-time event
-// pushes, supporting reconnection and event replay.
+// SSEClient connects to the server's daemon event stream to receive real-time
+// event pushes for every agent instance of this daemon, supporting
+// reconnection and event replay.
+//
+// The daemon owns a single stream: GET /api/workspaces/{ws}/daemons/{id}/events.
+// Every event's data envelope carries an agent_id field identifying the
+// target instance; the routing layer (Supervisor) dispatches on it, and
+// events without an agent_id are daemon-wide and broadcast to all instances.
 type SSEClient struct {
 	serverURL   string
 	workspaceID string
-	runtimeID   string
+	daemonID    string
 	tokenFn     func() string // callback returning the latest auth token
 	onEvent     func(eventType string, data json.RawMessage)
 	callbacks   SSECallbacks
@@ -59,18 +67,18 @@ type SSECallbacks struct {
 	OnDisconnected func(error)
 }
 
-// NewSSEClient creates a new SSE client.
-// tokenFn is a callback returning the current best auth token (session token or
-// API token).
-func NewSSEClient(serverURL, workspaceID, runtimeID string, tokenFn func() string, onEvent func(string, json.RawMessage)) *SSEClient {
-	return NewSSEClientWithCallbacks(serverURL, workspaceID, runtimeID, tokenFn, onEvent, SSECallbacks{})
+// NewSSEClient creates a new SSE client on the daemon's event stream.
+// tokenFn is a callback returning the current best auth token (session token
+// or daemon token).
+func NewSSEClient(serverURL, workspaceID, daemonID string, tokenFn func() string, onEvent func(string, json.RawMessage)) *SSEClient {
+	return NewSSEClientWithCallbacks(serverURL, workspaceID, daemonID, tokenFn, onEvent, SSECallbacks{})
 }
 
-func NewSSEClientWithCallbacks(serverURL, workspaceID, runtimeID string, tokenFn func() string, onEvent func(string, json.RawMessage), callbacks SSECallbacks) *SSEClient {
+func NewSSEClientWithCallbacks(serverURL, workspaceID, daemonID string, tokenFn func() string, onEvent func(string, json.RawMessage), callbacks SSECallbacks) *SSEClient {
 	return &SSEClient{
 		serverURL:      serverURL,
 		workspaceID:    workspaceID,
-		runtimeID:      runtimeID,
+		daemonID:       daemonID,
 		tokenFn:        tokenFn,
 		onEvent:        onEvent,
 		callbacks:      callbacks,
@@ -175,7 +183,7 @@ func (c *SSEClient) run() {
 // Returns:
 //   - error: returned on connection failure or event stream read error
 func (c *SSEClient) connect() error {
-	url := fmt.Sprintf("%s/api/workspaces/%s/runtimes/%s/events", c.serverURL, c.workspaceID, c.runtimeID)
+	url := fmt.Sprintf("%s/api/workspaces/%s/daemons/%s/events", c.serverURL, c.workspaceID, c.daemonID)
 
 	// Create a cancellable context so that Stop() can abort the HTTP request
 	ctx, cancel := context.WithCancel(context.Background())

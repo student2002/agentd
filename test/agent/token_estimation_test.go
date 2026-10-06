@@ -30,7 +30,7 @@ func TestTokenEstimation_CJKReducesCharBudget(t *testing.T) {
 			json.NewEncoder(w).Encode(agent.WorkspaceContext{ID: "ws-1", Name: "WS"})
 		})
 		mux.HandleFunc("/api/workspaces/{wsId}/projects/", func(w http.ResponseWriter, r *http.Request) {
-			json.NewEncoder(w).Encode(agent.ProjectContext{ID: "proj-1", Name: "Proj"})
+			json.NewEncoder(w).Encode(agent.Project{ID: "proj-1", Name: "Proj"})
 		})
 		mux.HandleFunc("/api/memories", func(w http.ResponseWriter, r *http.Request) {
 			json.NewEncoder(w).Encode([]agent.SharedMemory{})
@@ -49,8 +49,7 @@ func TestTokenEstimation_CJKReducesCharBudget(t *testing.T) {
 		client := agent.NewClient(server.URL, "test-token")
 		// Use a small context window to force truncation
 		cfg := &agent.Config{
-			Workspace: agent.WorkspaceConfig{ID: "ws-1"},
-			Agent:     agent.AgentInfo{ID: "agent-1", ContextWindow: 1000}, // small window
+			Agent: agent.AgentInfo{ContextWindow: 1000}, // small window
 		}
 
 		task := agent.Task{
@@ -66,7 +65,7 @@ func TestTokenEstimation_CJKReducesCharBudget(t *testing.T) {
 			Description: "Do the work",
 		}
 
-		ctx, err := agent.BuildExecutionContext(client, cfg, task, node, false)
+		ctx, err := agent.BuildExecutionContext(client, "ws-1", "agent-1", cfg, task, node, false)
 		if err != nil {
 			t.Fatalf("BuildExecutionContext failed: %v", err)
 		}
@@ -107,7 +106,7 @@ func TestTokenEstimation_DefaultContextWindow(t *testing.T) {
 		json.NewEncoder(w).Encode(agent.WorkspaceContext{ID: "ws-1", Name: "WS"})
 	})
 	mux.HandleFunc("/api/workspaces/{wsId}/projects/", func(w http.ResponseWriter, r *http.Request) {
-		json.NewEncoder(w).Encode(agent.ProjectContext{ID: "proj-1", Name: "Proj"})
+		json.NewEncoder(w).Encode(agent.Project{ID: "proj-1", Name: "Proj"})
 	})
 	mux.HandleFunc("/api/memories", func(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode([]agent.SharedMemory{})
@@ -125,14 +124,13 @@ func TestTokenEstimation_DefaultContextWindow(t *testing.T) {
 
 	client := agent.NewClient(server.URL, "test-token")
 	cfg := &agent.Config{
-		Workspace: agent.WorkspaceConfig{ID: "ws-1"},
-		Agent:     agent.AgentInfo{ID: "agent-1", ContextWindow: 0}, // zero = default 100000
+		Agent: agent.AgentInfo{ContextWindow: 0}, // zero = default 100000
 	}
 
 	task := agent.Task{ID: 1, Title: "Test", Description: "Hello", ProjectID: "proj-1"}
 	node := agent.TaskNode{ID: "node-1", TaskID: 1, Name: "1. Work", Description: "Do work"}
 
-	ctx, err := agent.BuildExecutionContext(client, cfg, task, node, false)
+	ctx, err := agent.BuildExecutionContext(client, "ws-1", "agent-1", cfg, task, node, false)
 	if err != nil {
 		t.Fatalf("BuildExecutionContext with zero ContextWindow failed: %v", err)
 	}

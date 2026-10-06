@@ -26,12 +26,13 @@ type PromptCapabilities struct {
 }
 
 // MaterializeAgentCapabilities prepares provider-specific local files for
-// skills and MCP servers.
+// skills and MCP servers, scoped to the executing connection's workspace and
+// agent identity.
 // Claude Code and AtomCode use project-local skill files. Tools with no known
 // native skill mechanism keep the prompt fallback enabled. All Teammate-generated
 // files are refreshed on every execution, so disabled or removed bindings do
 // not leak through stale files.
-func MaterializeAgentCapabilities(ctx context.Context, client *Client, cfg *Config, workDir, toolName string) (CapabilityInjection, error) {
+func MaterializeAgentCapabilities(ctx context.Context, run RunContext, cfg *Config, workDir, toolName string) (CapabilityInjection, error) {
 	injection := CapabilityInjection{
 		PromptCapabilities: PromptCapabilities{IncludeSkills: true, IncludeMCP: true},
 	}
@@ -40,16 +41,26 @@ func MaterializeAgentCapabilities(ctx context.Context, client *Client, cfg *Conf
 		return injection, fmt.Errorf("reset generated capabilities: %w", err)
 	}
 
-	skills, err := client.ListAgentSkills(ctx, cfg.Workspace.ID, cfg.Agent.ID)
+	skills, err := run.Client.ListAgentSkills(ctx, run.WorkspaceID, run.AgentID)
 	if err != nil {
 		return injection, fmt.Errorf("list agent skills: %w", err)
 	}
 	skills = enabledSkills(skills)
 	injection.SkillCount = len(skills)
 
-	mcpPath, mcpServers, err := WriteAgentMCPConfig(ctx, client, cfg, workDir)
+	mcpPath, mcpServers, err := WriteAgentMCPConfig(ctx, run.Client, run.WorkspaceID, run.AgentID, workDir)
 	if err != nil {
 		return injection, fmt.Errorf("write mcp config: %w", err)
+	}
+	// The agentd memory server is always present in the workDir config so
+	// the tool can reach the instance memory; the entry carries the
+	// execution context and connection credentials in its environment.
+	memoryPath, err := WriteTeammateMemoryMCPEntry(run, cfg, workDir)
+	if err != nil {
+		return injection, fmt.Errorf("write memory mcp entry: %w", err)
+	}
+	if mcpPath == "" {
+		mcpPath = memoryPath
 	}
 	if mcpPath != "" {
 		injection.ToolOptions.MCPConfigPath = mcpPath

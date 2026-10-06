@@ -161,13 +161,32 @@ func (g *GitManager) initEmptyRepo(repoURL, baseBranch string) error {
 }
 
 // initBaseBranch creates the base branch in an already-cloned repository that
-// has no branches.
+// has no branches. The clone of a completely empty remote leaves HEAD unborn
+// with no commits, so an initial commit is created before pushing — pushing an
+// unborn branch would fail with "src refspec ... does not match any".
 func (g *GitManager) initBaseBranch(baseBranch string) error {
 	cmd := exec.Command("git", "checkout", "-b", baseBranch)
 	cmd.Dir = g.workDir
 	cmd.Env = append(os.Environ(), g.env...)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("git checkout -b %s: %s: %w", baseBranch, string(out), err)
+	}
+
+	placeholder := filepath.Join(g.workDir, ".gitkeep")
+	if err := os.WriteFile(placeholder, []byte(""), 0644); err != nil {
+		return fmt.Errorf("write .gitkeep: %w", err)
+	}
+	cmd = exec.Command("git", "add", "-A")
+	cmd.Dir = g.workDir
+	cmd.Env = append(os.Environ(), g.env...)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("git add: %s: %w", string(out), err)
+	}
+	cmd = exec.Command("git", "commit", "-m", "teammate: initial commit")
+	cmd.Dir = g.workDir
+	cmd.Env = append(os.Environ(), g.env...)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("git commit: %s: %w", string(out), err)
 	}
 
 	cmd = exec.Command("git", "push", "-u", "origin", baseBranch)
@@ -377,45 +396,45 @@ func (g *GitManager) FetchAndCheckout(taskID int32, baseBranch string) error {
 	return nil
 }
 
-// ConfigureCredential configures the Git credential helper, using a temporary
-// askpass script to handle authentication.
+// ConfigureCredential configures authentication and identity for every git
+// command run by this manager:
+//   - a temporary askpass script answers HTTP credential prompts
+//   - GIT_CONFIG_* env entries clear the credential-helper chain inherited
+//     from global config (interactive helpers such as Git Credential Manager
+//     block forever on a headless daemon) and pin user.name/user.email
+//
+// Identity and helper clearing ride on environment variables instead of
+// repo-local `git config`, so they apply to clone and other commands that run
+// before a .git directory exists, without touching the machine's global
+// configuration.
 func (g *GitManager) ConfigureCredential(username, pat, gitName, gitEmail string) error {
-	if pat == "" {
-		return nil
-	}
-
-	scriptPath, env, err := createAskPass(username, pat)
-	if err != nil {
-		return err
-	}
-
-	g.env = append(g.env, env...)
-
-	// Save the script path for later cleanup
-	g.askpassPath = scriptPath
-
-	// Set the git identity — the agent must configure git_name/git_email
 	if gitEmail == "" {
 		return fmt.Errorf("agent git_email is required for git operations")
 	}
-	_ = g.SetGitConfig("user.email", gitEmail)
-
 	if gitName == "" {
 		return fmt.Errorf("agent git_name is required for git operations")
 	}
-	_ = g.SetGitConfig("user.name", gitName)
 
-	return nil
-}
-
-// SetGitConfig sets a Git config item in the local repository.
-func (g *GitManager) SetGitConfig(key, value string) error {
-	cmd := exec.Command("git", "config", key, value)
-	cmd.Dir = g.workDir
-	cmd.Env = append(os.Environ(), g.env...)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("git config %s %s: %s: %w", key, value, string(out), err)
+	env := []string{
+		"GIT_CONFIG_COUNT=3",
+		"GIT_CONFIG_KEY_0=credential.helper",
+		"GIT_CONFIG_VALUE_0=", // empty value resets the inherited helper chain
+		"GIT_CONFIG_KEY_1=user.name",
+		"GIT_CONFIG_VALUE_1=" + gitName,
+		"GIT_CONFIG_KEY_2=user.email",
+		"GIT_CONFIG_VALUE_2=" + gitEmail,
 	}
+
+	if pat != "" {
+		scriptPath, askpassEnv, err := createAskPass(username, pat)
+		if err != nil {
+			return err
+		}
+		g.askpassPath = scriptPath
+		env = append(env, askpassEnv...)
+	}
+
+	g.env = append(g.env, env...)
 	return nil
 }
 
@@ -427,12 +446,28 @@ func (g *GitManager) CleanupCredential() {
 	}
 }
 
+// createAskPass writes a temporary askpass script that answers git's username
+// and password prompts from the TEAMMATE_GIT_* environment variables. The
+// username/PAT values must not contain shell or cmd metacharacters; tokens
+// issued by common forges (hex or base62) satisfy this.
 func createAskPass(username, pat string) (string, []string, error) {
 	ext := ".sh"
 	content := "#!/bin/sh\ncase \"$1\" in *sername*|*Username*|*username*) printf '%s' \"$TEAMMATE_GIT_USERNAME\";; *) printf '%s' \"$TEAMMATE_GIT_PAT\";; esac\n"
 	if runtime.GOOS == "windows" {
+		// Plain cmd batch. findstr routes the prompt to the username or PAT
+		// branch; `set /p` under redirected nul input prints the value with
+		// no trailing newline. exit /b 0 keeps the exit status zero: the EOF
+		// read on nul leaves errorlevel 1, and git discards the output of an
+		// askpass that exits non-zero.
 		ext = ".cmd"
-		content = "@echo off\r\npowershell -NoProfile -ExecutionPolicy Bypass -Command \"if ($args[0] -match 'sername') { [Console]::Write($env:TEAMMATE_GIT_USERNAME) } else { [Console]::Write($env:TEAMMATE_GIT_PAT) }\" -- %*\r\n"
+		content = "@echo off\r\n" +
+			"echo(%~1 | findstr /i /c:\"sername\" >nul 2>&1\r\n" +
+			"if not errorlevel 1 (\r\n" +
+			"  <nul set /p dummy=%TEAMMATE_GIT_USERNAME%\r\n" +
+			") else (\r\n" +
+			"  <nul set /p dummy=%TEAMMATE_GIT_PAT%\r\n" +
+			")\r\n" +
+			"exit /b 0\r\n"
 	}
 
 	tmpFile, err := os.CreateTemp("", "teammate-askpass-*"+ext)

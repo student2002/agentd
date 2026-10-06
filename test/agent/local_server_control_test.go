@@ -1,7 +1,6 @@
 package agent_test
 
 import (
-	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -15,17 +14,16 @@ import (
 // requests (401), reject GET (405 from postOnly), and accept an authenticated
 // POST (delegating to the executor, which returns 200/JSON).
 func TestLocalServerControlEndpointsRequireTokenAndPost(t *testing.T) {
-	state := agent.NewLocalStateStore(agent.LocalStateConfig{InstanceID: "instance-1"})
-	hub := agent.NewLocalEventHub()
 	server := agent.NewLocalServer(agent.LocalServerConfig{
 		LocalToken: "lt_test",
-	}, state, hub)
+		Registry:   newFakeRegistry("claude-01"),
+	})
 
 	for _, route := range []string{
-		"/api/local/control/soft-interrupt",
-		"/api/local/control/intervene",
-		"/api/local/control/handback",
-		"/api/local/control/complete",
+		"/api/local/connections/team-a/agents/claude-01/control/soft-interrupt",
+		"/api/local/connections/team-a/agents/claude-01/control/intervene",
+		"/api/local/connections/team-a/agents/claude-01/control/handback",
+		"/api/local/connections/team-a/agents/claude-01/control/complete",
 	} {
 		// No token → 401
 		req := httptest.NewRequest(http.MethodPost, route, strings.NewReader("{}"))
@@ -49,11 +47,10 @@ func TestLocalServerControlEndpointsRequireTokenAndPost(t *testing.T) {
 // TestLocalServerControlPageServed proves the embedded HTML control page is
 // served at /api/local/control/page and is HTML.
 func TestLocalServerControlPageServed(t *testing.T) {
-	state := agent.NewLocalStateStore(agent.LocalStateConfig{InstanceID: "instance-1"})
-	hub := agent.NewLocalEventHub()
 	server := agent.NewLocalServer(agent.LocalServerConfig{
 		LocalToken: "lt_test",
-	}, state, hub)
+		Registry:   newFakeRegistry("claude-01"),
+	})
 
 	req := httptest.NewRequest(http.MethodGet, "/api/local/control/page", nil)
 	rec := httptest.NewRecorder()
@@ -66,7 +63,7 @@ func TestLocalServerControlPageServed(t *testing.T) {
 		t.Fatalf("expected text/html, got %q", ct)
 	}
 	body := rec.Body.String()
-	if !strings.Contains(body, "Teammate Local Control") {
+	if !strings.Contains(body, "Teammate Agent Console") {
 		t.Fatalf("control page body missing title; got %q", body[:min(80, len(body))])
 	}
 }
@@ -77,5 +74,3 @@ func min(a, b int) int {
 	}
 	return b
 }
-
-var _ = json.Marshal

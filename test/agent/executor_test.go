@@ -38,8 +38,7 @@ func TestTaskExecutor_IsRunning(t *testing.T) {
 		Workspace: agent.WorkspaceConfig{Root: t.TempDir()},
 		Git:       agent.GitConfig{BaseBranch: "master"},
 	}
-	client := agent.NewClient("http://localhost:0", "fake-token")
-	executor := agent.NewTaskExecutor(cfg, client, "agent-1")
+	executor := agent.NewTaskExecutor(cfg)
 
 	if executor.IsRunning() {
 		t.Error("new executor should not be running")
@@ -52,8 +51,7 @@ func TestTaskExecutor_CurrentTask_NotRunning(t *testing.T) {
 		Workspace: agent.WorkspaceConfig{Root: t.TempDir()},
 		Git:       agent.GitConfig{BaseBranch: "master"},
 	}
-	client := agent.NewClient("http://localhost:0", "fake-token")
-	executor := agent.NewTaskExecutor(cfg, client, "agent-1")
+	executor := agent.NewTaskExecutor(cfg)
 
 	taskID, node, ok := executor.CurrentTask()
 	if ok {
@@ -68,24 +66,29 @@ func TestTaskExecutor_CurrentTask_NotRunning(t *testing.T) {
 func TestTaskExecutorObserverReportsExecutionLifecycle(t *testing.T) {
 	t.Setenv("TEAMMATE_DISK_QUOTA_GB", "0")
 	cfg := &agent.Config{
-		Server: agent.ServerConfig{URL: "http://127.0.0.1:1", APIToken: "fake-token"},
+		Server: agent.ServerConfig{URL: "http://127.0.0.1:1"},
 		Agent: agent.AgentInfo{
-			ID:       "agent-1",
 			Name:     "Agent One",
 			Provider: "claude",
 		},
 		Workspace: agent.WorkspaceConfig{
-			ID:   "ws-1",
 			Root: t.TempDir(),
 		},
 		Git: agent.GitConfig{BaseBranch: "master"},
 	}
-	client := agent.NewClient(cfg.Server.URL, cfg.Server.APIToken)
+	client := agent.NewClient(cfg.Server.URL, "td_fake_token")
 	observer := &recordingExecutionObserver{}
-	executor := agent.NewTaskExecutorWithObserver(cfg, client, "agent-1", observer)
+	executor := agent.NewTaskExecutorWithObserver(cfg, observer)
 	node := agent.TaskNode{ID: "node-1", Name: "code", SortOrder: 1, NodeType: "standard"}
 
-	executor.Execute(12, node, "project-1")
+	executor.Execute(agent.RunContext{
+		Client:      client,
+		AgentID:     "agent-1",
+		WorkspaceID: "ws-1",
+		ProjectID:   "project-1",
+		TaskID:      12,
+		NodeID:      "node-1",
+	}, node)
 
 	if observer.started.TaskID != 12 {
 		t.Fatalf("expected start task id 12, got %d", observer.started.TaskID)

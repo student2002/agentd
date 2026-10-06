@@ -1,85 +1,93 @@
 // Package agent provides the core functionality of the AI agent daemon.
 //
 // This package implements the full lifecycle of the Agent Daemon, including:
-//   - runtime registration and heartbeat maintenance
-//   - SSE event listening and response
+//   - daemon registration, heartbeat maintenance and tool detection reports
+//   - SSE event listening and per-instance event routing
 //   - node claiming and task execution
 //   - Git operations and credential management
 //   - context construction and tool invocation
 //   - RSA encrypted communication
 //
 // Client is the HTTP client that communicates with the Server and encapsulates
-// all API calls.
-// The client supports two authentication methods: API Token (permanent) and
-// Session Token (7-day validity).
+// all API calls. Authentication is daemon-level: a permanent daemon token
+// (td_) that can be exchanged for a 7-day session token (st_). Calls acting
+// on behalf of one agent instance carry the X-Agent-ID header; the server
+// verifies the instance belongs to this daemon and rewrites the identity.
 package agent
 
 import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"strconv"
 	"time"
 )
 
 // Client is the HTTP client that communicates with the Teammate Server.
 //
 // The client encapsulates all REST API interactions with the Server, including:
-//   - runtime registration and heartbeat
-//   - node claiming and status reporting
+//   - daemon registration, heartbeat and deregistration
+//   - node claiming and status reporting (X-Agent-ID scoped)
 //   - Git credential retrieval
 //   - comment and log sending
 //   - token exchange and refresh
-//
-// Usage:
-//
-//	client := NewClient("http://localhost:8080", "tm_xxx_xxx")
-//	runtime, _ := client.RegisterRuntime(ctx, workspaceID, agentID, "claude", "1.0.0", pubKey)
 type Client struct {
 	// BaseURL is the base URL of the Server.
 	BaseURL string
 
-	// APIToken is the API Token (tm_ prefix) used for initial authentication.
+	// APIToken is the workspace connection's daemon token (td_ prefix) used
+	// for authentication.
 	APIToken string
 
-	// SessionToken is the exchanged session Token (st_ prefix), valid for 7 days.
+	// SessionToken is the exchanged session token (st_ prefix), valid for 7
+	// days.
 	SessionToken string
 
 	// SessionExpiry is the expiry time of the Session Token.
 	SessionExpiry time.Time
 
-	// PrivateKeyPEM is the PEM-encoded RSA private key, used to decrypt Git credentials.
+	// PrivateKeyPEM is the daemon-level PEM-encoded RSA private key, used to
+	// decrypt Git credentials.
 	PrivateKeyPEM string
 
 	// HTTP is the underlying HTTP client instance.
 	HTTP *http.Client
 }
 
-// NewClient creates a new Server communication client.
-//
-// Parameters:
-//   - baseURL: the base URL of the Server (e.g. "http://localhost:8080")
-//   - apiToken: the API Token used for initial authentication
-//
-// Returns:
-//   - *Client: the initialized client instance
-func NewClient(baseURL, apiToken string) *Client {
+// NewClient creates a new Server communication client authenticated with the
+// daemon token.
+func NewClient(baseURL, daemonToken string) *Client {
 	return &Client{
 		BaseURL:  baseURL,
-		APIToken: apiToken,
+		APIToken: daemonToken,
 		HTTP: &http.Client{
 			Timeout: 30 * time.Second,
 		},
 	}
 }
 
+// requestOption mutates an outgoing request before it is sent.
+type requestOption func(*http.Request)
+
+// withAgentHeader scopes a request to one agent instance via the X-Agent-ID
+// header. The server rewrites the caller identity to that instance after
+// verifying it was reported by this daemon.
+func withAgentHeader(agentID string) requestOption {
+	return func(req *http.Request) {
+		req.Header.Set("X-Agent-ID", agentID)
+	}
+}
+
 // do executes an HTTP request, automatically setting auth headers and JSON
 // serialization.
-// If body is not nil, it serializes it to JSON and sets the Content-Type header.
-func (c *Client) do(ctx context.Context, method, path string, body interface{}) (*http.Response, error) {
+// If body is not nil, it serializes it to JSON and sets the Content-Type
+// header.
+func (c *Client) do(ctx context.Context, method, path string, body interface{}, opts ...requestOption) (*http.Response, error) {
 	var bodyReader io.Reader
 	if body != nil {
 		data, err := json.Marshal(body)
@@ -97,13 +105,16 @@ func (c *Client) do(ctx context.Context, method, path string, body interface{}) 
 	token := c.authToken()
 	req.Header.Set("X-API-Key", token)
 	req.Header.Set("Content-Type", "application/json")
+	for _, opt := range opts {
+		opt(req)
+	}
 
 	return c.HTTP.Do(req)
 }
 
 // authToken returns the best available auth token.
 // It prefers the session token (if present and not close to expiry), otherwise
-// falls back to the API token.
+// falls back to the daemon token.
 func (c *Client) authToken() string {
 	if c.SessionToken != "" && !c.SessionExpiry.IsZero() && time.Now().Before(c.SessionExpiry.Add(-5*time.Minute)) {
 		return c.SessionToken
@@ -111,12 +122,39 @@ func (c *Client) authToken() string {
 	return c.APIToken
 }
 
+// APIError carries the HTTP status of a failed API call so callers can branch
+// on it (e.g. heartbeat 404 meaning the daemon was deleted server-side).
+type APIError struct {
+	StatusCode int
+	Body       string
+}
+
+func (e *APIError) Error() string {
+	return "API error " + strconv.Itoa(e.StatusCode) + ": " + e.Body
+}
+
+// IsNotFound reports whether the error is an API call that returned 404.
+// Callers wrap API errors with %w, so the check must traverse the chain.
+func IsNotFound(err error) bool {
+	var apiErr *APIError
+	return errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusNotFound
+}
+
+// IsUnauthorized reports whether the error is an API call that returned 401.
+// For daemon credentials (td_/st_) a 401 means the token was revoked or its
+// owner deleted server-side; there is no token-rotation path, so callers treat
+// it as a terminal condition like IsNotFound.
+func IsUnauthorized(err error) bool {
+	var apiErr *APIError
+	return errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusUnauthorized
+}
+
 // doJSON executes a JSON API request, automatically handling request body
 // serialization and response body deserialization.
 // If the response status code is >= 300, it returns an error containing the
 // status code and response body.
-func (c *Client) doJSON(ctx context.Context, method, path string, reqBody, respBody interface{}) error {
-	resp, err := c.do(ctx, method, path, reqBody)
+func (c *Client) doJSON(ctx context.Context, method, path string, reqBody, respBody interface{}, opts ...requestOption) error {
+	resp, err := c.do(ctx, method, path, reqBody, opts...)
 	if err != nil {
 		return err
 	}
@@ -124,7 +162,7 @@ func (c *Client) doJSON(ctx context.Context, method, path string, reqBody, respB
 
 	if resp.StatusCode >= 300 {
 		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("API error %d: %s", resp.StatusCode, string(body))
+		return &APIError{StatusCode: resp.StatusCode, Body: string(body)}
 	}
 
 	if respBody != nil {
@@ -133,11 +171,11 @@ func (c *Client) doJSON(ctx context.Context, method, path string, reqBody, respB
 	return nil
 }
 
-// ListAgentSkills retrieves the list of skills bound to the current Agent.
+// ListAgentSkills retrieves the list of skills bound to the agent instance.
 func (c *Client) ListAgentSkills(ctx context.Context, workspaceID, agentID string) ([]SkillContext, error) {
 	var skills []SkillContext
 	path := fmt.Sprintf("/api/workspaces/%s/agents/%s/skills", workspaceID, agentID)
-	if err := c.doJSON(ctx, "GET", path, nil, &skills); err != nil {
+	if err := c.doJSON(ctx, "GET", path, nil, &skills, withAgentHeader(agentID)); err != nil {
 		return nil, fmt.Errorf("list agent skills: %w", err)
 	}
 	return skills, nil
@@ -157,70 +195,115 @@ type AgentMcpServerContext struct {
 	AssignedAt string          `json:"assigned_at"`
 }
 
-// ListAgentMcpServers retrieves the list of MCP servers bound to the current Agent (via the daemon-only execution endpoint, which returns decrypted env_vars).
+// ListAgentMcpServers retrieves the list of MCP servers bound to the agent
+// instance (via the daemon-only execution endpoint, which returns decrypted
+// env_vars).
 func (c *Client) ListAgentMcpServers(ctx context.Context, workspaceID, agentID string) ([]AgentMcpServerContext, error) {
 	var servers []AgentMcpServerContext
 	path := fmt.Sprintf("/api/workspaces/%s/agents/%s/execution/mcp-servers", workspaceID, agentID)
-	if err := c.doJSON(ctx, "GET", path, nil, &servers); err != nil {
+	if err := c.doJSON(ctx, "GET", path, nil, &servers, withAgentHeader(agentID)); err != nil {
 		return nil, fmt.Errorf("list agent mcp servers: %w", err)
 	}
 	return servers, nil
 }
 
-// --- Runtime ---
-
-// RegisterRuntimeRequest represents the runtime registration request body,
-// corresponding to the server-side registerRuntimeRequest structure.
-type RegisterRuntimeRequest struct {
-	AgentID          string `json:"agent_id"`
-	DaemonID         string `json:"daemon_id"`
-	Provider         string `json:"provider"`
-	Version          string `json:"version"`
-	Status           string `json:"status"`
-	SessionTokenHash string `json:"session_token_hash"`
-	PublicKey        string `json:"public_key"`
+// GetAgent retrieves one agent instance's profile (instructions, git
+// identity). Scoped to the instance via X-Agent-ID.
+func (c *Client) GetAgent(ctx context.Context, workspaceID, agentID string, out interface{}) error {
+	path := fmt.Sprintf("/api/workspaces/%s/agents/%s", workspaceID, agentID)
+	return c.doJSON(ctx, "GET", path, nil, out, withAgentHeader(agentID))
 }
 
-// RegisterRuntimeResponse represents the runtime registration response body,
-// containing the newly created runtime ID.
-type RegisterRuntimeResponse struct {
-	ID string `json:"id"`
+// --- Daemon domain ---
+
+// ProviderInfo is one entry of the tool-detection snapshot reported at
+// registration.
+type ProviderInfo struct {
+	Provider  string `json:"provider"`
+	Version   string `json:"version,omitempty"`
+	Installed bool   `json:"installed"`
 }
 
-// RegisterRuntime registers the daemon as a runtime instance of the agent.
-// On success it returns the runtime ID, used for subsequent heartbeats and
-// event reception.
-//
-// Parameters:
-//   - ctx: context, used to control request timeout and cancellation
-//   - workspaceID: workspace ID
-//   - agentID: agent ID
-//   - provider: coding tool provider (e.g. "claude")
-//   - toolVersion: coding tool version
-//   - publicKeyPEM: PEM-encoded RSA public key, used by the server to encrypt Git credentials
-//
-// Returns:
-//   - *RegisterRuntimeResponse: registration response, containing the runtime ID
-//   - error: returned on registration failure
-func (c *Client) RegisterRuntime(ctx context.Context, workspaceID, agentID, provider, toolVersion, publicKeyPEM string) (*RegisterRuntimeResponse, error) {
-	var result RegisterRuntimeResponse
-	err := c.doJSON(ctx, "POST", fmt.Sprintf("/api/workspaces/%s/runtimes", workspaceID), RegisterRuntimeRequest{
-		AgentID:   agentID,
-		Provider:  provider,
-		Version:   toolVersion,
-		Status:    "online",
-		PublicKey: publicKeyPEM,
-	}, &result)
-	if err != nil {
-		return nil, err
+// RegisterDaemonReport is the machine-side registration payload: machine
+// identity plus the tool-detection snapshot. It carries no instance catalog —
+// instances are created server-side and delivered through desired_agents.
+type RegisterDaemonReport struct {
+	DeviceName string         `json:"device_name"`
+	Version    string         `json:"version"`
+	PublicKey  string         `json:"public_key"`
+	Providers  []ProviderInfo `json:"providers"`
+}
+
+// DesiredAgent is one server-owned instance delivered for local
+// materialization; AgentID is the server UUID the instance executes as.
+type DesiredAgent struct {
+	AgentID  string `json:"agent_id"`
+	Name     string `json:"name"`
+	Provider string `json:"provider"`
+	PersonaKey string `json:"persona_key"`
+}
+
+// RegisterDaemonResponse is the registration result: the daemon's own id, the
+// workspace the daemon token is bound to, the pending instances to
+// materialize, and the heartbeat interval.
+type RegisterDaemonResponse struct {
+	DaemonID          string         `json:"daemon_id"`
+	WorkspaceID       string         `json:"workspace_id"`
+	DesiredAgents     []DesiredAgent `json:"desired_agents"`
+	HeartbeatInterval int            `json:"heartbeat_interval"`
+}
+
+// AgentBusy is one entry of the heartbeat per-agent status payload.
+type AgentBusy struct {
+	Name string `json:"name"`
+	Busy bool   `json:"busy"`
+}
+
+// DaemonHeartbeatResponse is the heartbeat result carrying pending instances
+// for incremental delivery.
+type DaemonHeartbeatResponse struct {
+	DesiredAgents     []DesiredAgent `json:"desired_agents"`
+	HeartbeatInterval int            `json:"heartbeat_interval"`
+}
+
+// RegisterDaemon registers this machine's daemon with its tool-detection
+// snapshot. The instance catalog lives server-side; the response carries the
+// pending instances to materialize.
+func (c *Client) RegisterDaemon(ctx context.Context, report RegisterDaemonReport) (*RegisterDaemonResponse, error) {
+	var result RegisterDaemonResponse
+	if err := c.doJSON(ctx, "POST", "/api/daemons/register", report, &result); err != nil {
+		return nil, fmt.Errorf("register daemon: %w", err)
 	}
 	return &result, nil
+}
+
+// DaemonHeartbeat refreshes the daemon liveness and reports the busy status of
+// the instances this daemon has bound identities for. A nil agents slice sends
+// an empty list.
+func (c *Client) DaemonHeartbeat(ctx context.Context, agents []AgentBusy) (*DaemonHeartbeatResponse, error) {
+	body := struct {
+		Agents []AgentBusy `json:"agents"`
+	}{Agents: agents}
+	var result DaemonHeartbeatResponse
+	if err := c.doJSON(ctx, "POST", "/api/daemons/heartbeat", body, &result); err != nil {
+		return nil, fmt.Errorf("daemon heartbeat: %w", err)
+	}
+	return &result, nil
+}
+
+// DaemonDeregister marks the daemon and all its instances offline (graceful
+// shutdown).
+func (c *Client) DaemonDeregister(ctx context.Context) error {
+	if err := c.doJSON(ctx, "POST", "/api/daemons/deregister", struct{}{}, nil); err != nil {
+		return fmt.Errorf("daemon deregister: %w", err)
+	}
+	return nil
 }
 
 // --- Session Token Exchange ---
 
 // ExchangeTokenRequest represents the token exchange request body, used to
-// exchange an API token for a session token.
+// exchange a daemon token for a session token.
 type ExchangeTokenRequest struct {
 	APIToken string `json:"api_token"`
 }
@@ -232,18 +315,9 @@ type ExchangeTokenResponse struct {
 	ExpiresAt    time.Time `json:"expires_at"`
 }
 
-// ExchangeToken exchanges an API token for a session token.
+// ExchangeToken exchanges a daemon token for a session token.
 // The session token is used for subsequent API calls and is more secure than
-// the API token (short-lived).
-//
-// Parameters:
-//   - ctx: context, used to control request timeout and cancellation
-//   - apiToken: the API token to exchange
-//
-// Returns:
-//   - sessionToken: the new session token
-//   - expiresAt: the expiry time of the session token
-//   - error: returned on exchange failure
+// the daemon token (short-lived).
 func (c *Client) ExchangeToken(ctx context.Context, apiToken string) (sessionToken string, expiresAt time.Time, err error) {
 	var result ExchangeTokenResponse
 	err = c.doJSON(ctx, "POST", "/api/auth/token-exchange", ExchangeTokenRequest{
@@ -256,14 +330,8 @@ func (c *Client) ExchangeToken(ctx context.Context, apiToken string) (sessionTok
 }
 
 // RefreshSessionToken attempts to re-exchange a new session token using the
-// API token.
+// daemon token.
 // On success it updates the client's SessionToken and SessionExpiry fields.
-//
-// Parameters:
-//   - ctx: context, used to control request timeout and cancellation
-//
-// Returns:
-//   - error: returned on exchange failure
 func (c *Client) RefreshSessionToken(ctx context.Context) error {
 	token, expiresAt, err := c.ExchangeToken(ctx, c.APIToken)
 	if err != nil {
@@ -316,19 +384,6 @@ func (c *Client) StartSessionTokenRefresher(stopCh <-chan struct{}) {
 			}
 		}
 	}()
-}
-
-// Heartbeat sends a heartbeat to the Server to keep the runtime online.
-//
-// Parameters:
-//   - ctx: context, used to control request timeout and cancellation
-//   - workspaceID: workspace ID
-//   - runtimeID: runtime ID
-//
-// Returns:
-//   - error: returned on send failure
-func (c *Client) Heartbeat(ctx context.Context, workspaceID, runtimeID string) error {
-	return c.doJSON(ctx, "POST", fmt.Sprintf("/api/workspaces/%s/runtimes/%s/heartbeat", workspaceID, runtimeID), nil, nil)
 }
 
 // --- Node Operations ---
@@ -410,20 +465,12 @@ type boardColumnTask struct {
 }
 
 // ListPendingNodes returns the list of pending nodes in the project that can be
-// claimed.
+// claimed, scoped to the agent instance.
 // It first obtains tasks with pending nodes via the board API, then calls the
 // node API to get the full node information (including node ID).
-//
-// Parameters:
-//   - ctx: context, used to control request timeout and cancellation
-//   - projectID: project ID
-//
-// Returns:
-//   - []TaskNode: the list of pending nodes that can be claimed
-//   - error: returned on query failure
-func (c *Client) ListPendingNodes(ctx context.Context, projectID string) ([]TaskNode, error) {
+func (c *Client) ListPendingNodes(ctx context.Context, agentID, projectID string) ([]TaskNode, error) {
 	var result boardResponse
-	err := c.doJSON(ctx, "GET", fmt.Sprintf("/api/projects/%s/board", projectID), nil, &result)
+	err := c.doJSON(ctx, "GET", fmt.Sprintf("/api/projects/%s/board", projectID), nil, &result, withAgentHeader(agentID))
 	if err != nil {
 		return nil, err
 	}
@@ -450,7 +497,7 @@ func (c *Client) ListPendingNodes(ctx context.Context, projectID string) ([]Task
 			return nodes, ctx.Err()
 		default:
 		}
-		taskNodes, err := c.ListTaskNodes(ctx, taskID)
+		taskNodes, err := c.ListTaskNodes(ctx, agentID, taskID)
 		if err != nil {
 			continue
 		}
@@ -463,34 +510,28 @@ func (c *Client) ListPendingNodes(ctx context.Context, projectID string) ([]Task
 	return nodes, nil
 }
 
-// ListTaskNodes retrieves all nodes of the specified task.
+// ListTaskNodes retrieves all nodes of the specified task, scoped to the agent
+// instance.
 // Endpoint: GET /api/tasks/{taskId}/nodes
-//
-// Parameters:
-//   - ctx: context, used to control request timeout and cancellation
-//   - taskID: task ID
-//
-// Returns:
-//   - []TaskNode: the task node list
-//   - error: returned on query failure
-func (c *Client) ListTaskNodes(ctx context.Context, taskID int32) ([]TaskNode, error) {
+func (c *Client) ListTaskNodes(ctx context.Context, agentID string, taskID int32) ([]TaskNode, error) {
 	var result []TaskNode
-	err := c.doJSON(ctx, "GET", fmt.Sprintf("/api/tasks/%d/nodes", taskID), nil, &result)
+	err := c.doJSON(ctx, "GET", fmt.Sprintf("/api/tasks/%d/nodes", taskID), nil, &result, withAgentHeader(agentID))
 	return result, err
 }
 
 // ListExecutionContextComments retrieves the comment context that should be
-// injected when executing the specified node.
-func (c *Client) ListExecutionContextComments(ctx context.Context, taskID int32, nodeID string) ([]Comment, error) {
+// injected when executing the specified node, scoped to the agent instance.
+func (c *Client) ListExecutionContextComments(ctx context.Context, agentID string, taskID int32, nodeID string) ([]Comment, error) {
 	var result []Comment
-	err := c.doJSON(ctx, "GET", fmt.Sprintf("/api/tasks/%d/comments?node_id=%s&scope=execution_context", taskID, nodeID), nil, &result)
+	err := c.doJSON(ctx, "GET", fmt.Sprintf("/api/tasks/%d/comments?node_id=%s&scope=execution_context", taskID, nodeID), nil, &result, withAgentHeader(agentID))
 	return result, err
 }
 
-// ListNodeComments retrieves comments in the specified node's comment area.
-func (c *Client) ListNodeComments(ctx context.Context, taskID int32, nodeID string) ([]Comment, error) {
+// ListNodeComments retrieves comments in the specified node's comment area,
+// scoped to the agent instance.
+func (c *Client) ListNodeComments(ctx context.Context, agentID string, taskID int32, nodeID string) ([]Comment, error) {
 	var result []Comment
-	err := c.doJSON(ctx, "GET", fmt.Sprintf("/api/tasks/%d/comments?node_id=%s", taskID, nodeID), nil, &result)
+	err := c.doJSON(ctx, "GET", fmt.Sprintf("/api/tasks/%d/comments?node_id=%s", taskID, nodeID), nil, &result, withAgentHeader(agentID))
 	return result, err
 }
 
@@ -508,145 +549,79 @@ type InProgressNode struct {
 	ProjectID       string          `json:"project_id"`
 }
 
-// GetInProgressNodes queries the nodes claimed by the current Agent that are
+// GetInProgressNodes queries the nodes claimed by the agent instance that are
 // not yet completed (in_progress).
 // Used to resume unfinished execution after the Agent restarts.
 // Endpoint: GET /api/workspaces/{workspaceID}/agents/{agentID}/in-progress-nodes
-//
-// Parameters:
-//   - ctx: context
-//   - workspaceID: workspace ID
-//   - agentID: agent ID
-//
-// Returns:
-//   - []InProgressNode: the in_progress node list
-//   - error: returned on query failure
 func (c *Client) GetInProgressNodes(ctx context.Context, workspaceID, agentID string) ([]InProgressNode, error) {
 	var result []InProgressNode
-	err := c.doJSON(ctx, "GET", fmt.Sprintf("/api/workspaces/%s/agents/%s/in-progress-nodes", workspaceID, agentID), nil, &result)
+	err := c.doJSON(ctx, "GET", fmt.Sprintf("/api/workspaces/%s/agents/%s/in-progress-nodes", workspaceID, agentID), nil, &result, withAgentHeader(agentID))
 	return result, err
 }
 
-// ClaimNode claims a pending node, assigning it to the specified agent.
+// ClaimNode claims a pending node, assigning it to the specified agent
+// instance.
 // Uses optimistic locking for concurrency control; if the node has already
 // been claimed by another agent it returns 409 Conflict.
 // Endpoint: POST /api/tasks/{taskId}/nodes/{nodeId}/claim
-//
-// Parameters:
-//   - ctx: context, used to control request timeout and cancellation
-//   - agentID: the ID of the agent claiming the node
-//   - taskID: task ID
-//   - nodeID: node ID
-//
-// Returns:
-//   - *TaskNode: the node information after a successful claim
-//   - error: returned on claim failure (e.g. 409 Conflict)
 func (c *Client) ClaimNode(ctx context.Context, agentID string, taskID int32, nodeID string) (*TaskNode, error) {
 	var result TaskNode
 	err := c.doJSON(ctx, "POST", fmt.Sprintf("/api/tasks/%d/nodes/%s/claim", taskID, nodeID), map[string]string{
 		"agent_id": agentID,
-	}, &result)
+	}, &result, withAgentHeader(agentID))
 	return &result, err
 }
 
-// ApproveNode approves (completes) the current node.
+// ApproveNode approves (completes) the current node on behalf of the agent
+// instance.
 // Endpoint: POST /api/tasks/{taskId}/nodes/{nodeId}/approve
-//
-// Parameters:
-//   - ctx: context, used to control request timeout and cancellation
-//   - agentID: the approver agent ID
-//   - taskID: task ID
-//   - nodeID: node ID
-//   - comment: approval comment
-//
-// Returns:
-//   - error: returned on approval failure
 func (c *Client) ApproveNode(ctx context.Context, agentID string, taskID int32, nodeID, comment string) error {
 	return c.doJSON(ctx, "POST", fmt.Sprintf("/api/tasks/%d/nodes/%s/approve", taskID, nodeID), map[string]string{
 		"operator_id":   agentID,
 		"operator_type": "agent",
 		"comment":       comment,
-	}, nil)
+	}, nil, withAgentHeader(agentID))
 }
 
-// CompleteNode completes a standard node (agent-only call, does not require
-// task:approve permission).
+// CompleteNode completes a standard node on behalf of the agent instance
+// (agent-only call, does not require task:approve permission).
 // Endpoint: POST /api/tasks/{taskId}/nodes/{nodeId}/complete
-//
-// Parameters:
-//   - ctx: context, used to control request timeout and cancellation
-//   - agentID: the executing agent ID
-//   - taskID: task ID
-//   - nodeID: node ID
-//   - summary: node execution summary
-//
-// Returns:
-//   - error: returned on completion failure
 func (c *Client) CompleteNode(ctx context.Context, agentID string, taskID int32, nodeID, summary string) error {
 	return c.doJSON(ctx, "POST", fmt.Sprintf("/api/tasks/%d/nodes/%s/complete", taskID, nodeID), map[string]string{
 		"summary": summary,
-	}, nil)
+	}, nil, withAgentHeader(agentID))
 }
 
-// RejectNode rejects the current node, rolling it back to the specified target
-// node.
+// RejectNode rejects the current node on behalf of the agent instance, rolling
+// it back to the specified target node.
 // Endpoint: POST /api/tasks/{taskId}/nodes/{nodeId}/reject
-//
-// Parameters:
-//   - ctx: context, used to control request timeout and cancellation
-//   - agentID: the rejecter agent ID
-//   - taskID: task ID
-//   - nodeID: the ID of the rejected node
-//   - targetNodeID: the rollback target node ID
-//   - comment: rejection comment
-//
-// Returns:
-//   - error: returned on rejection failure
 func (c *Client) RejectNode(ctx context.Context, agentID string, taskID int32, nodeID, targetNodeID, comment string) error {
 	return c.doJSON(ctx, "POST", fmt.Sprintf("/api/tasks/%d/nodes/%s/reject", taskID, nodeID), map[string]interface{}{
 		"operator_id":    agentID,
 		"operator_type":  "agent",
 		"target_node_id": targetNodeID,
 		"comment":        comment,
-	}, nil)
+	}, nil, withAgentHeader(agentID))
 }
 
-// ManualIntervention marks the node as requiring manual intervention.
+// ManualIntervention marks the node as requiring manual intervention on
+// behalf of the agent instance.
 // Endpoint: POST /api/tasks/{taskId}/nodes/{nodeId}/manual
-//
-// Parameters:
-//   - ctx: context, used to control request timeout and cancellation
-//   - agentID: the operator agent ID
-//   - taskID: task ID
-//   - nodeID: node ID
-//   - comment: explanation of the intervention reason
-//
-// Returns:
-//   - error: returned on operation failure
 func (c *Client) ManualIntervention(ctx context.Context, agentID string, taskID int32, nodeID, comment string) error {
 	return c.doJSON(ctx, "POST", fmt.Sprintf("/api/tasks/%d/nodes/%s/manual", taskID, nodeID), map[string]string{
 		"operator_id":   agentID,
 		"operator_type": "agent",
 		"comment":       comment,
-	}, nil)
+	}, nil, withAgentHeader(agentID))
 }
 
-// SkipClaim relinquishes the node's continuation right, allowing other agents
-// to claim subsequent nodes.
+// SkipClaim relinquishes the node's continuation right on behalf of the agent
+// instance, allowing other agents to claim subsequent nodes.
 // Endpoint: POST /api/tasks/{taskId}/nodes/{nodeId}/skip-claim
-//
-// Parameters:
-//   - ctx: context, used to control request timeout and cancellation
-//   - agentID: the ID of the agent relinquishing the continuation right
-//   - taskID: task ID
-//   - nodeID: node ID
-//
-// Returns:
-//   - error: returned on operation failure
 func (c *Client) SkipClaim(ctx context.Context, agentID string, taskID int32, nodeID string) error {
 	return c.doJSON(ctx, "POST", fmt.Sprintf("/api/tasks/%d/nodes/%s/skip-claim", taskID, nodeID), map[string]string{
 		"agent_id": agentID,
-	}, nil)
+	}, nil, withAgentHeader(agentID))
 }
 
 // --- Token Usage ---
@@ -659,26 +634,17 @@ type TokenUsageRequest struct {
 	TotalTokens  int `json:"total_tokens"`
 }
 
-// ReportTokenUsage reports the token usage of a completed node.
+// ReportTokenUsage reports the token usage of a completed node on behalf of
+// the agent instance.
 // Endpoint: POST /api/tasks/{taskId}/token-usage
-//
-// Parameters:
-//   - ctx: context, used to control request timeout and cancellation
-//   - taskID: task ID
-//   - nodeID: node ID
-//   - agentID: the executing agent ID
-//   - usage: token usage information
-//
-// Returns:
-//   - error: returned on report failure
-func (c *Client) ReportTokenUsage(ctx context.Context, taskID int32, nodeID, agentID string, usage TokenUsageRequest) error {
+func (c *Client) ReportTokenUsage(ctx context.Context, agentID string, taskID int32, nodeID string, usage TokenUsageRequest) error {
 	return c.doJSON(ctx, "POST", fmt.Sprintf("/api/tasks/%d/token-usage", taskID), map[string]interface{}{
 		"task_node_id":  nodeID,
 		"agent_id":      agentID,
 		"input_tokens":  usage.InputTokens,
 		"output_tokens": usage.OutputTokens,
 		"total_tokens":  usage.TotalTokens,
-	}, nil)
+	}, nil, withAgentHeader(agentID))
 }
 
 // --- Git Credentials ---
@@ -706,17 +672,12 @@ type gitCredentialEntry struct {
 
 // GetGitCredentials retrieves and decrypts the project's Git credentials.
 // Returns a list of credentials (one per configured repo_url).
-//
-// Parameters:
-//   - ctx: context, used to control request timeout and cancellation
-//   - projectID: project ID
-//
-// Returns:
-//   - []GitCredentials: the decrypted credential list
-//   - error: returned on retrieval or decryption failure
-func (c *Client) GetGitCredentials(ctx context.Context, projectID string) ([]GitCredentials, error) {
+// Scoped to the agent instance via X-Agent-ID: the daemon principal has no
+// workspace role, but an agent that claimed a node in the project is a
+// project member and passes the access check.
+func (c *Client) GetGitCredentials(ctx context.Context, agentID, projectID string) ([]GitCredentials, error) {
 	var result gitCredentialsResponse
-	err := c.doJSON(ctx, "GET", fmt.Sprintf("/api/projects/%s/git-credentials", projectID), nil, &result)
+	err := c.doJSON(ctx, "GET", fmt.Sprintf("/api/projects/%s/git-credentials", projectID), nil, &result, withAgentHeader(agentID))
 	if err != nil {
 		return nil, err
 	}
@@ -724,7 +685,7 @@ func (c *Client) GetGitCredentials(ctx context.Context, projectID string) ([]Git
 	creds := make([]GitCredentials, 0, len(result.Credentials))
 	for _, entry := range result.Credentials {
 		pat := entry.EncryptedPAT
-		// If a private key is available, decrypt the PAT
+		// If the daemon private key is available, decrypt the PAT
 		if c.PrivateKeyPEM != "" && entry.EncryptedPAT != "" {
 			decrypted, err := DecryptWithPrivateKey(c.PrivateKeyPEM, entry.EncryptedPAT)
 			if err != nil {
@@ -755,26 +716,20 @@ type Project struct {
 }
 
 // ListProjects retrieves all projects in the workspace.
+// Scoped to the agent instance via X-Agent-ID: workspace-level routes require
+// a member role or agent permission, and the daemon principal has neither.
 // Endpoint: GET /api/workspaces/{workspaceID}/projects
-//
-// Parameters:
-//   - ctx: context, used to control request timeout and cancellation
-//   - workspaceID: workspace ID
-//
-// Returns:
-//   - []Project: the project list
-//   - error: returned on query failure
-func (c *Client) ListProjects(ctx context.Context, workspaceID string) ([]Project, error) {
+func (c *Client) ListProjects(ctx context.Context, agentID, workspaceID string) ([]Project, error) {
 	var result []Project
-	err := c.doJSON(ctx, "GET", fmt.Sprintf("/api/workspaces/%s/projects", workspaceID), nil, &result)
+	err := c.doJSON(ctx, "GET", fmt.Sprintf("/api/workspaces/%s/projects", workspaceID), nil, &result, withAgentHeader(agentID))
 	return result, err
 }
 
 // GetProject retrieves a single project's information, including project-level
-// repository configuration.
-func (c *Client) GetProject(ctx context.Context, workspaceID, projectID string) (*Project, error) {
+// repository configuration. Scoped to the agent instance via X-Agent-ID.
+func (c *Client) GetProject(ctx context.Context, agentID, workspaceID, projectID string) (*Project, error) {
 	var result Project
-	err := c.doJSON(ctx, "GET", fmt.Sprintf("/api/workspaces/%s/projects/%s", workspaceID, projectID), nil, &result)
+	err := c.doJSON(ctx, "GET", fmt.Sprintf("/api/workspaces/%s/projects/%s", workspaceID, projectID), nil, &result, withAgentHeader(agentID))
 	if err != nil {
 		return nil, err
 	}
@@ -783,43 +738,26 @@ func (c *Client) GetProject(ctx context.Context, workspaceID, projectID string) 
 
 // --- Task Messages ---
 
-// SendMessage sends a task log message; the content is desensitized before
-// upload.
-// Endpoint: POST /api/tasks/{taskId}/messages
-//
-// Parameters:
-//   - ctx: context, used to control request timeout and cancellation
-//   - taskID: task ID
-//   - nodeID: node ID
-//   - content: log content
-//
-// Returns:
-//   - error: returned on send failure
-func (c *Client) SendMessage(ctx context.Context, taskID int32, nodeID, content string) error {
-	return c.SendMessageWithType(ctx, taskID, nodeID, "stdout", content)
-}
-
-// SendMessageWithType sends a task log message of the specified type; the
+// SendMessage sends a task log message on behalf of the agent instance; the
 // content is desensitized before upload.
 // Endpoint: POST /api/tasks/{taskId}/messages
+func (c *Client) SendMessage(ctx context.Context, agentID string, taskID int32, nodeID, content string) error {
+	return c.SendMessageWithType(ctx, agentID, taskID, nodeID, "stdout", content)
+}
+
+// SendMessageWithType sends a task log message of the specified type on behalf
+// of the agent instance; the content is desensitized before upload.
+// Endpoint: POST /api/tasks/{taskId}/messages
 //
-// Parameters:
-//   - ctx: context, used to control request timeout and cancellation
-//   - taskID: task ID
-//   - nodeID: node ID
-//   - msgType: message type ("stdout", "stderr", "system")
-//   - content: log content
-//
-// Returns:
-//   - error: returned on send failure
-func (c *Client) SendMessageWithType(ctx context.Context, taskID int32, nodeID, msgType, content string) error {
+// msgType is one of "stdout", "stderr", "system".
+func (c *Client) SendMessageWithType(ctx context.Context, agentID string, taskID int32, nodeID, msgType, content string) error {
 	desensitized := DesensitizeLog(content)
 	log.Printf("[client:SendMessage] task=%d node=%s type=%s content_len=%d", taskID, nodeID, msgType, len(desensitized))
 	err := c.doJSON(ctx, "POST", fmt.Sprintf("/api/tasks/%d/messages", taskID), map[string]string{
 		"node_id": nodeID,
 		"type":    msgType,
 		"content": desensitized,
-	}, nil)
+	}, nil, withAgentHeader(agentID))
 	if err != nil {
 		log.Printf("[client:SendMessage] ERROR: %v", err)
 	} else {
@@ -831,98 +769,56 @@ func (c *Client) SendMessageWithType(ctx context.Context, taskID int32, nodeID, 
 // --- Interrupt ---
 
 // ReportInterrupt acknowledges that an interrupt request for a task node has
-// been processed.
+// been processed, on behalf of the agent instance.
 // Endpoint: POST /api/tasks/{taskId}/nodes/{nodeId}/interrupt-ack
-//
-// Parameters:
-//   - ctx: context, used to control request timeout and cancellation
-//   - taskID: task ID
-//   - nodeID: node ID
-//
-// Returns:
-//   - error: returned on acknowledgment failure
-func (c *Client) ReportInterrupt(ctx context.Context, taskID int32, nodeID string) error {
+func (c *Client) ReportInterrupt(ctx context.Context, agentID string, taskID int32, nodeID string) error {
 	return c.doJSON(ctx, "POST", fmt.Sprintf("/api/tasks/%d/nodes/%s/interrupt-ack", taskID, nodeID), map[string]string{
 		"comment": "interrupt acknowledged by agent",
-	}, nil)
+	}, nil, withAgentHeader(agentID))
 }
 
 // --- Task Details ---
 
-// GetTask retrieves task details by task ID.
+// GetTask retrieves task details by task ID on behalf of the agent instance.
 // Endpoint: GET /api/projects/{projectID}/tasks/{taskID}
-//
-// Parameters:
-//   - ctx: context, used to control request timeout and cancellation
-//   - projectID: project ID
-//   - taskID: task ID
-//
-// Returns:
-//   - *Task: task details
-//   - error: returned on query failure
-func (c *Client) GetTask(ctx context.Context, projectID string, taskID int32) (*Task, error) {
+func (c *Client) GetTask(ctx context.Context, agentID, projectID string, taskID int32) (*Task, error) {
 	var result Task
-	err := c.doJSON(ctx, "GET", fmt.Sprintf("/api/projects/%s/tasks/%d", projectID, taskID), nil, &result)
+	err := c.doJSON(ctx, "GET", fmt.Sprintf("/api/projects/%s/tasks/%d", projectID, taskID), nil, &result, withAgentHeader(agentID))
 	if err != nil {
 		return nil, err
 	}
 	return &result, nil
 }
 
-// ReportSummary updates the summary information of a completed node.
+// ReportSummary updates the summary information of a completed node on behalf
+// of the agent instance.
 // Endpoint: POST /api/tasks/{taskId}/nodes/{nodeId}/summary
-//
-// Parameters:
-//   - ctx: context, used to control request timeout and cancellation
-//   - taskID: task ID
-//   - nodeID: node ID
-//   - summary: node execution summary
-//
-// Returns:
-//   - error: returned on update failure
-func (c *Client) ReportSummary(ctx context.Context, taskID int32, nodeID, summary string) error {
+func (c *Client) ReportSummary(ctx context.Context, agentID string, taskID int32, nodeID, summary string) error {
 	return c.doJSON(ctx, "POST", fmt.Sprintf("/api/tasks/%d/nodes/%s/summary", taskID, nodeID), map[string]string{
 		"summary": summary,
-	}, nil)
+	}, nil, withAgentHeader(agentID))
 }
 
 // ReportGitBranch reports the task's Git branch name after the Git workspace
-// is initialized successfully.
+// is initialized successfully, on behalf of the agent instance.
 // Endpoint: PUT /api/tasks/{taskId}/git-branch
-//
-// Parameters:
-//   - ctx: context, used to control request timeout and cancellation
-//   - taskID: task ID
-//   - gitBranch: Git branch name
-//
-// Returns:
-//   - error: returned on report failure
-func (c *Client) ReportGitBranch(ctx context.Context, taskID int32, gitBranch string) error {
+func (c *Client) ReportGitBranch(ctx context.Context, agentID string, taskID int32, gitBranch string) error {
 	return c.doJSON(ctx, "PUT", fmt.Sprintf("/api/tasks/%d/git-branch", taskID), map[string]string{
 		"git_branch": gitBranch,
-	}, nil)
+	}, nil, withAgentHeader(agentID))
 }
 
-// PostComment posts a comment on a task.
+// PostComment posts a comment on a task on behalf of the agent instance.
 // Endpoint: POST /api/tasks/{taskId}/comments
-//
-// Parameters:
-//   - ctx: context, used to control request timeout and cancellation
-//   - taskID: task ID
-//   - content: comment content
-//   - authorType: author type ("agent" or "human")
-//   - authorID: author ID
-//
-// Returns:
-//   - error: returned on post failure
-func (c *Client) PostComment(ctx context.Context, taskID int32, content, authorType, authorID string) error {
+func (c *Client) PostComment(ctx context.Context, agentID string, taskID int32, content, authorType, authorID string) error {
 	return c.doJSON(ctx, "POST", fmt.Sprintf("/api/tasks/%d/comments", taskID), map[string]string{
 		"content": content,
-	}, nil)
+	}, nil, withAgentHeader(agentID))
 }
 
-// PostNodeComment posts a comment in the specified node's comment area.
-func (c *Client) PostNodeComment(ctx context.Context, taskID int32, nodeID, sourceNodeID, commentType, content string) error {
+// PostNodeComment posts a comment in the specified node's comment area on
+// behalf of the agent instance.
+func (c *Client) PostNodeComment(ctx context.Context, agentID string, taskID int32, nodeID, sourceNodeID, commentType, content string) error {
 	body := map[string]string{
 		"node_id":      nodeID,
 		"content":      content,
@@ -931,5 +827,5 @@ func (c *Client) PostNodeComment(ctx context.Context, taskID int32, nodeID, sour
 	if sourceNodeID != "" {
 		body["source_node_id"] = sourceNodeID
 	}
-	return c.doJSON(ctx, "POST", fmt.Sprintf("/api/tasks/%d/comments", taskID), body, nil)
+	return c.doJSON(ctx, "POST", fmt.Sprintf("/api/tasks/%d/comments", taskID), body, nil, withAgentHeader(agentID))
 }

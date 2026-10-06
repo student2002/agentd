@@ -17,6 +17,7 @@ const (
 	LocalEventSnapshotUpdated      = "snapshot.updated"
 	LocalEventOutputLine           = "execution_session.output_line"
 	LocalEventIntervening          = "execution_session.intervening"
+	LocalEventChatOutputLine       = "chat.output_line"
 )
 
 type LocalEvent struct {

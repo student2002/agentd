@@ -1,0 +1,8 @@
+# Keep the build context lean; web/ stays — the control console is embedded
+# into the binary at compile time.
+.git
+.gitignore
+docs
+test
+*.md
+teammate-agentd

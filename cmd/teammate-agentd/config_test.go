@@ -12,7 +12,7 @@ import (
 
 func TestSaveDefaultConfigWritesSparseYAML(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.yaml")
-	if err := agent.SaveConfig(defaultAgentConfig(), path); err != nil {
+	if err := agent.SaveGlobalConfig(defaultGlobalConfig(), path); err != nil {
 		t.Fatalf("save config: %v", err)
 	}
 
@@ -22,27 +22,32 @@ func TestSaveDefaultConfigWritesSparseYAML(t *testing.T) {
 	}
 	got := string(data)
 	for _, unwanted := range []string{
-		"project:",
 		"local:",
 		"openclaw:",
 		"opencode:",
 		"atomcode:",
 		"mimocode:",
 		"base_branch: master",
+		"max_concurrent_executions",
 		"path: \"\"",
+		"agents:",
+		"workspaces:",
+		"daemon:",
 	} {
 		if strings.Contains(got, unwanted) {
 			t.Fatalf("default config wrote unwanted %q into sparse YAML:\n%s", unwanted, got)
 		}
 	}
-	if !strings.Contains(got, "claude:") || !strings.Contains(got, "path: claude") {
-		t.Fatalf("default config should include active claude tool path, got:\n%s", got)
+	for _, want := range []string{"url: http://127.0.0.1:8080", "workspace_root:", "claude:", "path: claude"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("default config missing %q, got:\n%s", want, got)
+		}
 	}
 }
 
 func TestConfigLocalEnableGeneratesLocalBindingCredentials(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.yaml")
-	if err := agent.SaveConfig(defaultAgentConfig(), path); err != nil {
+	if err := agent.SaveGlobalConfig(defaultGlobalConfig(), path); err != nil {
 		t.Fatalf("save config: %v", err)
 	}
 
@@ -58,7 +63,7 @@ func TestConfigLocalEnableGeneratesLocalBindingCredentials(t *testing.T) {
 		t.Fatalf("enable local API: %v", err)
 	}
 
-	cfg, err := agent.LoadConfig(path)
+	cfg, err := agent.LoadGlobalConfig(path)
 	if err != nil {
 		t.Fatalf("load enabled config: %v", err)
 	}
@@ -91,13 +96,10 @@ func TestConfigLocalEnablePreservesSparseHandWrittenYAML(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.yaml")
 	original := strings.Join([]string{
 		"server:",
-		"  url: http://localhost:8080",
-		"  api_token: tm_token",
-		"agent:",
-		"  id: agent-1",
-		"  provider: claude",
-		"workspace:",
-		"  id: ws-1",
+		"  url: http://127.0.0.1:8080",
+		"workspaces:",
+		"  - name: team-a",
+		"    token: td_token",
 		"tools:",
 		"  claude:",
 		"    path: claude",
@@ -117,7 +119,6 @@ func TestConfigLocalEnablePreservesSparseHandWrittenYAML(t *testing.T) {
 	}
 	got := string(data)
 	for _, unwanted := range []string{
-		"root:",
 		"openclaw:",
 		"opencode:",
 		"atomcode:",
@@ -138,13 +139,13 @@ func TestConfigLocalEnablePreservesSparseHandWrittenYAML(t *testing.T) {
 
 func TestConfigLocalDisableKeepsBindingCredentials(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.yaml")
-	if err := agent.SaveConfig(defaultAgentConfig(), path); err != nil {
+	if err := agent.SaveGlobalConfig(defaultGlobalConfig(), path); err != nil {
 		t.Fatalf("save config: %v", err)
 	}
 	if err := enableLocalAPIAtPath(path); err != nil {
 		t.Fatalf("enable local API: %v", err)
 	}
-	enabled, err := agent.LoadConfig(path)
+	enabled, err := agent.LoadGlobalConfig(path)
 	if err != nil {
 		t.Fatalf("load enabled config: %v", err)
 	}
@@ -153,7 +154,7 @@ func TestConfigLocalDisableKeepsBindingCredentials(t *testing.T) {
 		t.Fatalf("disable local API: %v", err)
 	}
 
-	disabled, err := agent.LoadConfig(path)
+	disabled, err := agent.LoadGlobalConfig(path)
 	if err != nil {
 		t.Fatalf("load disabled config: %v", err)
 	}
@@ -172,13 +173,10 @@ func TestConfigSetPreservesSparseHandWrittenYAML(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.yaml")
 	original := strings.Join([]string{
 		"server:",
-		"  url: http://localhost:8080",
-		"  api_token: tm_token",
-		"agent:",
-		"  id: agent-1",
-		"  provider: claude",
-		"workspace:",
-		"  id: ws-1",
+		"  url: http://127.0.0.1:8080",
+		"workspaces:",
+		"  - name: team-a",
+		"    token: td_token",
 		"tools:",
 		"  claude:",
 		"    path: claude",
@@ -188,7 +186,7 @@ func TestConfigSetPreservesSparseHandWrittenYAML(t *testing.T) {
 		t.Fatalf("write config: %v", err)
 	}
 
-	if err := setConfigValueAtPath(path, "agent.name", "Agent One"); err != nil {
+	if err := setConfigValueAtPath(path, "name", "dev-box-01"); err != nil {
 		t.Fatalf("set config: %v", err)
 	}
 
@@ -198,7 +196,6 @@ func TestConfigSetPreservesSparseHandWrittenYAML(t *testing.T) {
 	}
 	got := string(data)
 	for _, unwanted := range []string{
-		"project:",
 		"openclaw:",
 		"opencode:",
 		"atomcode:",
@@ -210,11 +207,11 @@ func TestConfigSetPreservesSparseHandWrittenYAML(t *testing.T) {
 			t.Fatalf("config set wrote unwanted %q into sparse YAML:\n%s", unwanted, got)
 		}
 	}
-	if !strings.Contains(got, "name: Agent One") {
-		t.Fatalf("expected updated agent.name, got:\n%s", got)
+	if !strings.Contains(got, "name: dev-box-01") {
+		t.Fatalf("expected updated name, got:\n%s", got)
 	}
-	if !strings.Contains(got, "provider: claude") {
-		t.Fatalf("expected existing agent.provider to remain, got:\n%s", got)
+	if !strings.Contains(got, "token: td_token") {
+		t.Fatalf("expected existing workspace token to remain, got:\n%s", got)
 	}
 }
 
@@ -222,7 +219,7 @@ func TestConfigSetCanPatchIncompatiblePartialYAML(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.yaml")
 	partial := strings.Join([]string{
 		"server:",
-		"  url: http://localhost:8080",
+		"  url: http://127.0.0.1:8080",
 		"tools: []",
 		"",
 	}, "\n")
@@ -244,9 +241,24 @@ func TestConfigSetCanPatchIncompatiblePartialYAML(t *testing.T) {
 	}
 }
 
+func TestConfigSetRejectsRemovedDaemonKeys(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := agent.SaveGlobalConfig(defaultGlobalConfig(), path); err != nil {
+		t.Fatalf("save config: %v", err)
+	}
+	for _, key := range []string{"agent.id", "agent.provider", "server.api_token", "agents", "daemon.token", "daemon.workspace_id", "daemon.name", "workspaces"} {
+		if err := setConfigValueAtPath(path, key, "x"); err == nil {
+			t.Fatalf("expected set %q to be rejected", key)
+		}
+	}
+}
+
 func TestConfigListYAMLMasksSecretsByDefault(t *testing.T) {
-	cfg := defaultAgentConfig()
-	cfg.Server.APIToken = "tm_1234567890abcdef1234567890abcdef"
+	cfg := defaultGlobalConfig()
+	cfg.Workspaces = append(cfg.Workspaces, agent.WorkspaceEntry{
+		Name:  "team-a",
+		Token: "td_1234567890abcdef1234567890abcdef",
+	})
 	cfg.Local.Enabled = true
 	cfg.Local.LocalToken = "lt_1234567890abcdef1234567890abcdef"
 	cfg.Local.InstanceID = "instance-1"
@@ -256,17 +268,20 @@ func TestConfigListYAMLMasksSecretsByDefault(t *testing.T) {
 		t.Fatalf("marshal config: %v", err)
 	}
 	got := string(out)
-	if strings.Contains(got, cfg.Server.APIToken) || strings.Contains(got, cfg.Local.LocalToken) {
+	if strings.Contains(got, cfg.Workspaces[0].Token) || strings.Contains(got, cfg.Local.LocalToken) {
 		t.Fatalf("expected secrets to be masked, got:\n%s", got)
 	}
-	if !strings.Contains(got, "tm_123...cdef") || !strings.Contains(got, "lt_123...cdef") {
+	if !strings.Contains(got, "td_123...cdef") || !strings.Contains(got, "lt_123...cdef") {
 		t.Fatalf("expected masked tokens, got:\n%s", got)
 	}
 }
 
 func TestConfigListJSONCanShowSecretsExplicitly(t *testing.T) {
-	cfg := defaultAgentConfig()
-	cfg.Server.APIToken = "tm_1234567890abcdef1234567890abcdef"
+	cfg := defaultGlobalConfig()
+	cfg.Workspaces = append(cfg.Workspaces, agent.WorkspaceEntry{
+		Name:  "team-a",
+		Token: "td_1234567890abcdef1234567890abcdef",
+	})
 	cfg.Local.Enabled = true
 	cfg.Local.LocalToken = "lt_1234567890abcdef1234567890abcdef"
 	cfg.Local.InstanceID = "instance-1"
@@ -276,7 +291,7 @@ func TestConfigListJSONCanShowSecretsExplicitly(t *testing.T) {
 		t.Fatalf("marshal config: %v", err)
 	}
 	got := string(out)
-	if !strings.Contains(got, cfg.Server.APIToken) || !strings.Contains(got, cfg.Local.LocalToken) {
+	if !strings.Contains(got, cfg.Workspaces[0].Token) || !strings.Contains(got, cfg.Local.LocalToken) {
 		t.Fatalf("expected explicit secret output, got:\n%s", got)
 	}
 }

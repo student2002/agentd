@@ -15,24 +15,34 @@ type MCPToolConfig struct {
 	MCPServers map[string]MCPServerToolConfig `json:"mcpServers"`
 }
 
+// MCPServerToolConfig is one server entry in the tool's MCP config. Remote
+// servers use Type/URL; local stdio servers use Command/Args. Env may carry
+// credentials, so the file is written 0600.
 type MCPServerToolConfig struct {
-	Type string            `json:"type,omitempty"`
-	URL  string            `json:"url,omitempty"`
-	Env  map[string]string `json:"env,omitempty"`
+	Type    string            `json:"type,omitempty"`
+	URL     string            `json:"url,omitempty"`
+	Command string            `json:"command,omitempty"`
+	Args    []string          `json:"args,omitempty"`
+	Env     map[string]string `json:"env,omitempty"`
 }
+
+// TeammateMemoryMCPName is the agentd memory server's entry name in every
+// workDir MCP config.
+const TeammateMemoryMCPName = "teammate-memory"
 
 var invalidMCPNameChars = regexp.MustCompile(`[^A-Za-z0-9_.-]+`)
 
 // WriteAgentMCPConfig fetches the agent's enabled MCP bindings and writes them to
-// the local tool config file.
+// the local tool config file, scoped to the executing connection's workspace
+// and agent identity.
 // The file is written with 0600 permissions because the environment variables
 // may contain credentials.
-func WriteAgentMCPConfig(ctx context.Context, client *Client, cfg *Config, workDir string) (string, []AgentMcpServerContext, error) {
-	if client == nil || cfg == nil || cfg.Workspace.ID == "" || cfg.Agent.ID == "" {
+func WriteAgentMCPConfig(ctx context.Context, client *Client, workspaceID, agentID, workDir string) (string, []AgentMcpServerContext, error) {
+	if client == nil || workspaceID == "" || agentID == "" {
 		return "", nil, nil
 	}
 
-	servers, err := client.ListAgentMcpServers(ctx, cfg.Workspace.ID, cfg.Agent.ID)
+	servers, err := client.ListAgentMcpServers(ctx, workspaceID, agentID)
 	if err != nil {
 		return "", nil, err
 	}
@@ -147,6 +157,57 @@ func inferMCPTransport(server AgentMcpServerContext) string {
 		return "sse"
 	}
 	return "http"
+}
+
+// WriteTeammateMemoryMCPEntry adds (or refreshes) the agentd memory server
+// entry in the workDir MCP config so the coding tool can reach the instance
+// memory through the `teammate-agentd mcp` subprocess. The entry carries the
+// execution context and the connection's daemon token in its environment —
+// the same sensitivity class as the git askpass credentials, so the file
+// stays 0600. Returns the config path.
+func WriteTeammateMemoryMCPEntry(run RunContext, cfg *Config, workDir string) (string, error) {
+	dir := filepath.Join(workDir, ".teammate")
+	path := filepath.Join(dir, "mcp.json")
+
+	config := MCPToolConfig{MCPServers: map[string]MCPServerToolConfig{}}
+	if data, err := os.ReadFile(path); err == nil {
+		if err := json.Unmarshal(data, &config); err != nil || config.MCPServers == nil {
+			config = MCPToolConfig{MCPServers: map[string]MCPServerToolConfig{}}
+		}
+	}
+
+	executable, err := os.Executable()
+	if err != nil {
+		return "", fmt.Errorf("resolve agentd executable: %w", err)
+	}
+	config.MCPServers[TeammateMemoryMCPName] = MCPServerToolConfig{
+		Type:    "stdio",
+		Command: executable,
+		Args:    []string{"mcp"},
+		Env: map[string]string{
+			MCPCtxInstance:    cfg.Agent.Name,
+			MCPCtxPersona:     cfg.Agent.PersonaKey,
+			MCPCtxConnection:  run.ConnName,
+			MCPCtxWorkspaceID: run.WorkspaceID,
+			MCPCtxAgentID:     run.AgentID,
+			MCPCtxServerURL:   run.Client.BaseURL,
+			MCPCtxToken:       run.Client.APIToken,
+		},
+	}
+
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return "", fmt.Errorf("mkdir mcp config dir: %w", err)
+	}
+	data, err := json.MarshalIndent(config, "", "  ")
+	if err != nil {
+		return "", fmt.Errorf("marshal mcp config: %w", err)
+	}
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		return "", fmt.Errorf("write mcp config: %w", err)
+	}
+	// Add .teammate/mcp.json to git exclude to avoid committing it to the repo (best-effort, non-blocking)
+	_ = appendToGitExclude(workDir, ".teammate/mcp.json")
+	return path, nil
 }
 
 // appendToGitExclude adds the specified pattern to the repository's

@@ -1,4 +1,6 @@
-// config.go provides config loading and parsing for the Agent Daemon.
+// config.go provides the daemon config CLI (YAML key space: machine-level
+// scalars under server/daemon/...; agent instances are materialized from
+// desired delivery, not edited here).
 package main
 
 import (
@@ -19,8 +21,20 @@ var (
 
 var configCmd = &cobra.Command{
 	Use:   "config",
-	Short: "Manage agent daemon YAML configuration",
+	Short: "Manage the agent daemon YAML configuration",
 	Long:  "Manage the agent daemon config file read by teammate-agentd. The teammate server does not read this YAML file.",
+}
+
+var daemonCmd = &cobra.Command{
+	Use:   "daemon",
+	Short: "Daemon bootstrap helpers",
+}
+
+var daemonInitCmd = &cobra.Command{
+	Use:   "init",
+	Short: "Alias of 'config init' — create a default daemon config file",
+	Args:  cobra.NoArgs,
+	RunE:  configInitCmd.RunE,
 }
 
 var configInitCmd = &cobra.Command{
@@ -33,27 +47,30 @@ var configInitCmd = &cobra.Command{
 			path = agent.DefaultConfigPath()
 		}
 
-		// Overwrite protection: refuse to overwrite an existing file when --force is not specified
+		// Overwrite protection: refuse to overwrite an existing file when
+		// --force is not specified
 		if !forceOverwrite {
 			if _, err := os.Stat(path); err == nil {
-				return fmt.Errorf("config file already exists at %s; use --force to overwrite, or use --profile to create a separate config", path)
+				return fmt.Errorf("config file already exists at %s; use --force to overwrite", path)
 			}
 		}
 
-		cfg := defaultAgentConfig()
-		if err := agent.SaveConfig(cfg, path); err != nil {
+		cfg := defaultGlobalConfig()
+		if err := agent.SaveGlobalConfig(cfg, path); err != nil {
 			return fmt.Errorf("save agentd config: %w", err)
 		}
 		fmt.Println("Agent daemon config initialized at", path)
 		fmt.Println()
 		fmt.Println("Required before running teammate-agentd:")
-		fmt.Println("  teammate-agentd config set server.api_token <token>   # Agent API token from web UI")
-		fmt.Println("  teammate-agentd config set agent.id <uuid>            # Agent UUID from web UI")
-		fmt.Println("  teammate-agentd config set workspace.id <uuid>        # Workspace UUID")
+		fmt.Println("  teammate-agentd workspace add <td_...> --name team-a   # One entry per workspace (daemon token from that workspace's web UI)")
 		fmt.Println()
-		fmt.Println("Tip: use --profile <name> to manage multiple agents:")
-		fmt.Println("  teammate-agentd config init --profile claude")
-		fmt.Println("  teammate-agentd config init --profile atomcode")
+		fmt.Println("Agent instances are created in the workspace web UI (daemon group); agentd materializes them on delivery after registering.")
+		fmt.Println()
+		fmt.Println("workspace_id / daemon_id are adopted from the server after registration — never hand-edit them.")
+		fmt.Println()
+		fmt.Println("The local control API + console runs by default:")
+		fmt.Println("  teammate-agentd config local disable                   # Turn it off")
+		fmt.Println("  teammate-agentd config local enable                    # Turn it back on")
 		return nil
 	},
 }
@@ -77,7 +94,7 @@ var configGetCmd = &cobra.Command{
 	Short: "Display agent daemon configuration",
 	Args:  cobra.MaximumNArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		cfg, err := agent.LoadConfig(resolvedConfigPath())
+		cfg, err := agent.LoadGlobalConfig(resolvedConfigPath())
 		if err != nil {
 			return fmt.Errorf("load agentd config: %w", err)
 		}
@@ -115,7 +132,7 @@ var configListCmd = &cobra.Command{
 	Short: "List all agent daemon configuration values",
 	Args:  cobra.NoArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		cfg, err := agent.LoadConfig(resolvedConfigPath())
+		cfg, err := agent.LoadGlobalConfig(resolvedConfigPath())
 		if err != nil {
 			return fmt.Errorf("load agentd config: %w", err)
 		}
@@ -144,7 +161,7 @@ var configLocalEnableCmd = &cobra.Command{
 
 var configLocalDisableCmd = &cobra.Command{
 	Use:   "disable",
-	Short: "Disable the optional local control API while keeping binding credentials",
+	Short: "Disable the optional loopback local control API while keeping binding credentials",
 	Args:  cobra.NoArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		path := resolvedConfigPath()
@@ -158,7 +175,8 @@ var configLocalDisableCmd = &cobra.Command{
 
 func init() {
 	configInitCmd.Flags().BoolVar(&forceOverwrite, "force", false, "overwrite existing config file")
-	configListCmd.Flags().BoolVar(&showConfigSecrets, "show-secrets", false, "show full api tokens in json/yaml output")
+	daemonInitCmd.Flags().BoolVar(&forceOverwrite, "force", false, "overwrite existing config file")
+	configListCmd.Flags().BoolVar(&showConfigSecrets, "show-secrets", false, "show full tokens in json/yaml output")
 	configCmd.AddCommand(configInitCmd)
 	configCmd.AddCommand(configPathCmd)
 	configCmd.AddCommand(configGetCmd)
@@ -167,46 +185,27 @@ func init() {
 	configLocalCmd.AddCommand(configLocalEnableCmd)
 	configLocalCmd.AddCommand(configLocalDisableCmd)
 	configCmd.AddCommand(configLocalCmd)
+	daemonCmd.AddCommand(daemonInitCmd)
 }
 
-func defaultAgentConfig() *agent.Config {
-	cfg := &agent.Config{
-		Server: agent.ServerConfig{
-			URL:      "http://localhost:8080",
-			APIToken: "tm_YOUR_API_TOKEN_HERE",
-		},
-		Agent: agent.AgentInfo{
-			ID:            "YOUR_AGENT_ID",
-			Name:          "My Agent",
-			ContextWindow: 100000,
-			Provider:      "claude",
-		},
-		Workspace: agent.WorkspaceConfig{
-			ID: "YOUR_WORKSPACE_ID",
-		},
-	}
+func defaultGlobalConfig() *agent.GlobalConfig {
+	cfg := &agent.GlobalConfig{}
+	cfg.Server.URL = "http://127.0.0.1:8080"
+	cfg.WorkspaceRoot = agent.DefaultWorkspaceRoot()
 	cfg.Tools.Claude.Path = "claude"
+	cfg.Local.Enabled = true
+	cfg.Local.BindAddr = "127.0.0.1:17380"
 	return cfg
 }
 
-func getConfigValue(cfg *agent.Config, key string) (string, bool) {
+func getConfigValue(cfg *agent.GlobalConfig, key string) (string, bool) {
 	switch key {
 	case "server.url":
 		return cfg.Server.URL, true
-	case "server.api_token":
-		return maskToken(cfg.Server.APIToken), true
-	case "agent.id":
-		return cfg.Agent.ID, true
-	case "agent.name":
-		return cfg.Agent.Name, true
-	case "agent.context_window":
-		return fmt.Sprintf("%d", cfg.Agent.ContextWindow), true
-	case "agent.provider":
-		return cfg.Agent.Provider, true
-	case "workspace.id":
-		return cfg.Workspace.ID, true
-	case "workspace.root":
-		return cfg.Workspace.Root, true
+	case "name":
+		return cfg.Name, true
+	case "workspace_root":
+		return cfg.WorkspaceRoot, true
 	case "git.base_branch":
 		return cfg.Git.BaseBranch, true
 	case "local.enabled":
@@ -221,14 +220,14 @@ func getConfigValue(cfg *agent.Config, key string) (string, bool) {
 		return fmt.Sprintf("%t", cfg.Debug), true
 	default:
 		if toolName, field, ok := parseToolKey(key); ok {
-			tool, ok := getToolConfig(cfg, toolName)
+			if field != "path" {
+				return "", false
+			}
+			toolCfg, ok := getToolConfig(cfg, toolName)
 			if !ok {
 				return "", false
 			}
-			switch field {
-			case "path":
-				return tool.Path, true
-			}
+			return toolCfg.Path, true
 		}
 		return "", false
 	}
@@ -238,22 +237,9 @@ func setConfigValueAtPath(path, key, value string) error {
 	if path == "" {
 		path = agent.DefaultConfigPath()
 	}
-	data, err := os.ReadFile(path)
+	raw, err := loadRawConfigForMutation(path)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return fmt.Errorf("config file not found at %s; run 'teammate-agentd config init' to create one", path)
-		}
-		return fmt.Errorf("read config: %w", err)
-	}
-
-	var raw map[string]interface{}
-	if len(strings.TrimSpace(string(data))) > 0 {
-		if err := yaml.Unmarshal(data, &raw); err != nil {
-			return fmt.Errorf("parse config: %w", err)
-		}
-	}
-	if raw == nil {
-		raw = make(map[string]interface{})
+		return err
 	}
 
 	typedValue, err := parseConfigSetValue(key, value)
@@ -263,26 +249,13 @@ func setConfigValueAtPath(path, key, value string) error {
 	if err := setRawConfigValue(raw, key, typedValue); err != nil {
 		return err
 	}
-
-	out, err := yaml.Marshal(raw)
-	if err != nil {
-		return fmt.Errorf("marshal config: %w", err)
-	}
-	return os.WriteFile(path, out, 0600)
+	return writeRawConfig(path, raw)
 }
 
 func parseConfigSetValue(key, value string) (interface{}, error) {
 	switch key {
-	case "agent.context_window":
-		var parsed int
-		if _, err := fmt.Sscanf(value, "%d", &parsed); err != nil || parsed <= 0 {
-			return nil, fmt.Errorf("agent.context_window must be a positive integer")
-		}
-		return parsed, nil
 	case "debug", "local.enabled":
 		return parseBool(value), nil
-	case "agent.provider":
-		return strings.ToLower(strings.TrimSpace(value)), nil
 	default:
 		if toolName, _, ok := parseToolKey(key); ok {
 			if !isKnownTool(toolName) {
@@ -299,16 +272,13 @@ func parseConfigSetValue(key, value string) (interface{}, error) {
 
 func knownScalarConfigKeys() map[string]struct{} {
 	return map[string]struct{}{
-		"server.url":        {},
-		"server.api_token":  {},
-		"agent.id":          {},
-		"agent.name":        {},
-		"workspace.id":      {},
-		"workspace.root":    {},
-		"git.base_branch":   {},
-		"local.bind_addr":   {},
-		"local.local_token": {},
-		"local.instance_id": {},
+		"server.url":             {},
+		"name":                   {},
+		"workspace_root":         {},
+		"git.base_branch":        {},
+		"local.bind_addr":        {},
+		"local.local_token":      {},
+		"local.instance_id":      {},
 	}
 }
 
@@ -353,6 +323,8 @@ func disableLocalAPIAtPath(path string) error {
 	return writeRawConfig(path, raw)
 }
 
+// loadRawConfigForMutation reads the YAML as a generic map so unrelated keys
+// and comments survive round-trips.
 func loadRawConfigForMutation(path string) (map[string]interface{}, error) {
 	if path == "" {
 		path = agent.DefaultConfigPath()
@@ -434,7 +406,7 @@ func isKnownTool(name string) bool {
 	}
 }
 
-func getToolConfig(cfg *agent.Config, name string) (agent.ToolConfig, bool) {
+func getToolConfig(cfg *agent.GlobalConfig, name string) (agent.ToolConfig, bool) {
 	switch name {
 	case "claude":
 		return cfg.Tools.Claude, true
@@ -460,7 +432,7 @@ func parseBool(value string) bool {
 	}
 }
 
-func printConfig(cfg *agent.Config) error {
+func printConfig(cfg *agent.GlobalConfig) error {
 	switch strings.ToLower(outputFmt) {
 	case "json", "yaml", "yml":
 		data, err := marshalConfigForOutput(cfg, outputFmt, showConfigSecrets)
@@ -474,43 +446,56 @@ func printConfig(cfg *agent.Config) error {
 	return nil
 }
 
-func maskedConfig(cfg *agent.Config) *agent.Config {
+func maskedConfig(cfg *agent.GlobalConfig) *agent.GlobalConfig {
 	copy := *cfg
-	copy.Server.APIToken = maskToken(cfg.Server.APIToken)
+	copy.Workspaces = make([]agent.WorkspaceEntry, len(cfg.Workspaces))
+	for i, w := range cfg.Workspaces {
+		w.Token = maskToken(w.Token)
+		copy.Workspaces[i] = w
+	}
 	copy.Local.LocalToken = maskToken(cfg.Local.LocalToken)
 	return &copy
 }
 
-func marshalConfigForOutput(cfg *agent.Config, format string, showSecrets bool) ([]byte, error) {
+func marshalConfigForOutput(cfg *agent.GlobalConfig, format string, showSecrets bool) ([]byte, error) {
 	outputCfg := cfg
 	if !showSecrets {
 		outputCfg = maskedConfig(cfg)
 	}
 	switch strings.ToLower(format) {
 	case "json":
-		return agent.MarshalConfigJSON(outputCfg)
+		return agent.MarshalGlobalConfigJSON(outputCfg)
 	case "yaml", "yml":
-		return agent.MarshalConfigYAML(outputCfg)
+		return agent.MarshalGlobalConfigYAML(outputCfg)
 	default:
 		return nil, fmt.Errorf("unsupported output format: %s", format)
 	}
 }
 
-func printConfigSummary(cfg *agent.Config) {
+func printConfigSummary(cfg *agent.GlobalConfig) {
 	fmt.Printf("Server URL:       %s\n", cfg.Server.URL)
-	fmt.Printf("API Token:        %s\n", maskToken(cfg.Server.APIToken))
-	fmt.Printf("Agent ID:         %s\n", cfg.Agent.ID)
-	fmt.Printf("Agent Name:       %s\n", cfg.Agent.Name)
-	fmt.Printf("Agent Provider:   %s\n", cfg.Agent.Provider)
-	fmt.Printf("Context Window:   %d\n", cfg.Agent.ContextWindow)
-	fmt.Printf("Workspace ID:     %s\n", cfg.Workspace.ID)
-	fmt.Printf("Workspace Root:   %s\n", cfg.Workspace.Root)
+	fmt.Printf("Device Name:      %s\n", cfg.Name)
+	fmt.Printf("Workspace Root:   %s\n", cfg.WorkspaceRoot)
 	fmt.Printf("Git Base Branch:  %s\n", cfg.Git.BaseBranch)
 	fmt.Printf("Local API:        %v\n", cfg.Local.Enabled)
 	fmt.Printf("Local Bind Addr:  %s\n", cfg.Local.BindAddr)
 	fmt.Printf("Local Token:      %s\n", maskToken(cfg.Local.LocalToken))
 	fmt.Printf("Local Instance:   %s\n", cfg.Local.InstanceID)
 	fmt.Printf("Debug:            %v\n", cfg.Debug)
+	fmt.Printf("Workspaces:\n")
+	if len(cfg.Workspaces) == 0 {
+		fmt.Printf("  (none; run 'teammate-agentd workspace add <td_token> --name <alias>')\n")
+	}
+	for _, w := range cfg.Workspaces {
+		fmt.Printf("  - %s (token=%s workspace=%s daemon=%s)\n", w.Name, maskToken(w.Token), w.WorkspaceID, w.DaemonID)
+		for _, a := range w.Agents {
+			identity := "pending"
+			if a.AgentID != "" {
+				identity = a.AgentID
+			}
+			fmt.Printf("      %s (%s, %s)\n", a.Name, a.Provider, identity)
+		}
+	}
 }
 
 func maskToken(token string) string {

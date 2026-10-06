@@ -14,14 +14,14 @@ import (
 // before touching the client when paused.
 func TestNodeWatcherPausedStopsClaiming(t *testing.T) {
 	cfg := &agent.Config{
-		Server:    agent.ServerConfig{URL: "http://127.0.0.1:1", APIToken: "fake-token"},
-		Workspace: agent.WorkspaceConfig{ID: "ws-1", Root: t.TempDir()},
-		Agent:     agent.AgentInfo{ID: "agent-1", Provider: "claude"},
+		Server:    agent.ServerConfig{URL: "http://127.0.0.1:1"},
+		Workspace: agent.WorkspaceConfig{Root: t.TempDir()},
+		Agent:     agent.AgentInfo{Provider: "claude"},
 		Git:       agent.GitConfig{BaseBranch: "master"},
 	}
-	client := agent.NewClient(cfg.Server.URL, cfg.Server.APIToken)
-	executor := agent.NewTaskExecutor(cfg, client, "agent-1")
-	watcher := agent.NewNodeWatcher(client, executor, "agent-1", "ws-1", 10*time.Millisecond)
+	client := agent.NewClient(cfg.Server.URL, "td_fake_token")
+	executor := agent.NewTaskExecutor(cfg)
+	watcher := agent.NewNodeWatcher(client, executor, "team-a", "agent-1", "ws-1", 10*time.Millisecond)
 
 	if watcher.IsPaused() {
 		t.Fatal("new watcher should not be paused")

@@ -11,12 +11,10 @@ import (
 
 func TestLocalStateStoreSnapshotTracksRuntimeAndExecution(t *testing.T) {
 	store := agent.NewLocalStateStore(agent.LocalStateConfig{
-		InstanceID:  "instance-1",
-		AgentID:     "agent-1",
-		AgentName:   "ac",
-		WorkspaceID: "ws-1",
-		Provider:    "claude",
-		ServerURL:   "http://localhost:8080",
+		InstanceID: "instance-1",
+		AgentName:  "ac",
+		Provider:   "claude",
+		ServerURL:  "http://127.0.0.1:8080",
 	})
 
 	store.SetRuntimeRegistered("rt-1", "daemon-1")
@@ -135,44 +133,52 @@ func TestLocalEventHubPublishesSnapshotEvents(t *testing.T) {
 	}
 }
 
-func TestDaemonInitialLocalSnapshot(t *testing.T) {
-	cfg := &agent.Config{}
-	cfg.Agent.ID = "agent-1"
-	cfg.Agent.Name = "ac"
-	cfg.Agent.Provider = "claude"
-	cfg.Workspace.ID = "ws-1"
-	cfg.Server.URL = "http://localhost:8080"
-	cfg.Local.Enabled = true
-	cfg.Local.BindAddr = "127.0.0.1:0"
-	cfg.Local.LocalToken = "lt_test"
-	cfg.Local.InstanceID = "instance-1"
+func TestAgentRuntimeInitialLocalSnapshot(t *testing.T) {
+	view := &agent.Config{}
+	view.Agent.Name = "ac"
+	view.Agent.Provider = "claude"
+	view.Server.URL = "http://127.0.0.1:8080"
+	view.Local.Enabled = true
+	view.Local.BindAddr = "127.0.0.1:0"
+	view.Local.LocalToken = "lt_test"
+	view.Local.InstanceID = "instance-1"
 
-	daemon, err := agent.NewDaemon(cfg)
-	if err != nil {
-		t.Fatalf("new daemon: %v", err)
-	}
-	snapshot := daemon.LocalSnapshot()
-	if snapshot.InstanceID != "instance-1" {
-		t.Fatalf("unexpected instance id: %s", snapshot.InstanceID)
+	runtime := agent.NewAgentRuntime(view, "team-a", "ac")
+	snapshot := runtime.Snapshot()
+	if snapshot.Config.AgentName != "ac" {
+		t.Fatalf("unexpected agent name: %s", snapshot.Config.AgentName)
 	}
 	if snapshot.Runtime.Status != agent.LocalRuntimeOffline {
 		t.Fatalf("expected initial runtime offline, got %s", snapshot.Runtime.Status)
 	}
+	runtime.State().SetAgentIdentity("ws-1", "agent-uuid-1")
+	snapshot = runtime.Snapshot()
+	if snapshot.Config.WorkspaceID != "ws-1" || snapshot.Config.AgentID != "agent-uuid-1" {
+		t.Fatalf("expected identity recorded, got %+v", snapshot.Config)
+	}
+	// Rebinding replaces the single identity instead of accumulating.
+	runtime.State().SetAgentIdentity("ws-1", "agent-uuid-2")
+	snapshot = runtime.Snapshot()
+	if snapshot.Config.AgentID != "agent-uuid-2" {
+		t.Fatalf("expected identity replaced, got %+v", snapshot.Config)
+	}
+	runtime.State().ClearAgentIdentity()
+	snapshot = runtime.Snapshot()
+	if snapshot.Config.WorkspaceID != "" || snapshot.Config.AgentID != "" {
+		t.Fatalf("expected identity cleared, got %+v", snapshot.Config)
+	}
 }
 
-func TestDaemonStopIsIdempotent(t *testing.T) {
-	cfg := &agent.Config{}
-	cfg.Agent.ID = "agent-1"
-	cfg.Agent.Name = "ac"
-	cfg.Agent.Provider = "claude"
-	cfg.Workspace.ID = "ws-1"
-	cfg.Server.URL = "http://localhost:8080"
+func TestAgentRuntimeIdentitiesPendingUntilResolved(t *testing.T) {
+	view := &agent.Config{}
+	view.Agent.Name = "ac"
+	view.Agent.Provider = "claude"
 
-	daemon, err := agent.NewDaemon(cfg)
-	if err != nil {
-		t.Fatalf("new daemon: %v", err)
+	runtime := agent.NewAgentRuntime(view, "team-a", "ac")
+	if got := runtime.Snapshot().Config.AgentID; got != "" {
+		t.Fatalf("expected no identity while pending, got %q", got)
 	}
-
-	daemon.Stop()
-	daemon.Stop()
+	if got := len(runtime.Watchers()); got != 0 {
+		t.Fatalf("expected no watcher while pending, got %d", got)
+	}
 }

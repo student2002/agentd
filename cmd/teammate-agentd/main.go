@@ -1,10 +1,11 @@
-// main.go is the entry point of teammate-agentd (the Agent daemon).
+// main.go is the entry point of teammate-agentd (the machine daemon managing
+// local agent instances).
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
-	"path/filepath"
 
 	"github.com/spf13/cobra"
 	"github.com/teammate/agentd/internal/agent"
@@ -12,39 +13,39 @@ import (
 
 var (
 	cfgPath   string
-	profile   string
 	outputFmt string
 )
 
+var rootCmd = &cobra.Command{
+	Use:   "teammate-agentd",
+	Short: "Teammate Agent Daemon - one daemon managing local agent instances",
+	RunE: func(cmd *cobra.Command, args []string) error {
+		cfg, err := agent.LoadGlobalConfig(resolvedConfigPath())
+		if err != nil {
+			return fmt.Errorf("load config: %w", err)
+		}
+		// The local control frontend runs by default; generate its
+		// credentials on first start so the supervisor sees them.
+		if err := cfg.EnsureLocalCredentials(resolvedConfigPath()); err != nil {
+			return err
+		}
+		if err := agent.ValidateGlobalConfig(cfg); err != nil {
+			return fmt.Errorf("validate config: %w", err)
+		}
+
+		supervisor := agent.NewSupervisor(cfg, resolvedConfigPath(), agent.SupervisorOptions{})
+		return supervisor.Run(context.Background())
+	},
+}
+
 func main() {
-	rootCmd := &cobra.Command{
-		Use:   "teammate-agentd",
-		Short: "Teammate Agent Daemon - lightweight agent runtime",
-		RunE: func(cmd *cobra.Command, args []string) error {
-			cfg, err := agent.LoadConfig(resolvedConfigPath())
-			if err != nil {
-				return fmt.Errorf("load config: %w", err)
-			}
-			if err := agent.ValidateConfig(cfg); err != nil {
-				return fmt.Errorf("validate config: %w", err)
-			}
-
-			d, err := agent.NewDaemonWithOptions(cfg, agent.DaemonOptions{
-				Profile:    profile,
-				ConfigPath: resolvedConfigPath(),
-			})
-			if err != nil {
-				return fmt.Errorf("init daemon: %w", err)
-			}
-			return d.Run()
-		},
-	}
-
-	rootCmd.PersistentFlags().StringVarP(&cfgPath, "config", "c", "", "agent daemon config file path (default: ~/.teammate/config.yaml)")
-	rootCmd.PersistentFlags().StringVar(&profile, "profile", "", "agent daemon config profile (loads ~/.teammate/config-{profile}.yaml)")
+	rootCmd.PersistentFlags().StringVarP(&cfgPath, "config", "c", "", "daemon config file path (default: ~/.teammate/config.yaml)")
 	rootCmd.PersistentFlags().StringVarP(&outputFmt, "output", "o", "table", "output format for config commands: table, json, yaml")
 
 	rootCmd.AddCommand(configCmd)
+	rootCmd.AddCommand(daemonCmd)
+	rootCmd.AddCommand(agentCmd)
+	rootCmd.AddCommand(workspaceCmd)
 	rootCmd.AddCommand(&cobra.Command{
 		Use:   "version",
 		Short: "Print version",
@@ -59,15 +60,5 @@ func main() {
 }
 
 func resolvedConfigPath() string {
-	if cfgPath != "" {
-		return cfgPath
-	}
-	if profile == "" {
-		return ""
-	}
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return filepath.Join(".teammate", "config-"+profile+".yaml")
-	}
-	return filepath.Join(home, ".teammate", "config-"+profile+".yaml")
+	return cfgPath
 }

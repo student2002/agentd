@@ -19,6 +19,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -33,15 +34,43 @@ import (
 	"github.com/teammate/agentd/internal/agent/tool"
 )
 
+// ErrInterventionNotHeld is returned by local intervention actions when the
+// executor does not hold the requested task/node context (idle, mismatched
+// target, or no soft-interrupted takeover). The local control plane maps it
+// to 409.
+var ErrInterventionNotHeld = errors.New("intervention target not held")
+
+// ErrCodingToolUnavailable is returned when an intervention turn cannot run
+// because no coding tool is installed. The local control plane maps it to 503.
+var ErrCodingToolUnavailable = errors.New("coding tool unavailable")
+
+// RunContext carries one node's execution identity: the workspace connection
+// the node belongs to (alias plus its client), the agent UUID resolved within
+// that workspace, and the node's location. Every server call during the
+// execution goes through RunContext.Client with X-Agent-ID = RunContext.AgentID.
+type RunContext struct {
+	Client      *Client // the owning workspace connection's client
+	ConnName    string  // the owning connection's local alias
+	AgentID     string  // the agent UUID within that workspace
+	WorkspaceID string
+	ProjectID   string
+	TaskID      int32
+	NodeID      string
+}
+
 // TaskExecutor is responsible for executing claimed nodes using coding tools, and manages
 // the Git workspace, session recovery, checkpoint commits, and interrupt handling.
 type TaskExecutor struct {
 	cfg      *Config
-	client   *Client
-	agentID  string
 	git      *GitManager
 	stopCh   chan struct{}
 	observer ExecutionObserver
+
+	// run is the current execution's identity, installed at Execute entry and
+	// kept after the execution returns so local intervention turns (soft
+	// interrupt, manual takeover, manual completion) keep reporting through
+	// the same connection. Nil while no node has ever been executed.
+	run *RunContext
 
 	mu          sync.Mutex
 	currentTool tool.Tool
@@ -53,12 +82,6 @@ type TaskExecutor struct {
 
 	sessionID   string // current Claude Code session ID, used for --resume
 	lastWorkDir string // last working directory, used for session invalidation detection
-
-	// nodeProjectID is the projectID of the running node, captured at Execute
-	// entry. Intervention turns reuse it for completeness; the turn makes no
-	// server call, so it is informational — but capturing it keeps the local
-	// intervention state symmetric with the autonomous Execute path.
-	nodeProjectID string
 
 	// interrupted is set by Interrupt before cancelling the execution context.
 	// It tells Execute's err branch to skip reportFailure (ManualIntervention),
@@ -79,11 +102,21 @@ type TaskExecutor struct {
 	// with a fake tool. Test-only seam; never set in production.
 	toolFactoryForTest func() TestTool
 
+	// toolFactory, when non-nil, replaces the real coding-tool selector.
+	// Production injection point (supervisor ToolFactory option).
+	toolFactory func() tool.Tool
+
 	// logBuffer, when set, captures desensitized output lines for the local
 	// control API (recent + SSE streaming). Data source: this agentd's own
 	// onOutput only — never cross-workspace/project. Degrades to a no-op when
 	// nil (local control disabled).
 	logBuffer *LogBuffer
+
+	// onResume, when set, is invoked by Handback after a soft-interrupted
+	// takeover is handed back to the agent. It triggers a watcher recovery
+	// pass so the still in_progress node is re-entered with the persisted
+	// tool session. Wired by the runtime; nil in tests unless injected.
+	onResume func()
 }
 
 type ExecutionObserver interface {
@@ -97,41 +130,62 @@ type ExecutionObserver interface {
 // NewTaskExecutor creates a new task executor.
 //
 // Args:
-//   - cfg: daemon configuration
-//   - client: Server communication client
-//   - agentID: agent ID
+//   - cfg: the machine-level config view (tools, git, workspace root)
 //
 // Returns:
 //   - *TaskExecutor: the initialized executor instance
-func NewTaskExecutor(cfg *Config, client *Client, agentID string) *TaskExecutor {
-	return NewTaskExecutorWithObserver(cfg, client, agentID, nil)
+func NewTaskExecutor(cfg *Config) *TaskExecutor {
+	return NewTaskExecutorWithObserver(cfg, nil)
 }
 
-func NewTaskExecutorWithObserver(cfg *Config, client *Client, agentID string, observer ExecutionObserver) *TaskExecutor {
+func NewTaskExecutorWithObserver(cfg *Config, observer ExecutionObserver) *TaskExecutor {
 	return &TaskExecutor{
 		cfg:      cfg,
-		client:   client,
-		agentID:  agentID,
 		observer: observer,
 		stopCh:   make(chan struct{}),
 	}
+}
+
+// currentRun returns the active execution identity, or nil when none was ever
+// installed.
+func (e *TaskExecutor) currentRun() *RunContext {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.run
 }
 
 // Execute executes a claimed node, including Git workspace initialization, context building,
 // coding tool invocation, and result reporting.
 //
 // Args:
-//   - taskID: task ID
+//   - run: the execution identity (owning connection, agent UUID, workspace, node location)
 //   - node: the node information to execute
-//   - projectID: project ID
-func (e *TaskExecutor) Execute(taskID int32, node TaskNode, projectID string) {
+func (e *TaskExecutor) Execute(run RunContext, node TaskNode) {
+	taskID := run.TaskID
+	projectID := run.ProjectID
 	log.Printf("[executor] starting node %s (%s) for task %d", node.ID, node.Name, taskID)
 
 	e.currentMu.Lock()
+	taskChanged := e.taskID != taskID
 	e.running = true
 	e.taskID = taskID
 	e.node = node
 	e.currentMu.Unlock()
+	e.mu.Lock()
+	e.run = &run
+	if taskChanged {
+		// Bind the session context to this task at entry: a tool session
+		// captured for a previous task must never be resumed or reused for
+		// this one. Same-task re-entry (watcher recovery, handback) keeps the
+		// captured session so the next turn resumes it.
+		projectDir := "no-project"
+		if run.ProjectID != "" {
+			projectDir = run.ProjectID
+		}
+		e.sessionID = ""
+		e.lastWorkDir = workDirPath(e.cfg.Workspace.Root, run.WorkspaceID, run.AgentID, projectDir, taskID)
+	}
+	e.mu.Unlock()
 	e.interrupted.Store(false)
 	e.softInterrupted.Store(false)
 
@@ -156,43 +210,37 @@ func (e *TaskExecutor) Execute(taskID int32, node TaskNode, projectID string) {
 	}
 	projectRepoURL := ""
 	if projectID != "" {
-		if fetchedTask, err := e.client.GetTask(context.Background(), projectID, taskID); err == nil && fetchedTask != nil {
+		if fetchedTask, err := run.Client.GetTask(context.Background(), run.AgentID, projectID, taskID); err == nil && fetchedTask != nil {
 			task = *fetchedTask
 			task.ProjectID = projectID // ensure projectID is set even if the API did not return it
 		}
-		if project, err := e.client.GetProject(context.Background(), e.cfg.Workspace.ID, projectID); err == nil && project != nil {
+		if project, err := run.Client.GetProject(context.Background(), run.AgentID, run.WorkspaceID, projectID); err == nil && project != nil {
 			projectRepoURL = strings.TrimSpace(project.RepoURL)
 		} else {
 			log.Printf("[executor] warning: failed to fetch project git config: %v", err)
 		}
 	}
 
-	// 1. Create an isolated working directory: {Root}/{workspaceID}/{projectID}/{taskID}/{agentID}
-	// Ensure tasks of different projects and agents are isolated from each other
+	// Create an isolated working directory: {Root}/{workspaceID}/{agentID}/{projectID}/{taskID}
+	// so tasks of different projects and agent instances are isolated from each other
 	projectDir := "no-project"
 	if task.ProjectID != "" {
 		projectDir = task.ProjectID
 	}
-	workDir := filepath.Join(e.cfg.Workspace.Root, e.agentID, e.cfg.Workspace.ID, projectDir, fmt.Sprintf("%d", taskID))
+	workDir := workDirPath(e.cfg.Workspace.Root, run.WorkspaceID, run.AgentID, projectDir, taskID)
 	if err := os.MkdirAll(workDir, 0755); err != nil {
 		log.Printf("[executor] failed to create workdir: %v", err)
 		e.notifyExecutionFailed(taskID, node.ID, err)
-		e.reportFailure(taskID, node.ID, err)
+		e.reportFailure(&run, taskID, node.ID, err)
 		return
 	}
-	e.notifyExecutionStarted(taskID, node, workDir)
-
-	// Capture the node's projectID so intervention turns (which reuse the
-	// executor's captured state without re-running Execute) have it available.
-	e.mu.Lock()
-	e.nodeProjectID = projectID
-	e.mu.Unlock()
+	e.notifyExecutionStarted(&run, taskID, node, workDir)
 
 	// Check disk quota before execution
 	if err := e.checkDiskQuota(workDir); err != nil {
 		log.Printf("[executor] disk quota check failed: %v", err)
 		e.notifyExecutionFailed(taskID, node.ID, err)
-		e.reportFailure(taskID, node.ID, err)
+		e.reportFailure(&run, taskID, node.ID, err)
 		return
 	}
 
@@ -208,11 +256,11 @@ func (e *TaskExecutor) Execute(taskID int32, node TaskNode, projectID string) {
 	gitRequired := projectRepoURL != ""
 	if task.ProjectID != "" {
 		var err error
-		gitReady, err = e.initGitWorkspace(workDir, taskID, task.ProjectID, projectRepoURL, gitRequired)
+		gitReady, err = e.initGitWorkspace(&run, workDir, taskID, task.ProjectID, projectRepoURL, gitRequired)
 		if err != nil {
 			log.Printf("[executor] git workspace initialization failed: %v", err)
 			e.notifyExecutionFailed(taskID, node.ID, err)
-			e.reportFailure(taskID, node.ID, err)
+			e.reportFailure(&run, taskID, node.ID, err)
 			return
 		}
 	}
@@ -244,7 +292,7 @@ func (e *TaskExecutor) Execute(taskID int32, node TaskNode, projectID string) {
 		}
 		// Report the Git branch name to the Server so the frontend can display it
 		branch := BranchName(taskID)
-		if err := e.client.ReportGitBranch(context.Background(), taskID, branch); err != nil {
+		if err := run.Client.ReportGitBranch(context.Background(), run.AgentID, taskID, branch); err != nil {
 			log.Printf("[executor] warning: failed to report git branch: %v", err)
 		}
 	}
@@ -279,7 +327,7 @@ func (e *TaskExecutor) Execute(taskID int32, node TaskNode, projectID string) {
 		}
 	}
 
-	capabilities, err := MaterializeAgentCapabilities(ctx, e.client, e.cfg, workDir, t.Name())
+	capabilities, err := MaterializeAgentCapabilities(ctx, run, e.cfg, workDir, t.Name())
 	if err != nil {
 		log.Printf("[executor] warning: failed to prepare agent capabilities: %v", err)
 		capabilities = CapabilityInjection{
@@ -292,10 +340,10 @@ func (e *TaskExecutor) Execute(taskID int32, node TaskNode, projectID string) {
 	// 5. Build the execution context using the context injection layer
 	// Use a simplified context when resuming a Claude session (--resume retains the previous reasoning)
 	isResume := e.sessionID != "" && e.lastWorkDir == workDir
-	prompt, err := e.buildPromptWithClient(taskID, node, task, isResume, capabilities.PromptCapabilities)
+	prompt, err := e.buildPromptWithClient(run.Client, run.WorkspaceID, run.AgentID, taskID, node, task, isResume, capabilities.PromptCapabilities)
 	if err != nil {
 		e.notifyExecutionFailed(taskID, node.ID, err)
-		e.reportFailure(taskID, node.ID, fmt.Errorf("build prompt: %w", err))
+		e.reportFailure(&run, taskID, node.ID, fmt.Errorf("build prompt: %w", err))
 		return
 	}
 
@@ -358,7 +406,7 @@ func (e *TaskExecutor) Execute(taskID int32, node TaskNode, projectID string) {
 		case <-timer.C:
 			log.Printf("[executor] node %s execution exceeded %v, notifying user", node.Name, timeout)
 			warning := fmt.Sprintf("⚠️ Node execution exceeded %v; manual intervention may be required. You can interrupt this task on the task detail page.", timeout)
-			if sendErr := e.client.SendMessageWithType(context.Background(), taskID, node.ID, "system", warning); sendErr != nil {
+			if sendErr := run.Client.SendMessageWithType(context.Background(), run.AgentID, taskID, node.ID, "system", warning); sendErr != nil {
 				log.Printf("[executor] failed to send timeout warning: %v", sendErr)
 			}
 		case <-ctx.Done():
@@ -375,7 +423,7 @@ func (e *TaskExecutor) Execute(taskID int32, node TaskNode, projectID string) {
 			e.logBuffer.Append(LogLine{TaskID: taskID, NodeID: node.ID, Line: safeLine})
 		}
 		// Send the desensitized log to the server
-		if sendErr := e.client.SendMessage(context.Background(), taskID, node.ID, safeLine); sendErr != nil {
+		if sendErr := run.Client.SendMessage(context.Background(), run.AgentID, taskID, node.ID, safeLine); sendErr != nil {
 			log.Printf("[executor] failed to send message: %v", sendErr)
 		}
 	})
@@ -384,6 +432,15 @@ func (e *TaskExecutor) Execute(taskID int32, node TaskNode, projectID string) {
 	cancel()
 	<-checkpointDone
 	<-timeoutDone
+
+	// The tool adapters report a killed/crashed process as a nil error with a
+	// non-zero exit code; treat that exactly like a returned error so an
+	// interrupted or crashed tool never falls through to the completion path
+	// (which would report manual_intervention and leak a local takeover to
+	// the server).
+	if result != nil && result.ExitCode != 0 && err == nil {
+		err = fmt.Errorf("tool exited with code %d", result.ExitCode)
+	}
 
 	if err != nil {
 		log.Printf("[executor] tool execution failed: %v", err)
@@ -402,7 +459,7 @@ func (e *TaskExecutor) Execute(taskID int32, node TaskNode, projectID string) {
 			e.git.CommitAll(fmt.Sprintf("teammate: partial work for %s (failed)", node.Name))
 			_ = e.pushIfNeeded(taskID, node, attempt)
 		}
-		e.reportFailure(taskID, node.ID, err)
+		e.reportFailure(&run, taskID, node.ID, err)
 		e.notifyExecutionFailed(taskID, node.ID, err)
 		return
 	}
@@ -467,7 +524,7 @@ func (e *TaskExecutor) Execute(taskID int32, node TaskNode, projectID string) {
 			OutputTokens: result.OutputTokens,
 			TotalTokens:  result.TotalTokens,
 		}
-		if err := e.client.ReportTokenUsage(context.Background(), taskID, node.ID, e.agentID, usage); err != nil {
+		if err := run.Client.ReportTokenUsage(context.Background(), run.AgentID, taskID, node.ID, usage); err != nil {
 			log.Printf("[executor] failed to report token usage: %v", err)
 		}
 	}
@@ -477,15 +534,15 @@ func (e *TaskExecutor) Execute(taskID int32, node TaskNode, projectID string) {
 		log.Printf("[executor] agent requests human input for node %s", node.Name)
 		comment := extractNeedsInputComment(result.Output)
 		if comment != "" {
-			if e.shouldPostNeedsInputComment(context.Background(), taskID, node.ID, comment) {
-				if err := e.client.PostNodeComment(context.Background(), taskID, node.ID, "", "question", comment); err != nil {
+			if e.shouldPostNeedsInputComment(context.Background(), &run, taskID, node.ID, comment) {
+				if err := run.Client.PostNodeComment(context.Background(), run.AgentID, taskID, node.ID, "", "question", comment); err != nil {
 					log.Printf("[executor] failed to post comment: %v", err)
 				}
 			} else {
 				log.Printf("[executor] skipped duplicate needs_input comment for node %s", node.ID)
 			}
 		}
-		if err := e.client.ManualIntervention(context.Background(), e.agentID, taskID, node.ID, "Agent requests clarification"); err != nil {
+		if err := run.Client.ManualIntervention(context.Background(), run.AgentID, taskID, node.ID, "Agent requests clarification"); err != nil {
 			log.Printf("[executor] failed to set manual intervention: %v", err)
 		}
 		log.Printf("[executor] node %s set to manual_intervention, waiting for user response", node.Name)
@@ -495,7 +552,7 @@ func (e *TaskExecutor) Execute(taskID int32, node TaskNode, projectID string) {
 	// 10. Generate the node summary
 	summary := e.generateSummary(workDir, t, taskID, node)
 	if summary != "" {
-		if err := e.client.ReportSummary(context.Background(), taskID, node.ID, summary); err != nil {
+		if err := run.Client.ReportSummary(context.Background(), run.AgentID, taskID, node.ID, summary); err != nil {
 			log.Printf("[executor] failed to report summary: %v", err)
 		}
 	}
@@ -507,7 +564,7 @@ func (e *TaskExecutor) Execute(taskID int32, node TaskNode, projectID string) {
 			reason = "Git commit failed or produced no repository changes — manual review required"
 		}
 		log.Printf("[executor] git operation failed for node %s, setting manual_intervention", node.Name)
-		if err := e.client.ManualIntervention(context.Background(), e.agentID, taskID, node.ID, reason); err != nil {
+		if err := run.Client.ManualIntervention(context.Background(), run.AgentID, taskID, node.ID, reason); err != nil {
 			log.Printf("[executor] failed to set manual intervention: %v", err)
 		} else {
 			log.Printf("[executor] node %s set to manual_intervention successfully (reason: %s)", node.Name, reason)
@@ -518,20 +575,20 @@ func (e *TaskExecutor) Execute(taskID int32, node TaskNode, projectID string) {
 	if node.NodeType == "review" {
 		// Review node: do not auto-approve. Post the structured review result as a comment.
 		reviewComment := fmt.Sprintf("## Review Completed\n\n**Node:** %s\n\n**Recommendation:** Review analysis complete. A human or authorized agent should make the approve/reject decision.\n\n**Summary:** %s", node.Name, summary)
-		if err := e.client.PostNodeComment(context.Background(), taskID, node.ID, "", "code_review", reviewComment); err != nil {
+		if err := run.Client.PostNodeComment(context.Background(), run.AgentID, taskID, node.ID, "", "code_review", reviewComment); err != nil {
 			log.Printf("[executor] failed to post review comment: %v", err)
 		}
 		log.Printf("[executor] review node %s completed, waiting for review decision (approve/reject)", node.Name)
 	} else {
 		// Standard/manual node: auto-complete after execution
 		handoffComment := e.buildHandoffComment(taskID, node, summary, gitReady)
-		if err := e.client.CompleteNode(context.Background(), e.agentID, taskID, node.ID, handoffComment); err != nil {
+		if err := run.Client.CompleteNode(context.Background(), run.AgentID, taskID, node.ID, handoffComment); err != nil {
 			log.Printf("[executor] failed to complete node: %v", err)
 			comment := fmt.Sprintf("Agent finished execution but failed to mark node completed: %v", err)
-			if postErr := e.client.PostNodeComment(context.Background(), taskID, node.ID, "", "question", comment); postErr != nil {
+			if postErr := run.Client.PostNodeComment(context.Background(), run.AgentID, taskID, node.ID, "", "question", comment); postErr != nil {
 				log.Printf("[executor] failed to post completion failure comment: %v", postErr)
 			}
-			if miErr := e.client.ManualIntervention(context.Background(), e.agentID, taskID, node.ID, comment); miErr != nil {
+			if miErr := run.Client.ManualIntervention(context.Background(), run.AgentID, taskID, node.ID, comment); miErr != nil {
 				log.Printf("[executor] failed to set manual intervention after completion failure: %v", miErr)
 			}
 			return
@@ -552,8 +609,8 @@ func (e *TaskExecutor) Execute(taskID int32, node TaskNode, projectID string) {
 //
 // Returns:
 //   - bool: whether the Git workspace is ready
-func (e *TaskExecutor) initGitWorkspace(workDir string, taskID int32, projectID, projectRepoURL string, required bool) (bool, error) {
-	creds, err := e.client.GetGitCredentials(context.Background(), projectID)
+func (e *TaskExecutor) initGitWorkspace(run *RunContext, workDir string, taskID int32, projectID, projectRepoURL string, required bool) (bool, error) {
+	creds, err := run.Client.GetGitCredentials(context.Background(), run.AgentID, projectID)
 	if err != nil {
 		if e.git.IsGitRepo() {
 			log.Printf("[executor] git credentials unavailable, using existing repository: %v", err)
@@ -584,7 +641,7 @@ func (e *TaskExecutor) initGitWorkspace(workDir string, taskID int32, projectID,
 
 	if e.git.IsGitRepo() {
 		if cred != nil {
-			gitName, gitEmail := e.fetchAgentGitIdentity()
+			gitName, gitEmail := e.fetchAgentGitIdentity(run)
 			if err := e.git.ConfigureCredential(cred.Username, cred.PAT, gitName, gitEmail); err != nil {
 				e.git.CleanupCredential()
 				if required {
@@ -622,7 +679,7 @@ func (e *TaskExecutor) initGitWorkspace(workDir string, taskID int32, projectID,
 		return false, nil
 	}
 
-	gitName, gitEmail := e.fetchAgentGitIdentity()
+	gitName, gitEmail := e.fetchAgentGitIdentity(run)
 	if err := e.git.ConfigureCredential(cred.Username, cred.PAT, gitName, gitEmail); err != nil {
 		e.git.CleanupCredential()
 		if required {
@@ -683,18 +740,19 @@ func (e *TaskExecutor) setupExistingRepo(taskID int32, required bool) (bool, err
 	return true, nil
 }
 
-// fetchAgentGitIdentity fetches the agent's Git username and email from the server.
-// Used to configure git config user.name and user.email.
+// fetchAgentGitIdentity fetches the agent's Git username and email from the
+// server through the execution's connection. Used to configure git config
+// user.name and user.email.
 //
 // Returns:
 //   - gitName: Git username
 //   - gitEmail: Git email
-func (e *TaskExecutor) fetchAgentGitIdentity() (gitName, gitEmail string) {
+func (e *TaskExecutor) fetchAgentGitIdentity(run *RunContext) (gitName, gitEmail string) {
 	var agent struct {
 		GitName  string `json:"git_name"`
 		GitEmail string `json:"git_email"`
 	}
-	if err := e.client.doJSON(context.Background(), "GET", fmt.Sprintf("/api/workspaces/%s/agents/%s", e.cfg.Workspace.ID, e.agentID), nil, &agent); err != nil {
+	if err := run.Client.GetAgent(context.Background(), run.WorkspaceID, run.AgentID, &agent); err != nil {
 		log.Printf("[executor] warning: failed to fetch agent git identity: %v", err)
 		return "", ""
 	}
@@ -730,12 +788,24 @@ func (e *TaskExecutor) pushIfNeeded(taskID int32, node TaskNode, attempt int) er
 	if err := e.git.PushTag(startTag); err != nil {
 		log.Printf("[executor] warning: failed to push tag %s: %v", startTag, err)
 	}
-	// Push the node complete tag (if it exists) — created during the completion phase
+	// The complete tag only exists on runs that reached the completion phase;
+	// push it only when present locally
 	completeTag := NodeCompleteTag(taskID, nodeOrder, attempt)
-	if err := e.git.PushTag(completeTag); err != nil {
-		log.Printf("[executor] warning: failed to push tag %s: %v", completeTag, err)
+	if e.git.tagExists(completeTag) {
+		if err := e.git.PushTag(completeTag); err != nil {
+			log.Printf("[executor] warning: failed to push tag %s: %v", completeTag, err)
+		}
 	}
 	return nil
+}
+
+// runContextWorkspace resolves the workspace of the current execution, or ""
+// when none was ever installed (local-only seeds).
+func runContextWorkspace(run *RunContext) string {
+	if run == nil {
+		return ""
+	}
+	return run.WorkspaceID
 }
 
 // Stop terminates the executor and closes the stop signal channel.
@@ -766,11 +836,18 @@ func (e *TaskExecutor) Interrupt(taskID int32, nodeID string) error {
 		return nil
 	}
 
+	// Duplicate control events (e.g. a redelivered interrupt) must not run
+	// the interrupt path twice: the second commit/tag/ack would fail and
+	// double-report.
+	if e.interrupted.Swap(true) {
+		log.Printf("[executor] interrupt ignored: task %d node %s already interrupted", taskID, nodeID)
+		return nil
+	}
+
 	log.Printf("[executor] interrupting task %d node %s", taskID, nodeID)
-	// Mark interrupted so Execute's err branch (triggered by our cancel) does
-	// NOT also call reportFailure (ManualIntervention) + partial commit +
-	// notifyExecutionFailed. Interrupt owns the interrupt reporting path.
-	e.interrupted.Store(true)
+	// The interrupted flag (set by the Swap above) makes Execute's err branch
+	// skip reportFailure (ManualIntervention), partial commit, and
+	// notifyExecutionFailed; Interrupt owns the interrupt reporting path.
 	e.notifyExecutionInterrupted(taskID, nodeID)
 
 	// 1. Cancel the execution context
@@ -814,8 +891,10 @@ func (e *TaskExecutor) Interrupt(taskID int32, nodeID string) error {
 	}
 
 	// 4. Report the interrupt completion to the server
-	if err := e.client.ReportInterrupt(context.Background(), taskID, nodeID); err != nil {
-		log.Printf("[executor] failed to report interrupt: %v", err)
+	if run := e.currentRun(); run != nil {
+		if err := run.Client.ReportInterrupt(context.Background(), run.AgentID, taskID, nodeID); err != nil {
+			log.Printf("[executor] failed to report interrupt: %v", err)
+		}
 	}
 
 	log.Printf("[executor] interrupt completed for task %d node %s", taskID, nodeID)
@@ -841,13 +920,30 @@ func (e *TaskExecutor) SoftInterrupt(taskID int32, nodeID string) error {
 	e.currentMu.Unlock()
 
 	if !running || currentTaskID != taskID || currentNode.ID != nodeID {
-		log.Printf("[executor] soft-interrupt ignored: not running task %d node %s", taskID, nodeID)
-		return nil
+		log.Printf("[executor] soft-interrupt rejected: not running task %d node %s", taskID, nodeID)
+		return fmt.Errorf("%w: not running task %d node %s", ErrInterventionNotHeld, taskID, nodeID)
 	}
 
 	log.Printf("[executor] soft-interrupting task %d node %s (server stays unaware)", taskID, nodeID)
-	e.notifyExecutionInterrupted(taskID, nodeID)
 	e.softInterrupted.Store(true)
+
+	// Local takeover moves the session to the intervening state; the server
+	// is not notified and the node stays in_progress.
+	e.mu.Lock()
+	workDir := e.lastWorkDir
+	sessionID := e.sessionID
+	e.mu.Unlock()
+	if e.observer != nil {
+		e.observer.OnExecutionStarted(LocalExecutionSession{
+			WorkspaceID:          runContextWorkspace(e.currentRun()),
+			TaskID:               taskID,
+			NodeID:               nodeID,
+			NodeName:             currentNode.Name,
+			ToolSessionIDPresent: sessionID != "",
+			WorkDir:              workDir,
+			Status:               LocalExecutionIntervening,
+		})
+	}
 
 	// 1. Cancel the execution context so the tool's Execute returns ctx.Err().
 	e.mu.Lock()
@@ -870,14 +966,31 @@ func (e *TaskExecutor) SoftInterrupt(taskID int32, nodeID string) error {
 	return nil
 }
 
+// interventionTargetMatches reports whether the executor currently holds the
+// context for the given node — either mid-execution or after a soft-interrupted
+// local takeover — so local intervention turns (intervene, handback, manual
+// complete) may operate on it. Returns the held node when it matches.
+func (e *TaskExecutor) interventionTargetMatches(taskID int32, nodeID string) (TaskNode, bool) {
+	e.currentMu.Lock()
+	running := e.running
+	currentTaskID := e.taskID
+	currentNode := e.node
+	e.currentMu.Unlock()
+	if !(running || e.softInterrupted.Load()) || currentTaskID != taskID || currentNode.ID != nodeID {
+		return TaskNode{}, false
+	}
+	return currentNode, true
+}
+
 // IsInterventionAllowed reports whether a human can take over the currently
-// running node locally. Intervention requires the node to be running and a
-// tool session id to be present (so the turn can resume the same session).
+// held node locally. Intervention requires an execution context (running, or
+// soft-interrupted takeover) and a tool session id to be present (so the turn
+// can resume the same session).
 func (e *TaskExecutor) IsInterventionAllowed() bool {
 	e.currentMu.Lock()
 	running := e.running
 	e.currentMu.Unlock()
-	if !running {
+	if !running && !e.softInterrupted.Load() {
 		return false
 	}
 	e.mu.Lock()
@@ -896,25 +1009,20 @@ func (e *TaskExecutor) IsInterventionAllowed() bool {
 // closure already appends to (kept so the team sees the human's working
 // output). It cannot leak cross-workspace data: workDir is scoped to one task.
 func (e *TaskExecutor) ExecuteInterventionTurn(taskID int32, nodeID, message string) (string, error) {
-	e.currentMu.Lock()
-	running := e.running
-	currentTaskID := e.taskID
-	currentNode := e.node
-	e.currentMu.Unlock()
-
-	if !running || currentTaskID != taskID || currentNode.ID != nodeID {
-		return "", fmt.Errorf("intervention turn rejected: not running task %d node %s", taskID, nodeID)
+	currentNode, ok := e.interventionTargetMatches(taskID, nodeID)
+	if !ok {
+		return "", fmt.Errorf("%w: not holding task %d node %s", ErrInterventionNotHeld, taskID, nodeID)
 	}
 
 	e.mu.Lock()
 	workDir := e.lastWorkDir
 	sessionID := e.sessionID
-	projectID := e.nodeProjectID
 	e.mu.Unlock()
+	run := e.currentRun()
 
 	t := e.selectTool()
 	if t == nil {
-		return "", fmt.Errorf("intervention turn rejected: coding tool unavailable")
+		return "", fmt.Errorf("intervention turn: %w", ErrCodingToolUnavailable)
 	}
 
 	if claudeTool, ok := t.(*tool.ClaudeTool); ok && sessionID != "" {
@@ -925,6 +1033,7 @@ func (e *TaskExecutor) ExecuteInterventionTurn(taskID int32, nodeID, message str
 
 	if e.observer != nil {
 		e.observer.OnExecutionStarted(LocalExecutionSession{
+			WorkspaceID:          runContextWorkspace(run),
 			TaskID:               taskID,
 			NodeID:               nodeID,
 			NodeName:             currentNode.Name,
@@ -941,8 +1050,8 @@ func (e *TaskExecutor) ExecuteInterventionTurn(taskID int32, nodeID, message str
 	result, err := t.Execute(ctx, workDir, message, tool.ExecuteOptions{}, func(line string) {
 		safeLine := desensitizeOutputLine(line)
 		log.Printf("[intervention-output] %s", safeLine)
-		if e.client != nil {
-			if sendErr := e.client.SendMessage(context.Background(), taskID, nodeID, safeLine); sendErr != nil {
+		if run != nil {
+			if sendErr := run.Client.SendMessage(context.Background(), run.AgentID, taskID, nodeID, safeLine); sendErr != nil {
 				log.Printf("[intervention] failed to send message: %v", sendErr)
 			}
 		}
@@ -963,7 +1072,6 @@ func (e *TaskExecutor) ExecuteInterventionTurn(taskID int32, nodeID, message str
 			_ = store.Save(result.SessionID, t.Name())
 		}
 	}
-	_ = projectID // captured for completeness; the turn makes no server call
 
 	return result.Output, nil
 }
@@ -977,26 +1085,35 @@ func (e *TaskExecutor) ExecuteInterventionTurn(taskID int32, nodeID, message str
 // Data source / permission boundary: reuses the executor's own in-memory state.
 // No server calls are made; it cannot leak cross-workspace data.
 func (e *TaskExecutor) Handback(taskID int32, nodeID string) bool {
-	e.currentMu.Lock()
-	running := e.running
-	currentTaskID := e.taskID
-	currentNode := e.node
-	e.currentMu.Unlock()
-
-	if !running || currentTaskID != taskID || currentNode.ID != nodeID {
+	currentNode, ok := e.interventionTargetMatches(taskID, nodeID)
+	if !ok {
 		return false
 	}
 
+	e.mu.Lock()
+	workDir := e.lastWorkDir
+	e.mu.Unlock()
 	if e.observer != nil {
 		e.observer.OnExecutionStarted(LocalExecutionSession{
+			WorkspaceID:          runContextWorkspace(e.currentRun()),
 			TaskID:               taskID,
 			NodeID:               nodeID,
 			NodeName:             currentNode.Name,
-			Tool:                 "",
 			ToolSessionIDPresent: true,
-			WorkDir:              e.lastWorkDir,
+			WorkDir:              workDir,
 			Status:               LocalExecutionRunning,
 		})
+	}
+
+	// After a soft-interrupted takeover the execution goroutine has already
+	// returned; clear the takeover flag and trigger a recovery pass so the
+	// watcher re-enters Execute for the still in_progress node with the
+	// persisted tool session.
+	if !e.IsRunning() {
+		e.softInterrupted.Store(false)
+		if e.onResume != nil {
+			go e.onResume()
+		}
 	}
 	return true
 }
@@ -1011,21 +1128,17 @@ func (e *TaskExecutor) Handback(taskID int32, nodeID string) bool {
 // identity. The single server call (CompleteNode) uses the executor's own
 // agentID; no cross-workspace data is involved.
 func (e *TaskExecutor) CompleteManually(taskID int32, nodeID string) bool {
-	e.currentMu.Lock()
-	running := e.running
-	currentTaskID := e.taskID
-	currentNode := e.node
-	e.currentMu.Unlock()
-
-	if !running || currentTaskID != taskID || currentNode.ID != nodeID {
+	currentNode, ok := e.interventionTargetMatches(taskID, nodeID)
+	if !ok {
 		return false
 	}
-	if e.client == nil {
+	run := e.currentRun()
+	if run == nil {
 		return false
 	}
 
 	comment := fmt.Sprintf("Node %s completed manually by the local operator.", currentNode.Name)
-	if err := e.client.CompleteNode(context.Background(), e.agentID, taskID, nodeID, comment); err != nil {
+	if err := run.Client.CompleteNode(context.Background(), run.AgentID, taskID, nodeID, comment); err != nil {
 		log.Printf("[intervention] manual CompleteNode failed: %v", err)
 		return false
 	}
@@ -1041,16 +1154,20 @@ func (e *TaskExecutor) CompleteManually(taskID int32, nodeID string) bool {
 	return true
 }
 
-func (e *TaskExecutor) notifyExecutionStarted(taskID int32, node TaskNode, workDir string) {
+func (e *TaskExecutor) notifyExecutionStarted(run *RunContext, taskID int32, node TaskNode, workDir string) {
 	if e.observer == nil {
 		return
 	}
+	e.mu.Lock()
+	sessionPresent := e.sessionID != ""
+	e.mu.Unlock()
 	e.observer.OnExecutionStarted(LocalExecutionSession{
+		WorkspaceID:          run.WorkspaceID,
 		TaskID:               taskID,
 		NodeID:               node.ID,
 		NodeName:             node.Name,
 		Tool:                 e.cfg.Agent.Provider,
-		ToolSessionIDPresent: e.sessionID != "",
+		ToolSessionIDPresent: sessionPresent,
 		WorkDir:              workDir,
 	})
 }
@@ -1086,6 +1203,14 @@ func (e *TaskExecutor) IsRunning() bool {
 	return e.running
 }
 
+// IsSoftInterrupted reports whether the executor holds a locally taken-over
+// node (soft-interrupted, server still unaware). While true the watcher must
+// neither recover the node nor claim new work: the human owns the executor
+// until Handback clears the flag.
+func (e *TaskExecutor) IsSoftInterrupted() bool {
+	return e.softInterrupted.Load()
+}
+
 // CurrentTask returns the currently running task ID and node information.
 func (e *TaskExecutor) CurrentTask() (taskID int32, node TaskNode, ok bool) {
 	e.currentMu.Lock()
@@ -1112,6 +1237,14 @@ type TestTool interface {
 	IsInstalled() bool
 }
 
+// SetToolFactory replaces the real coding-tool selector with the given
+// factory. Production injection point (supervisor options).
+func (e *TaskExecutor) SetToolFactory(factory func() tool.Tool) {
+	e.mu.Lock()
+	e.toolFactory = factory
+	e.mu.Unlock()
+}
+
 // SetToolFactoryForTest replaces the real tool selector with a fake for tests.
 // Test-only seam; does not change production behavior when unset.
 func (e *TaskExecutor) SetToolFactoryForTest(factory func() TestTool) {
@@ -1136,10 +1269,19 @@ func (e *TaskExecutor) SetLogBuffer(lb *LogBuffer) {
 	e.mu.Unlock()
 }
 
-// SeedRunningForTest primes the executor as if Execute had started a node and
-// then been soft-interrupted, so intervention methods can be exercised without
-// a full Execute run. Test-only.
-func (e *TaskExecutor) SeedRunningForTest(taskID int32, node TaskNode, projectID, workDir string) {
+// SetResumeCallback installs the callback Handback invokes after handing a
+// soft-interrupted takeover back to the agent. The runtime wires it to a
+// watcher recovery trigger.
+func (e *TaskExecutor) SetResumeCallback(fn func()) {
+	e.mu.Lock()
+	e.onResume = fn
+	e.mu.Unlock()
+}
+
+// SeedRunningForTest primes the executor as if Execute had started a node with
+// the given identity and then been soft-interrupted, so intervention methods
+// can be exercised without a full Execute run. Test-only.
+func (e *TaskExecutor) SeedRunningForTest(run *RunContext, taskID int32, node TaskNode, workDir string) {
 	e.currentMu.Lock()
 	e.running = true
 	e.taskID = taskID
@@ -1148,7 +1290,7 @@ func (e *TaskExecutor) SeedRunningForTest(taskID int32, node TaskNode, projectID
 	e.mu.Lock()
 	e.sessionID = ""
 	e.lastWorkDir = workDir
-	e.nodeProjectID = projectID
+	e.run = run
 	e.mu.Unlock()
 }
 
@@ -1185,6 +1327,9 @@ func (a testToolAdapter) IsInstalled() bool { return a.inner.IsInstalled() }
 // Returns:
 //   - tool.Tool: the selected coding tool adapter instance
 func (e *TaskExecutor) selectTool() tool.Tool {
+	if e.toolFactory != nil {
+		return e.toolFactory()
+	}
 	if e.toolFactoryForTest != nil {
 		return testToolAdapter{inner: e.toolFactoryForTest()}
 	}
@@ -1212,13 +1357,13 @@ func (e *TaskExecutor) toolPath(provider string) string {
 	}
 }
 
-func (e *TaskExecutor) shouldPostNeedsInputComment(ctx context.Context, taskID int32, nodeID, content string) bool {
-	comments, err := e.client.ListNodeComments(ctx, taskID, nodeID)
+func (e *TaskExecutor) shouldPostNeedsInputComment(ctx context.Context, run *RunContext, taskID int32, nodeID, content string) bool {
+	comments, err := run.Client.ListNodeComments(ctx, run.AgentID, taskID, nodeID)
 	if err != nil {
 		log.Printf("[executor] warning: failed to list node comments before needs_input dedupe: %v", err)
 		return true
 	}
-	return !HasDuplicateAgentComment(comments, e.agentID, "question", content)
+	return !HasDuplicateAgentComment(comments, run.AgentID, "question", content)
 }
 
 func HasDuplicateAgentComment(comments []Comment, agentID, commentType, content string) bool {
@@ -1256,9 +1401,10 @@ func (e *TaskExecutor) buildHandoffComment(taskID int32, node TaskNode, summary 
 	return sb.String()
 }
 
-// buildPromptWithClient builds the execution context prompt using the context injection layer.
-func (e *TaskExecutor) buildPromptWithClient(taskID int32, node TaskNode, task Task, isResume bool, caps PromptCapabilities) (string, error) {
-	context, err := BuildExecutionContextWithCapabilities(e.client, e.cfg, task, node, isResume, caps)
+// buildPromptWithClient builds the execution context prompt using the context
+// injection layer, scoped to the execution's connection and identity.
+func (e *TaskExecutor) buildPromptWithClient(client *Client, workspaceID, agentID string, taskID int32, node TaskNode, task Task, isResume bool, caps PromptCapabilities) (string, error) {
+	context, err := BuildExecutionContextWithCapabilities(client, workspaceID, agentID, e.cfg, task, node, isResume, caps)
 	if err != nil {
 		return "", fmt.Errorf("build execution context: %w", err)
 	}
@@ -1285,9 +1431,9 @@ func (e *TaskExecutor) buildPromptWithClient(taskID int32, node TaskNode, task T
 //   - taskID: task ID
 //   - nodeID: node ID
 //   - err: the error that caused the failure
-func (e *TaskExecutor) reportFailure(taskID int32, nodeID string, err error) {
+func (e *TaskExecutor) reportFailure(run *RunContext, taskID int32, nodeID string, err error) {
 	comment := fmt.Sprintf("Execution failed: %v\nManual intervention required.", err)
-	if reportErr := e.client.ManualIntervention(context.Background(), e.agentID, taskID, nodeID, comment); reportErr != nil {
+	if reportErr := run.Client.ManualIntervention(context.Background(), run.AgentID, taskID, nodeID, comment); reportErr != nil {
 		log.Printf("[executor] failed to report manual intervention: %v", reportErr)
 	}
 }

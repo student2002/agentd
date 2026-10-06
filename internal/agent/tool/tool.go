@@ -24,6 +24,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -64,6 +65,63 @@ type Tool interface {
 
 	// IsInstalled checks whether the tool is available on the system.
 	IsInstalled() bool
+}
+
+// ToolSession is one historical conversation session of a coding tool,
+// enumerated from the tool's own on-disk session store.
+type ToolSession struct {
+	ID        string
+	Title     string
+	WorkDir   string
+	UpdatedAt time.Time
+	Turns     int
+}
+
+// SessionLister is an optional adapter capability: adapters whose tool keeps
+// a local session store implement it so callers can list and resume past
+// conversations. Adapters without one simply omit the interface.
+type SessionLister interface {
+	ListSessions() ([]ToolSession, error)
+}
+
+// SessionMessage is one turn of a tool session's conversation transcript.
+type SessionMessage struct {
+	Role string // "user" | "assistant"
+	Text string
+}
+
+// SessionReader is an optional adapter capability to load one historical
+// session's conversation transcript from the tool's local store.
+type SessionReader interface {
+	ReadSession(id string) ([]SessionMessage, error)
+}
+
+// sessionReadCaps bound transcript loading: last N messages, each truncated.
+const (
+	maxSessionMessages     = 100
+	maxSessionMessageChars = 8000
+)
+
+func validSessionID(id string) bool {
+	if id == "" || len(id) > 128 {
+		return false
+	}
+	if strings.ContainsAny(id, `/\`) || strings.Contains(id, "..") {
+		return false
+	}
+	return true
+}
+
+func trimSessionMessages(msgs []SessionMessage) []SessionMessage {
+	if len(msgs) > maxSessionMessages {
+		msgs = msgs[len(msgs)-maxSessionMessages:]
+	}
+	for i := range msgs {
+		if len(msgs[i].Text) > maxSessionMessageChars {
+			msgs[i].Text = msgs[i].Text[:maxSessionMessageChars] + "…"
+		}
+	}
+	return msgs
 }
 
 func stopCommand(cmd *exec.Cmd, done <-chan struct{}) error {
@@ -155,9 +213,10 @@ func (t *ClaudeTool) Execute(ctx context.Context, workDir, prompt string, option
 		args = append(args, "--resume", resumeID)
 	}
 	if options.MCPConfigPath != "" {
-		args = append(args, "--mcp-config", options.MCPConfigPath)
+		// Equals form: space-separated "--mcp-config <path>" makes the CLI
+		// consume the first prompt word as the config value.
+		args = append(args, "--mcp-config="+options.MCPConfigPath)
 	}
-	args = append(args, prompt)
 
 	t.cmd = exec.Command(t.path, args...)
 	t.cmd.Dir = workDir
@@ -167,6 +226,10 @@ func (t *ClaudeTool) Execute(ctx context.Context, workDir, prompt string, option
 		"GIT_CEILING_DIRECTORIES="+ceilingDir,
 	)
 
+	// The prompt must travel via stdin, never argv: Windows npm shims forward
+	// arguments through cmd.exe `%*`, which treats embedded newlines as
+	// command separators and truncates the prompt to its first line.
+	stdin, _ := t.cmd.StdinPipe()
 	stdout, _ := t.cmd.StdoutPipe()
 	stderr, _ := t.cmd.StderrPipe()
 
@@ -174,6 +237,14 @@ func (t *ClaudeTool) Execute(ctx context.Context, workDir, prompt string, option
 		return nil, fmt.Errorf("claude start: %w", err)
 	}
 	started = true
+
+	go func() {
+		defer stdin.Close()
+		if _, err := io.WriteString(stdin, prompt); err != nil {
+			log.Printf("[claude] warning: failed to write prompt to stdin: %v", err)
+		}
+	}()
+
 	t.mu.Unlock() // release the lock after Start() so Stop() can access t.cmd
 
 	go func() {
@@ -190,6 +261,7 @@ func (t *ClaudeTool) Execute(ctx context.Context, workDir, prompt string, option
 	var fullOutput strings.Builder
 	var sessionIDMu sync.Mutex
 	var capturedSessionID string
+	textExtractor := &streamJSONTextExtractor{}
 	go func() {
 		scanner := bufio.NewScanner(stdout)
 		scanner.Buffer(make([]byte, 0, 1024*1024), 1024*1024) // 1MB buffer
@@ -199,7 +271,7 @@ func (t *ClaudeTool) Execute(ctx context.Context, workDir, prompt string, option
 			fullOutput.WriteByte('\n')
 			log.Printf("[tool:stdout] raw line: %s", line[:min(200, len(line))])
 			// Extract displayable text from the stream-json line
-			displayText := extractStreamJSONText(line)
+			displayText := textExtractor.extract(line)
 			if displayText != "" {
 				sanitized := sanitizeLog(displayText)
 				outputLines = append(outputLines, sanitized)
@@ -541,7 +613,12 @@ type AtomCodeTool struct {
 	mu              sync.Mutex
 	done            chan struct{} // closed when Execute completes
 	continueSession bool          // next Execute uses --continue to resume the session
+	resumeSessionID string        // if set, the next Execute call uses --resume <id>
 }
+
+// atomcodeResumeHint matches the stderr hint atomcode prints after a run:
+// "To resume this session, run: atomcode -p "…" --resume <uuid>".
+var atomcodeResumeHint = regexp.MustCompile(`--resume ([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})`)
 
 // NewAtomCodeTool creates a new AtomCode tool adapter.
 func NewAtomCodeTool(path string) *AtomCodeTool {
@@ -564,6 +641,13 @@ func (t *AtomCodeTool) SetContinueSession(continueSession bool) {
 	t.continueSession = continueSession
 }
 
+// SetResumeSession resumes the given atomcode session id on the next Execute call.
+func (t *AtomCodeTool) SetResumeSession(sessionID string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.resumeSessionID = sessionID
+}
+
 // Execute runs AtomCode.
 // Uses `atomcode -p "prompt"` for headless mode execution.
 // In AtomCode headless mode, bash calls are auto-approved; other tools that require
@@ -576,6 +660,8 @@ func (t *AtomCodeTool) Execute(ctx context.Context, workDir, prompt string, opti
 
 	continueSession := t.continueSession
 	t.continueSession = false
+	resumeID := t.resumeSessionID
+	t.resumeSessionID = ""
 
 	defer func() {
 		if !started {
@@ -592,7 +678,9 @@ func (t *AtomCodeTool) Execute(ctx context.Context, workDir, prompt string, opti
 	}
 
 	args := []string{"-p", prompt}
-	if continueSession {
+	if resumeID != "" {
+		args = append(args, "--resume", resumeID)
+	} else if continueSession {
 		args = append([]string{"--continue"}, args...)
 	}
 	t.cmd = exec.Command(t.path, args...)
@@ -631,10 +719,22 @@ func (t *AtomCodeTool) Execute(ctx context.Context, workDir, prompt string, opti
 		})
 	}()
 
+	var sessionIDMu sync.Mutex
+	var capturedSessionID string
 	go func() {
 		scanLines(stderr, func(line string) {
 			line = sanitizeLog(line)
 			log.Printf("[tool:stderr:atomcode] %s", line)
+			if m := atomcodeResumeHint.FindStringSubmatch(line); m != nil {
+				sessionIDMu.Lock()
+				capturedSessionID = m[1]
+				sessionIDMu.Unlock()
+				// The resume hint is adapter metadata, not transcript content.
+				return
+			}
+			if strings.TrimSpace(line) == "" {
+				return
+			}
 			if onOutput != nil {
 				onOutput("[stderr] " + line)
 			}
@@ -655,6 +755,9 @@ func (t *AtomCodeTool) Execute(ctx context.Context, workDir, prompt string, opti
 		Output:   fullOutput.String(),
 		ExitCode: exitCode,
 	}
+	sessionIDMu.Lock()
+	result.SessionID = capturedSessionID
+	sessionIDMu.Unlock()
 
 	result.InputTokens, result.OutputTokens = extractTokenUsage(result.Output)
 	result.TotalTokens = result.InputTokens + result.OutputTokens
@@ -807,9 +910,19 @@ func (t *MiMoCodeTool) Stop() error {
 
 // --- Stream JSON Text Extraction ---
 
-// extractStreamJSONText parses a single line of Claude stream-json output and returns the displayable text.
-// Each line is a JSON object containing a "type" field that identifies the event type.
-func extractStreamJSONText(line string) string {
+// streamJSONTextExtractor extracts displayable text from Claude stream-json
+// lines, deduplicating the redundant text sources in the protocol: the same
+// reply can arrive as incremental text deltas, as a complete assistant
+// message, and as the final result. Preference order: live deltas, then the
+// assistant message, and the result only as a fallback when nothing else
+// carried the text. One instance per Execute run.
+type streamJSONTextExtractor struct {
+	sawDeltas bool
+	emitted   bool
+}
+
+// extract parses a single stream-json line and returns its displayable text.
+func (x *streamJSONTextExtractor) extract(line string) string {
 	line = strings.TrimSpace(line)
 	if line == "" || !strings.HasPrefix(line, "{") {
 		return ""
@@ -844,7 +957,15 @@ func extractStreamJSONText(line string) string {
 				texts = append(texts, block.Text)
 			}
 		}
-		return strings.Join(texts, "\n")
+		text := strings.Join(texts, "\n")
+		if x.sawDeltas {
+			// Deltas already streamed this text as it arrived.
+			return ""
+		}
+		if text != "" {
+			x.emitted = true
+		}
+		return text
 
 	case "content_block_start":
 		// A new content block starts
@@ -856,6 +977,8 @@ func extractStreamJSONText(line string) string {
 			_ = json.Unmarshal(c, &cb)
 		}
 		if cb.Type == "text" && cb.Text != "" {
+			x.sawDeltas = true
+			x.emitted = true
 			return cb.Text
 		}
 		return ""
@@ -870,12 +993,19 @@ func extractStreamJSONText(line string) string {
 			_ = json.Unmarshal(d, &delta)
 		}
 		if delta.Type == "text_delta" && delta.Text != "" {
+			x.sawDeltas = true
+			x.emitted = true
 			return delta.Text
 		}
 		return ""
 
 	case "result":
-		// Final result: {"type":"result","result":"...","usage":{...}}
+		// Final result: {"type":"result","result":"...","usage":{...}}.
+		// The result text duplicates the final assistant reply; emit it only
+		// when no other source carried the text.
+		if x.emitted {
+			return ""
+		}
 		var resultStr string
 		if r, ok := obj["result"]; ok {
 			_ = json.Unmarshal(r, &resultStr)
@@ -980,34 +1110,382 @@ func scanLines(reader io.Reader, fn func(line string)) {
 
 // --- Token Usage Extraction ---
 
-// extractTokenUsage extracts Token usage information from the output.
-func extractTokenUsage(output string) (int, int) {
-	// Try to parse the JSON output to obtain token usage
-	var result struct {
-		Usage struct {
-			InputTokens  int `json:"input_tokens"`
-			OutputTokens int `json:"output_tokens"`
-		} `json:"usage"`
-	}
-
-	// Try to parse as a single JSON object
-	if err := json.Unmarshal([]byte(output), &result); err == nil {
-		return result.Usage.InputTokens, result.Usage.OutputTokens
-	}
-
-	// Try to find a JSON line containing usage information
-	for _, line := range strings.Split(output, "\n") {
-		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, "{") && strings.Contains(line, "usage") {
-			if err := json.Unmarshal([]byte(line), &result); err == nil {
-				if result.Usage.InputTokens > 0 || result.Usage.OutputTokens > 0 {
-					return result.Usage.InputTokens, result.Usage.OutputTokens
+// scanJSONObjects returns every complete top-level JSON object in s, recovered
+// by brace matching. Stream-json output is line-framed in principle, but some
+// gateways emit objects with embedded newlines or concatenate objects without
+// line breaks, so line-based splitting cannot be relied upon.
+func scanJSONObjects(s string) []string {
+	var objs []string
+	depth, start := 0, -1
+	inStr, esc := false, false
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case esc:
+			esc = false
+		case inStr && c == '\\':
+			esc = true
+		case c == '"':
+			inStr = !inStr
+		case !inStr && c == '{':
+			if depth == 0 {
+				start = i
+			}
+			depth++
+		case !inStr && c == '}':
+			if depth > 0 {
+				depth--
+				if depth == 0 && start >= 0 {
+					objs = append(objs, s[start:i+1])
+					start = -1
 				}
 			}
 		}
 	}
+	return objs
+}
 
-	return 0, 0
+// extractTokenUsage extracts Token usage information from the output.
+// Parsing is tolerant: the last object carrying top-level usage (e.g. the
+// stream-json "result" event) wins; when no such object exists, per-message
+// usage from "assistant" events is summed as a fallback, so successful runs
+// still report usage when the gateway omits the closing result event.
+func extractTokenUsage(output string) (int, int) {
+	type usageJSON struct {
+		InputTokens  int `json:"input_tokens"`
+		OutputTokens int `json:"output_tokens"`
+	}
+
+	resultIn, resultOut := 0, 0
+	hasResult := false
+	fallbackIn, fallbackOut := 0, 0
+
+	for _, obj := range scanJSONObjects(output) {
+		var event struct {
+			Type    string `json:"type"`
+			Usage   *usageJSON `json:"usage"`
+			Message *struct {
+				Usage *usageJSON `json:"usage"`
+			} `json:"message"`
+		}
+		if err := json.Unmarshal([]byte(obj), &event); err != nil {
+			continue
+		}
+		if event.Usage != nil && (event.Usage.InputTokens > 0 || event.Usage.OutputTokens > 0) {
+			resultIn, resultOut = event.Usage.InputTokens, event.Usage.OutputTokens
+			hasResult = true
+			continue
+		}
+		if event.Type == "assistant" && event.Message != nil && event.Message.Usage != nil {
+			fallbackIn += event.Message.Usage.InputTokens
+			fallbackOut += event.Message.Usage.OutputTokens
+		}
+	}
+
+	if hasResult {
+		return resultIn, resultOut
+	}
+	return fallbackIn, fallbackOut
+}
+
+// --- Session stores (SessionLister implementations) ---
+
+// maxListSessions caps the enumerated history per tool.
+const maxListSessions = 50
+
+// atomcodeSessionMeta is the subset of atomcode's `<id>.meta` catalog file
+// needed for listing. Parsing is deliberately lenient: unknown fields are
+// ignored, unreadable files are skipped, so a newer atomcode format stays
+// listable until a breaking change.
+type atomcodeSessionMeta struct {
+	ID         string `json:"id"`
+	Name       string `json:"name"`
+	WorkingDir string `json:"working_dir"`
+	UpdatedAt  int64  `json:"updated_at"` // epoch milliseconds
+	TurnCount  int    `json:"turn_count"`
+	Origin     string `json:"origin"`
+}
+
+// ListSessions enumerates atomcode sessions from $ATOMCODE_HOME/sessions
+// (default ~/.atomcode/sessions), newest first. Scheduled-run sessions are
+// hidden, matching atomcode's own resume picker.
+func (t *AtomCodeTool) ListSessions() ([]ToolSession, error) {
+	root, err := atomcodeSessionsRoot()
+	if err != nil {
+		return nil, err
+	}
+	return listAtomCodeSessions(root)
+}
+
+func atomcodeSessionsRoot() (string, error) {
+	if home := os.Getenv("ATOMCODE_HOME"); home != "" {
+		return filepath.Join(home, "sessions"), nil
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, ".atomcode", "sessions"), nil
+}
+
+func listAtomCodeSessions(root string) ([]ToolSession, error) {
+	buckets, err := os.ReadDir(root)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	var sessions []ToolSession
+	for _, bucket := range buckets {
+		if !bucket.IsDir() {
+			continue
+		}
+		metas, err := filepath.Glob(filepath.Join(root, bucket.Name(), "*.meta"))
+		if err != nil {
+			continue
+		}
+		for _, metaPath := range metas {
+			data, err := os.ReadFile(metaPath)
+			if err != nil {
+				continue
+			}
+			var meta atomcodeSessionMeta
+			if err := json.Unmarshal(data, &meta); err != nil {
+				continue
+			}
+			if meta.ID == "" || meta.Origin == "scheduled" {
+				continue
+			}
+			sessions = append(sessions, ToolSession{
+				ID:        meta.ID,
+				Title:     meta.Name,
+				WorkDir:   meta.WorkingDir,
+				UpdatedAt: time.UnixMilli(meta.UpdatedAt).UTC(),
+				Turns:     meta.TurnCount,
+			})
+		}
+	}
+	sortSessions(sessions)
+	return trimSessions(sessions), nil
+}
+
+// ListSessions enumerates claude sessions from $CLAUDE_CONFIG_DIR/projects
+// (default ~/.claude/projects), newest first. Claude keeps no separate
+// catalog: one `<session-id>.jsonl` per session; the real working directory
+// is read from the transcript's first cwd field. Titles are unavailable
+// without replaying full messages, so they stay empty.
+func (t *ClaudeTool) ListSessions() ([]ToolSession, error) {
+	root, err := claudeProjectsRoot()
+	if err != nil {
+		return nil, err
+	}
+	return listClaudeSessions(root)
+}
+
+func claudeProjectsRoot() (string, error) {
+	if dir := os.Getenv("CLAUDE_CONFIG_DIR"); dir != "" {
+		return filepath.Join(dir, "projects"), nil
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, ".claude", "projects"), nil
+}
+
+func listClaudeSessions(root string) ([]ToolSession, error) {
+	projects, err := os.ReadDir(root)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	var sessions []ToolSession
+	for _, project := range projects {
+		if !project.IsDir() {
+			continue
+		}
+		files, err := os.ReadDir(filepath.Join(root, project.Name()))
+		if err != nil {
+			continue
+		}
+		for _, f := range files {
+			// Subdirectories hold subagent transcripts, not top-level sessions.
+			if f.IsDir() || !strings.HasSuffix(f.Name(), ".jsonl") {
+				continue
+			}
+			info, err := f.Info()
+			if err != nil {
+				continue
+			}
+			sessions = append(sessions, ToolSession{
+				ID:        strings.TrimSuffix(f.Name(), ".jsonl"),
+				WorkDir:   claudeSessionCwd(filepath.Join(root, project.Name(), f.Name()), project.Name()),
+				UpdatedAt: info.ModTime().UTC(),
+			})
+		}
+	}
+	sortSessions(sessions)
+	return trimSessions(sessions), nil
+}
+
+// claudeSessionCwd reads the session's real working directory from the first
+// transcript line carrying a cwd field. Claude Code encodes project folder
+// names lossily (every non-alphanumeric character becomes '-'), so the folder
+// name is only a fallback identifier, never a decoded path.
+func claudeSessionCwd(path, fallback string) string {
+	file, err := os.Open(path)
+	if err != nil {
+		return fallback
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
+	for i := 0; scanner.Scan() && i < 50; i++ {
+		var line struct {
+			Cwd string `json:"cwd"`
+		}
+		if err := json.Unmarshal(scanner.Bytes(), &line); err == nil && line.Cwd != "" {
+			return line.Cwd
+		}
+	}
+	return fallback
+}
+
+func sortSessions(sessions []ToolSession) {
+	sort.Slice(sessions, func(i, j int) bool { return sessions[i].UpdatedAt.After(sessions[j].UpdatedAt) })
+}
+
+func trimSessions(sessions []ToolSession) []ToolSession {
+	if len(sessions) > maxListSessions {
+		return sessions[:maxListSessions]
+	}
+	return sessions
+}
+
+// ReadSession loads an atomcode session transcript from its `<id>.snapshot`
+// file next to the `.meta` catalog. System and Tool messages and empty
+// assistant placeholders (tool-call turns) are skipped.
+func (t *AtomCodeTool) ReadSession(id string) ([]SessionMessage, error) {
+	if !validSessionID(id) {
+		return nil, fmt.Errorf("atomcode: invalid session id")
+	}
+	root, err := atomcodeSessionsRoot()
+	if err != nil {
+		return nil, err
+	}
+	matches, _ := filepath.Glob(filepath.Join(root, "*", id+".snapshot"))
+	if len(matches) == 0 {
+		return nil, fmt.Errorf("atomcode: session %s not found", id)
+	}
+	data, err := os.ReadFile(matches[0])
+	if err != nil {
+		return nil, err
+	}
+	var snap struct {
+		Messages []struct {
+			Role string `json:"role"`
+			Text string `json:"text"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal(data, &snap); err != nil {
+		return nil, fmt.Errorf("atomcode: parse snapshot: %w", err)
+	}
+	out := []SessionMessage{}
+	for _, m := range snap.Messages {
+		switch m.Role {
+		case "User":
+			if strings.TrimSpace(m.Text) != "" {
+				out = append(out, SessionMessage{Role: "user", Text: m.Text})
+			}
+		case "Assistant":
+			if strings.TrimSpace(m.Text) != "" {
+				out = append(out, SessionMessage{Role: "assistant", Text: m.Text})
+			}
+		}
+	}
+	return trimSessionMessages(out), nil
+}
+
+// ReadSession loads a claude session transcript from its `<id>.jsonl` file.
+// Only user and assistant text is kept; tool results and meta lines are
+// skipped.
+func (t *ClaudeTool) ReadSession(id string) ([]SessionMessage, error) {
+	if !validSessionID(id) {
+		return nil, fmt.Errorf("claude: invalid session id")
+	}
+	root, err := claudeProjectsRoot()
+	if err != nil {
+		return nil, err
+	}
+	matches, _ := filepath.Glob(filepath.Join(root, "*", id+".jsonl"))
+	if len(matches) == 0 {
+		return nil, fmt.Errorf("claude: session %s not found", id)
+	}
+	file, err := os.Open(matches[0])
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	out := []SessionMessage{}
+	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, 0, 1024*1024), 8*1024*1024)
+	for scanner.Scan() {
+		var line struct {
+			Type    string          `json:"type"`
+			Message json.RawMessage `json:"message"`
+		}
+		if err := json.Unmarshal(scanner.Bytes(), &line); err != nil || line.Message == nil {
+			continue
+		}
+		var msg struct {
+			Content json.RawMessage `json:"content"`
+		}
+		if err := json.Unmarshal(line.Message, &msg); err != nil {
+			continue
+		}
+		text := claudeContentText(msg.Content)
+		if strings.TrimSpace(text) == "" {
+			continue
+		}
+		switch line.Type {
+		case "user":
+			out = append(out, SessionMessage{Role: "user", Text: text})
+		case "assistant":
+			out = append(out, SessionMessage{Role: "assistant", Text: text})
+		}
+	}
+	return trimSessionMessages(out), nil
+}
+
+// claudeContentText extracts displayable text from a claude message content
+// field, which is either a plain string or an array of typed blocks.
+func claudeContentText(content json.RawMessage) string {
+	if len(content) == 0 {
+		return ""
+	}
+	var asString string
+	if err := json.Unmarshal(content, &asString); err == nil {
+		return asString
+	}
+	var blocks []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}
+	if err := json.Unmarshal(content, &blocks); err != nil {
+		return ""
+	}
+	var texts []string
+	for _, b := range blocks {
+		if b.Type == "text" && b.Text != "" {
+			texts = append(texts, b.Text)
+		}
+	}
+	return strings.Join(texts, "\n")
 }
 
 // --- Tool Factory ---

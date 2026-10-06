@@ -4,7 +4,9 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Teammate Agent Console</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%237aa2ff' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M12 2 3 7v10l9 5 9-5V7l-9-5z'/%3E%3Cpath d='M12 22V12'/%3E%3Cpath d='m3 7 9 5 9-5'/%3E%3C/svg%3E" />
   <link rel="stylesheet" href="assets/control.css" />
+  <link rel="stylesheet" href="assets/chat.css" />
 </head>
 <body>
   <div class="app">
@@ -21,17 +23,28 @@
         </div>
       </div>
       <div class="topbar-right">
+        <select id="workspace-select" class="chat-select workspace-select" title="workspace filter" aria-label="workspace filter"></select>
+        <select id="agent-select" class="chat-select agent-select" title="agent instance" aria-label="agent instance"></select>
+        <div class="view-switch" id="view-switch">
+          <button id="view-console-btn" class="vs-btn active" data-i18n="view-console">Console</button>
+          <button id="view-chat-btn" class="vs-btn" data-i18n="view-chat">Direct Chat</button>
+        </div>
         <span class="chip chip-ghost mono" id="chip-instance" title="instance id"></span>
         <span class="chip" id="chip-provider"></span>
         <button id="lang-switch" class="btn btn-ghost btn-sm"></button>
       </div>
     </header>
 
-    <main class="layout">
+    <main class="layout" id="view-console">
       <section class="stats">
         <div class="stat-card">
           <div class="stat-head">
-            <span class="stat-label" data-i18n="runtime">Runtime</span>
+            <span class="stat-label-wrap">
+              <span class="stat-icon" aria-hidden="true">
+                <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="2" width="20" height="8" rx="2" /><rect x="2" y="14" width="20" height="8" rx="2" /><line x1="6" y1="6" x2="6.01" y2="6" /><line x1="6" y1="18" x2="6.01" y2="18" /></svg>
+              </span>
+              <span class="stat-label" data-i18n="runtime">Runtime</span>
+            </span>
             <span class="dot" id="dot-runtime"></span>
           </div>
           <div class="stat-value" id="val-runtime">—</div>
@@ -39,7 +52,12 @@
         </div>
         <div class="stat-card">
           <div class="stat-head">
-            <span class="stat-label" data-i18n="agent">Agent</span>
+            <span class="stat-label-wrap">
+              <span class="stat-icon" aria-hidden="true">
+                <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="8" width="16" height="12" rx="3" /><path d="M12 8V4" /><circle cx="12" cy="3" r="1" /><circle cx="9" cy="14" r="1" /><circle cx="15" cy="14" r="1" /></svg>
+              </span>
+              <span class="stat-label" data-i18n="agent">Agent</span>
+            </span>
             <span class="dot" id="dot-agent"></span>
           </div>
           <div class="stat-value" id="val-agent">—</div>
@@ -47,7 +65,12 @@
         </div>
         <div class="stat-card">
           <div class="stat-head">
-            <span class="stat-label" data-i18n="execution">Execution</span>
+            <span class="stat-label-wrap">
+              <span class="stat-icon" aria-hidden="true">
+                <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12" /></svg>
+              </span>
+              <span class="stat-label" data-i18n="execution">Execution</span>
+            </span>
             <span class="dot" id="dot-exec"></span>
           </div>
           <div class="stat-value" id="val-exec">—</div>
@@ -55,11 +78,39 @@
         </div>
         <div class="stat-card">
           <div class="stat-head">
-            <span class="stat-label" data-i18n="tool">Tool</span>
+            <span class="stat-label-wrap">
+              <span class="stat-icon" aria-hidden="true">
+                <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5" /><line x1="12" y1="19" x2="20" y2="19" /></svg>
+              </span>
+              <span class="stat-label" data-i18n="tool">Tool</span>
+            </span>
             <span class="dot" id="dot-tool"></span>
           </div>
           <div class="stat-value" id="val-tool">—</div>
           <div class="stat-sub" id="sub-tool">—</div>
+        </div>
+      </section>
+
+      <section class="card server-card" id="server-card">
+        <div class="card-head">
+          <h2 data-i18n="server-card">Server &amp; Workspaces</h2>
+          <span class="pill" id="server-pill">—</span>
+        </div>
+
+        <div class="server-url-row mono" id="server-url-row">—</div>
+
+        <div class="connections-list" id="connections-list"></div>
+
+        <div class="action-group">
+          <span class="action-label" data-i18n="connection-add-label">Add workspace connection</span>
+          <div class="connection-add-row">
+            <input id="connection-add-name" class="mono" data-placeholder-i18n="connection-name-ph" placeholder="alias (e.g. team-a)" autocomplete="off" />
+            <input id="connection-add-token" class="mono connection-add-token" data-placeholder-i18n="connection-token-ph" placeholder="td_… — daemon token from that workspace's web UI" autocomplete="off" />
+          </div>
+          <div class="action-row">
+            <button id="connection-add" class="btn btn-primary btn-sm" data-i18n="connection-add">Add</button>
+          </div>
+          <p class="hint" data-i18n="connection-hint">Each connection registers with its own token; instances created in that workspace's web UI are materialized here on delivery.</p>
         </div>
       </section>
 
@@ -115,6 +166,17 @@
         </div>
       </section>
 
+      <section class="card agents-card">
+        <div class="card-head">
+          <h2 data-i18n="instances">Instances</h2>
+          <span class="pill" id="agents-count">0</span>
+        </div>
+
+        <div class="agents-list" id="agents-list"></div>
+
+        <p class="hint" data-i18n="agent-source-hint">Instances are created in the workspace web UI and materialized here on delivery.</p>
+      </section>
+
       <section class="card logs-card">
         <div class="card-head">
           <h2 data-i18n="logs">Live Logs</h2>
@@ -127,17 +189,89 @@
             <button id="clear-logs" class="btn btn-ghost btn-sm" data-i18n="clear">Clear</button>
           </div>
         </div>
-        <pre id="logs" class="terminal"></pre>
+        <div class="terminal-wrap">
+          <div class="terminal-bar" aria-hidden="true">
+            <span class="tb-dot"></span><span class="tb-dot"></span><span class="tb-dot"></span>
+            <span class="tb-title mono">agentd · logs</span>
+          </div>
+          <pre id="logs" class="terminal"></pre>
+        </div>
       </section>
     </main>
+
+    <section class="view chat-view" id="view-chat" hidden>
+      <div class="chat-toolbar">
+        <div class="chat-field">
+          <label class="chat-field-label" for="chat-provider" data-i18n="chat-tool">Tool</label>
+          <select id="chat-provider" class="chat-select"></select>
+        </div>
+        <span class="chat-tool-status" id="chat-tool-status"></span>
+        <button id="chat-check" class="btn btn-sm">
+          <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14" /><polyline points="22 4 12 14.01 9 11.01" /></svg>
+          <span data-i18n="chat-check">Check</span>
+        </button>
+        <div class="chat-field chat-field-session">
+          <label class="chat-field-label" for="chat-session" data-i18n="chat-session">Session</label>
+          <select id="chat-session" class="chat-select chat-session-select"></select>
+        </div>
+        <div class="chat-field chat-field-grow">
+          <label class="chat-field-label" for="chat-workdir" data-i18n="chat-workdir">Work dir</label>
+          <input id="chat-workdir" class="mono" data-placeholder-i18n="chat-workdir-ph" placeholder="optional — defaults to a local scratch dir" autocomplete="off" />
+        </div>
+        <button id="chat-new-session" class="btn btn-sm">
+          <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 5v14M5 12h14" /></svg>
+          <span data-i18n="chat-new-session">New session</span>
+        </button>
+      </div>
+
+      <div class="chat-transcript" id="chat-transcript">
+        <div class="chat-hero" id="chat-hero">
+          <div class="chat-hero-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" width="26" height="26" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" /></svg>
+          </div>
+          <div class="chat-hero-title" data-i18n="chat-hero-title">Chat directly with a local coding tool</div>
+          <div class="chat-hero-sub" data-i18n="chat-hero-sub">Runs entirely on this machine — no task node, no server involved.</div>
+        </div>
+      </div>
+
+      <div class="chat-composer">
+        <textarea id="chat-input" rows="1" data-placeholder-i18n="chat-input-ph" placeholder="Message… (Enter to send, Shift+Enter for newline)"></textarea>
+        <button id="chat-send" class="btn btn-primary chat-send-btn">
+          <span class="chat-send-icon chat-icon-send" aria-hidden="true">
+            <svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor"><path d="M3 11.5 21 3l-8.5 18-2.3-7.2L3 11.5z" /></svg>
+          </span>
+          <span class="chat-send-icon chat-icon-stop" aria-hidden="true">
+            <svg viewBox="0 0 24 24" width="12" height="12" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="2" /></svg>
+          </span>
+          <span id="chat-send-label" data-i18n="chat-send">Send</span>
+        </button>
+      </div>
+    </section>
 
     <footer class="footer">
       <span class="dot dot-sm" id="dot-health"></span>
       <span data-i18n="subtitle">Local console — operations affect only this agentd instance; the server stays unaware (node remains in_progress).</span>
     </footer>
 
+    <div class="gate" id="memory-modal" hidden>
+      <div class="gate-box memory-box">
+        <h2 data-i18n="memory-title">Instance memory</h2>
+        <p class="hint" id="memory-sub"></p>
+        <textarea id="memory-content" class="mono" rows="16" spellcheck="false"></textarea>
+        <div class="gate-row">
+          <button id="memory-save" class="btn btn-primary" data-i18n="memory-save">Save</button>
+          <button id="memory-clear" class="btn btn-warn" data-i18n="memory-clear">Clear</button>
+          <button id="memory-close" class="btn btn-ghost" data-i18n="memory-close">Close</button>
+        </div>
+        <p class="gate-error" id="memory-error" hidden></p>
+      </div>
+    </div>
+
     <div class="gate" id="gate" hidden>
       <div class="gate-box">
+        <div class="gate-icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="11" width="16" height="10" rx="2" /><path d="M8 11V7a4 4 0 0 1 8 0v4" /></svg>
+        </div>
         <h2 data-i18n="gate-title">Local token required</h2>
         <p data-i18n="gate-desc">Enter local.local_token from ~/.teammate/config.yaml, or open the page with ?token=…</p>
         <div class="gate-row">
@@ -149,5 +283,8 @@
     </div>
   </div>
   <script src="assets/control.js"></script>
+  <script src="assets/marked.min.js"></script>
+  <script src="assets/purify.min.js"></script>
+  <script src="assets/chat.js"></script>
 </body>
 </html>

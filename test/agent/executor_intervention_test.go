@@ -2,7 +2,6 @@ package agent_test
 
 import (
 	"testing"
-	"time"
 
 	"github.com/teammate/agentd/internal/agent"
 )
@@ -16,13 +15,13 @@ func TestExecuteInterventionTurnRunsOneTurnWithMessage(t *testing.T) {
 	ft := newFakeTool("claude")
 	ft.SetInterventionMode(true)
 	ft.SetOutput("did the thing")
-	executor := agent.NewTaskExecutorWithObserver(nil, nil, "agent-1", &recordingExecutionObserver{})
+	executor := agent.NewTaskExecutorWithObserver(nil, &recordingExecutionObserver{})
 	executor.SetToolFactoryForTest(func() agent.TestTool { return &fakeToolAdapter{tool: ft} })
 	executor.SetGitManagerForTest(nil)
 
 	// Seed the executor as if Execute() had already started a node and captured
-	// its workDir + projectID, then soft-interrupted to hand control to a human.
-	executor.SeedRunningForTest(7, agent.TaskNode{ID: "n-int", Name: "node-2", SortOrder: 2}, "proj-7", t.TempDir())
+	// its workDir, then soft-interrupted to hand control to a human.
+	executor.SeedRunningForTest(nil, 7, agent.TaskNode{ID: "n-int", Name: "node-2", SortOrder: 2}, t.TempDir())
 
 	out, err := executor.ExecuteInterventionTurn(7, "n-int", "please add a test")
 	if err != nil {
@@ -43,10 +42,8 @@ func TestExecuteInterventionTurnRunsOneTurnWithMessage(t *testing.T) {
 // rejected when no node matches — the human cannot complete a node the
 // executor is not tracking.
 func TestCompleteManuallyReturnsFalseWhenNotRunning(t *testing.T) {
-	executor := agent.NewTaskExecutorWithObserver(nil, nil, "agent-1", nil)
+	executor := agent.NewTaskExecutorWithObserver(nil, nil)
 	if ok := executor.CompleteManually(7, "n-none"); ok {
 		t.Fatal("expected CompleteManually to return false when not running the node")
 	}
 }
-
-var _ = time.Second

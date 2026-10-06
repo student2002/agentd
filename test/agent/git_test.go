@@ -460,50 +460,42 @@ func TestGitManager_ConfigureCredential(t *testing.T) {
 		t.Fatalf("ConfigureCredential failed: %v", err)
 	}
 
-	// Verify that git config has been set
-	cmd := exec.Command("git", "config", "user.name")
+	// Identity rides on GIT_CONFIG_* env applied to every git command; a
+	// commit made through the manager must carry the configured author.
+	if err := os.WriteFile(filepath.Join(workDir, "change.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatalf("write change: %v", err)
+	}
+	if _, err := gm.CommitAllWithResult("test: identity check"); err != nil {
+		t.Fatalf("CommitAllWithResult failed: %v", err)
+	}
+
+	cmd := exec.Command("git", "log", "-1", "--format=%an|%ae")
 	cmd.Dir = workDir
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		t.Fatalf("git config user.name failed: %v", err)
+		t.Fatalf("git log failed: %v", err)
 	}
-	if strings.TrimSpace(string(out)) != "Test Agent" {
-		t.Errorf("user.name = %q, want %q", strings.TrimSpace(string(out)), "Test Agent")
+	if got := strings.TrimSpace(string(out)); got != "Test Agent|test@agent.local" {
+		t.Errorf("commit author = %q, want %q", got, "Test Agent|test@agent.local")
 	}
 
 	gm.CleanupCredential()
 }
 
-// TestGitManager_ConfigureCredential_EmptyPAT verifies that ConfigureCredential
-// returns an error when given an empty PAT string.
+// TestGitManager_ConfigureCredential_EmptyPAT verifies that an empty PAT skips
+// the askpass setup without error, while missing git identity is rejected.
 func TestGitManager_ConfigureCredential_EmptyPAT(t *testing.T) {
 	tmpDir := t.TempDir()
 	runGit(t, tmpDir, "init")
 	gm := agent.NewGitManager(tmpDir)
 
-	if err := gm.ConfigureCredential("user", "", "", ""); err != nil {
+	if err := gm.ConfigureCredential("user", "", "Agent", "agent@local"); err != nil {
 		t.Fatalf("ConfigureCredential with empty PAT should not error: %v", err)
 	}
-}
-
-// TestGitManager_SetGitConfig verifies that SetGitConfig writes username and
-// email to the repository's Git configuration.
-func TestGitManager_SetGitConfig(t *testing.T) {
-	tmpDir := t.TempDir()
-	runGit(t, tmpDir, "init")
-	gm := agent.NewGitManager(tmpDir)
-
-	if err := gm.SetGitConfig("user.name", "TestUser"); err != nil {
-		t.Fatalf("SetGitConfig failed: %v", err)
+	if err := gm.ConfigureCredential("user", "pat", "", "agent@local"); err == nil {
+		t.Fatal("ConfigureCredential without git_name should error")
 	}
-
-	cmd := exec.Command("git", "config", "user.name")
-	cmd.Dir = tmpDir
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		t.Fatalf("git config user.name failed: %v", err)
-	}
-	if strings.TrimSpace(string(out)) != "TestUser" {
-		t.Errorf("user.name = %q, want %q", strings.TrimSpace(string(out)), "TestUser")
+	if err := gm.ConfigureCredential("user", "pat", "Agent", ""); err == nil {
+		t.Fatal("ConfigureCredential without git_email should error")
 	}
 }

@@ -13,8 +13,10 @@ import (
 	"github.com/teammate/agentd/internal/agent"
 )
 
-// TestBuildContext_AllAPIPathsVerified verifies that all 5 context-fetching
+// TestBuildContext_AllAPIPathsVerified verifies that the context-fetching
 // functions call the correct API paths and successfully parse the responses.
+// Workspace memories are NOT fetched here: memory access goes through the
+// local MCP server on demand, never through prompt injection.
 func TestBuildContext_AllAPIPathsVerified(t *testing.T) {
 	// record which API paths were called
 	calledPaths := make(map[string]bool)
@@ -42,25 +44,24 @@ func TestBuildContext_AllAPIPathsVerified(t *testing.T) {
 		if r.Method != "GET" {
 			t.Errorf("project: expected GET, got %s", r.Method)
 		}
-		json.NewEncoder(w).Encode(agent.ProjectContext{
+		json.NewEncoder(w).Encode(agent.Project{
 			ID:          "proj-1",
 			Name:        "Test Project",
 			Description: "A test project for context injection",
 		})
 	})
 
-	// 3. GET /api/memories
+	// 3. GET /api/memories — must NEVER be called during context building;
+	// a call fails the test (the endpoint answers with a marker body).
 	mux.HandleFunc("/api/memories", func(w http.ResponseWriter, r *http.Request) {
 		calledPaths["GET /api/memories"] = true
-		if r.Method != "GET" {
-			t.Errorf("memories: expected GET, got %s", r.Method)
-		}
+		t.Errorf("context building must not fetch memories: %s %s", r.Method, r.URL.Path)
 		json.NewEncoder(w).Encode([]agent.SharedMemory{
 			{ID: "mem-1", Title: "Architecture Decision", Content: "Use Go for backend", Score: 0.9},
 		})
 	})
 
-	// 5. GET /api/workspaces/{wsId}/agents/{agentId}/skills
+	// 4. GET /api/workspaces/{wsId}/agents/{agentId}/skills
 	mux.HandleFunc("/api/workspaces/{wsId}/agents/", func(w http.ResponseWriter, r *http.Request) {
 		// this handler matches both the agent info and the skills path
 		// check whether it is a skills subpath
@@ -100,10 +101,7 @@ func TestBuildContext_AllAPIPathsVerified(t *testing.T) {
 	// create a client pointing to the mock server
 	client := agent.NewClient(server.URL, "test-token")
 
-	cfg := &agent.Config{
-		Workspace: agent.WorkspaceConfig{ID: "ws-1"},
-		Agent:     agent.AgentInfo{ID: "agent-1"},
-	}
+	cfg := &agent.Config{}
 
 	task := agent.Task{
 		ID:          1,
@@ -122,16 +120,15 @@ func TestBuildContext_AllAPIPathsVerified(t *testing.T) {
 	}
 
 	// build the execution context
-	context, err := agent.BuildExecutionContext(client, cfg, task, node, false)
+	context, err := agent.BuildExecutionContext(client, "ws-1", "agent-1", cfg, task, node, false)
 	if err != nil {
 		t.Fatalf("BuildExecutionContext failed: %v", err)
 	}
 
-	// verify that all 5 API paths were called
+	// verify that the expected API paths were called
 	expectedPaths := []string{
 		"GET /api/workspaces/{wsId}",
 		"GET /api/workspaces/{wsId}/projects/{projectId}",
-		"GET /api/memories",
 		"GET /api/workspaces/{wsId}/agents/{agentId}",
 		"GET /api/workspaces/{wsId}/agents/{agentId}/skills",
 		"GET /api/workspaces/{wsId}/agents/{agentId}/execution/mcp-servers",
@@ -146,7 +143,6 @@ func TestBuildContext_AllAPIPathsVerified(t *testing.T) {
 	expectedSections := []string{
 		"Workspace Context",
 		"Project Context",
-		"Shared Memory",
 		"Agent Instructions",
 		"Skill Context",
 		"MCP Servers",
@@ -166,8 +162,6 @@ func TestBuildContext_AllAPIPathsVerified(t *testing.T) {
 		"A test workspace for context injection",
 		"Test Project",
 		"A test project for context injection",
-		"Architecture Decision",
-		"Use Go for backend",
 		"You are a senior Go developer",
 		"Code Review",
 		"Docs MCP",
@@ -181,6 +175,14 @@ func TestBuildContext_AllAPIPathsVerified(t *testing.T) {
 		if !containsContent(context, content) {
 			t.Errorf("context missing expected content: %q", content)
 		}
+	}
+
+	// Memory must not be injected into the prompt — it is MCP-pull-only.
+	if containsSection(context, "Shared Memory") {
+		t.Errorf("context must not carry a Shared Memory section:\n%s", context)
+	}
+	if containsContent(context, "Architecture Decision") || containsContent(context, "Use Go for backend") {
+		t.Errorf("memory content leaked into the context:\n%s", context)
 	}
 
 	// verify that the context is non-empty and not too short (previously only about 187 characters)
@@ -251,9 +253,9 @@ func TestBuildContext_GetTaskAPIPath(t *testing.T) {
 	server := httptest.NewServer(mux)
 	defer server.Close()
 
-	client := agent.NewClient(server.URL, "test-token")
+	client := agent.NewClient(server.URL, "td_test_token")
 
-	task, err := client.GetTask(context.Background(), "proj-1", 1)
+	task, err := client.GetTask(context.Background(), "agent-1", "proj-1", 1)
 	if err != nil {
 		t.Fatalf("GetTask failed: %v", err)
 	}
@@ -336,7 +338,7 @@ func TestBuildContext_DirectoryPermissions(t *testing.T) {
 			ReadonlyDirs:    json.RawMessage(`["/docs","/README.md"]`),
 			FullControlDirs: json.RawMessage(`["/src"]`),
 		}
-		ctx, err := agent.BuildExecutionContext(client, cfg, task, node, false)
+		ctx, err := agent.BuildExecutionContext(client, "ws-1", "agent-1", cfg, task, node, false)
 		if err != nil {
 			t.Fatalf("BuildExecutionContext: %v", err)
 		}
@@ -353,7 +355,7 @@ func TestBuildContext_DirectoryPermissions(t *testing.T) {
 
 	t.Run("without directory permissions", func(t *testing.T) {
 		node := agent.TaskNode{ID: "node-1", Name: "code"}
-		ctx, err := agent.BuildExecutionContext(client, cfg, task, node, false)
+		ctx, err := agent.BuildExecutionContext(client, "ws-1", "agent-1", cfg, task, node, false)
 		if err != nil {
 			t.Fatalf("BuildExecutionContext: %v", err)
 		}

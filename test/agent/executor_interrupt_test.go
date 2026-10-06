@@ -13,22 +13,29 @@ import (
 func TestInterruptDoesNotReportManualIntervention(t *testing.T) {
 	t.Setenv("TEAMMATE_DISK_QUOTA_GB", "100")
 	cfg := &agent.Config{
-		Server:    agent.ServerConfig{URL: "http://127.0.0.1:1", APIToken: "fake-token"},
-		Agent:     agent.AgentInfo{ID: "agent-1", Name: "Agent One", Provider: "claude"},
-		Workspace: agent.WorkspaceConfig{ID: "ws-1", Root: t.TempDir()},
+		Server:    agent.ServerConfig{URL: "http://127.0.0.1:1"},
+		Agent:     agent.AgentInfo{Name: "Agent One", Provider: "claude"},
+		Workspace: agent.WorkspaceConfig{Root: t.TempDir()},
 		Git:       agent.GitConfig{BaseBranch: "master"},
 	}
 
-	client := agent.NewClient(cfg.Server.URL, cfg.Server.APIToken)
+	client := agent.NewClient(cfg.Server.URL, "td_fake_token")
 	observer := &recordingExecutionObserver{}
-	executor := agent.NewTaskExecutorWithObserver(cfg, client, "agent-1", observer)
+	executor := agent.NewTaskExecutorWithObserver(cfg, observer)
 	executor.SetToolFactoryForTest(func() agent.TestTool {
 		return &fakeToolAdapter{tool: newFakeTool("claude")}
 	})
 
 	node := agent.TaskNode{ID: "node-1", Name: "code", SortOrder: 1, NodeType: "standard"}
 
-	go executor.Execute(12, node, "project-1")
+	go executor.Execute(agent.RunContext{
+		Client:      client,
+		AgentID:     "agent-1",
+		WorkspaceID: "ws-1",
+		ProjectID:   "project-1",
+		TaskID:      12,
+		NodeID:      "node-1",
+	}, node)
 	executor.WaitRunningForTest(t)
 
 	if err := executor.Interrupt(12, "node-1"); err != nil {
