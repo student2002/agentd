@@ -24,7 +24,7 @@ var rootCmd = &cobra.Command{
 		if err != nil {
 			return fmt.Errorf("load config: %w", err)
 		}
-		// The local control frontend runs by default; generate its
+		// When the local control frontend is explicitly enabled, generate its
 		// credentials on first start so the supervisor sees them.
 		if err := cfg.EnsureLocalCredentials(resolvedConfigPath()); err != nil {
 			return err

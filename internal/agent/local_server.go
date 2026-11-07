@@ -45,9 +45,6 @@ type LocalServer struct {
 }
 
 func NewLocalServer(cfg LocalServerConfig) *LocalServer {
-	if cfg.BindAddr == "" {
-		cfg.BindAddr = "127.0.0.1:17380"
-	}
 	return &LocalServer{cfg: cfg}
 }
 
@@ -68,7 +65,8 @@ func (s *LocalServer) Handler() http.Handler {
 	mux.HandleFunc("/api/local/chat/logs/recent", s.getOnly(s.requireLocalToken(s.handleChatLogsRecent)))
 	mux.HandleFunc("/api/local/chat/logs/stream", s.getOnly(s.requireLocalToken(s.handleChatLogsStream)))
 	mux.HandleFunc("/api/local/connections", s.requireLocalToken(s.handleConnections))
-	mux.HandleFunc("/api/local/connections/{name}", s.deleteOnly(s.requireLocalToken(s.handleConnectionDelete)))
+	mux.HandleFunc("/api/local/connections/{name}", s.requireLocalToken(s.handleConnectionEntry))
+	mux.HandleFunc("/api/local/server", s.requireLocalToken(s.handleServer))
 	mux.HandleFunc("/api/local/memory/{persona}", s.requireLocalToken(s.handleInstanceMemory))
 
 	// Instance-level, addressed by (connection, name). The instance catalog
@@ -121,17 +119,6 @@ func (s *LocalServer) postOnly(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			w.Header().Set("Allow", http.MethodPost)
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		next(w, r)
-	}
-}
-
-func (s *LocalServer) deleteOnly(next http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodDelete {
-			w.Header().Set("Allow", http.MethodDelete)
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
@@ -295,6 +282,20 @@ func (s *LocalServer) handleConnections(w http.ResponseWriter, r *http.Request) 
 	}
 }
 
+// handleConnectionEntry serves the per-connection endpoints: DELETE removes
+// the connection, PUT replaces its daemon token (web-side rotate-token).
+func (s *LocalServer) handleConnectionEntry(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodDelete:
+		s.handleConnectionDelete(w, r)
+	case http.MethodPut:
+		s.handleConnectionTokenUpdate(w, r)
+	default:
+		w.Header().Set("Allow", http.MethodDelete+", "+http.MethodPut)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
 // handleConnectionDelete removes one workspace connection.
 func (s *LocalServer) handleConnectionDelete(w http.ResponseWriter, r *http.Request) {
 	registry, ok := s.requireRegistry(w)
@@ -306,6 +307,67 @@ func (s *LocalServer) handleConnectionDelete(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	writeLocalJSON(w, map[string]bool{"ok": true})
+}
+
+// handleConnectionTokenUpdate replaces one connection's daemon token in place
+// and returns the refreshed connection list.
+func (s *LocalServer) handleConnectionTokenUpdate(w http.ResponseWriter, r *http.Request) {
+	registry, ok := s.requireRegistry(w)
+	if !ok {
+		return
+	}
+	var req struct {
+		Token string `json:"token"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	if err := registry.UpdateConnectionToken(r.PathValue("name"), req.Token); err != nil {
+		writeRegistryError(w, err)
+		return
+	}
+	writeLocalJSON(w, struct {
+		Connections []ConnectionInfo `json:"connections"`
+	}{Connections: registry.Connections()})
+}
+
+// serverURLPayload is the GET result and PUT body of /api/local/server.
+type serverURLPayload struct {
+	URL string `json:"url"`
+}
+
+// handleServer serves GET (the server URL every connection dials) and PUT
+// (hot switch) for the local control page. Switching tears down every
+// workspace connection — tokens are only valid on the issuing server — and
+// persists the new URL.
+func (s *LocalServer) handleServer(w http.ResponseWriter, r *http.Request) {
+	registry, ok := s.requireRegistry(w)
+	if !ok {
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		writeLocalJSON(w, serverURLPayload{URL: registry.ServerURL()})
+	case http.MethodPut:
+		var req serverURLPayload
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		if err := registry.SetServerURL(req.URL); err != nil {
+			if errors.Is(err, ErrInvalidServerURL) {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		writeLocalJSON(w, serverURLPayload{URL: registry.ServerURL()})
+	default:
+		w.Header().Set("Allow", http.MethodGet+", "+http.MethodPut)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
 }
 
 // handleInstanceMemory serves the per-persona memory management for the

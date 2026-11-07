@@ -639,6 +639,10 @@ func writeDualWorkspaceConfig(t *testing.T, serverURL string) string {
 	content := strings.Join([]string{
 		"server:",
 		"  url: " + serverURL,
+		// Task execution creates {workspace_root}/{ws}/{agent}/{project}/{task}
+		// directories; without this line the default resolves to the real
+		// ~/.teammate/workspaces and the test writes into the developer's home.
+		"workspace_root: '" + t.TempDir() + "'",
 		"workspaces:",
 		"  - name: team-a",
 		"    token: td_team_a",
@@ -747,6 +751,219 @@ func TestSupervisorConnectionManagement(t *testing.T) {
 	}
 	if err := sup.RemoveConnection("team-a"); err == nil {
 		t.Fatal("expected unknown connection error")
+	}
+}
+
+// TestSupervisorUpdateConnectionToken proves the in-place token rotation: the
+// entry survives with its identities and its runtime pool, only the token on
+// disk changes.
+func TestSupervisorUpdateConnectionToken(t *testing.T) {
+	cfg := &agent.GlobalConfig{}
+	cfg.Server.URL = "http://127.0.0.1:1"
+	cfg.Local.Enabled = false
+	cfg.Workspaces = []agent.WorkspaceEntry{{
+		Name:  "team-a",
+		Token: "td_old",
+		Agents: []agent.WorkspaceAgent{
+			{Name: "claude-01", Provider: "claude", AgentID: "uuid-1"},
+		},
+	}}
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := agent.SaveGlobalConfig(cfg, path); err != nil {
+		t.Fatalf("save config: %v", err)
+	}
+
+	sup := agent.NewSupervisor(cfg, path, agent.SupervisorOptions{})
+	sup.EnsureRuntimeForTest("team-a", "claude-01")
+
+	if err := sup.UpdateConnectionToken("team-a", "td_rotated"); err != nil {
+		t.Fatalf("update token: %v", err)
+	}
+
+	// The rotated token is persisted; identities on the entry survive.
+	reloaded, err := agent.LoadGlobalConfig(path)
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	entry := reloaded.Workspace("team-a")
+	if entry == nil || entry.Token != "td_rotated" {
+		t.Fatalf("token not persisted: %+v", entry)
+	}
+	if len(entry.Agents) != 1 || entry.Agents[0].AgentID != "uuid-1" {
+		t.Fatalf("identities lost on rotation: %+v", entry.Agents)
+	}
+
+	// The runtime pool is untouched — registration rebinds it later.
+	if _, ok := sup.Runtime("team-a", "claude-01"); !ok {
+		t.Fatal("runtime pool must survive a token update")
+	}
+	conns := sup.Connections()
+	if len(conns) != 1 || conns[0].Name != "team-a" {
+		t.Fatalf("connection missing after update: %+v", conns)
+	}
+
+	if err := sup.UpdateConnectionToken("team-b", "td_x"); err == nil {
+		t.Fatal("expected unknown connection error")
+	}
+	if err := sup.UpdateConnectionToken("team-a", "nope"); err == nil {
+		t.Fatal("expected invalid token error")
+	}
+}
+
+// TestSupervisorUpdateConnectionTokenPersistFailure proves the rollback on a
+// failed config save: the in-memory token reverts to the old value and the
+// connection is rebuilt on the old credentials.
+func TestSupervisorUpdateConnectionTokenPersistFailure(t *testing.T) {
+	cfg := &agent.GlobalConfig{}
+	cfg.Server.URL = "http://127.0.0.1:1"
+	cfg.Local.Enabled = false
+	cfg.Workspaces = []agent.WorkspaceEntry{{
+		Name:  "team-a",
+		Token: "td_old",
+	}}
+	// A path that is itself a directory defeats both MkdirAll and WriteFile.
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.Mkdir(path, 0700); err != nil {
+		t.Fatalf("mkdir config path: %v", err)
+	}
+
+	sup := agent.NewSupervisor(cfg, path, agent.SupervisorOptions{})
+	err := sup.UpdateConnectionToken("team-a", "td_rotated")
+	if err == nil || !strings.Contains(err.Error(), "persist config") {
+		t.Fatalf("expected persist failure, got %v", err)
+	}
+
+	conns := sup.Connections()
+	if len(conns) != 1 || conns[0].Name != "team-a" {
+		t.Fatalf("connection must be rebuilt after a failed save: %+v", conns)
+	}
+	// maskDaemonToken("td_old") = "td_o…"; the rotated token would mask as
+	// "td_r…", so the masked form proves the in-memory rollback.
+	if conns[0].TokenMasked != "td_o…" {
+		t.Fatalf("in-memory token must roll back to the old value: %+v", conns[0])
+	}
+}
+
+// TestSupervisorRunConsoleOnlyWithoutServerURL proves the guided startup
+// path: with no server URL configured the daemon still runs (console-only,
+// no registration loops) and shuts down cleanly when the context is
+// cancelled.
+func TestSupervisorRunConsoleOnlyWithoutServerURL(t *testing.T) {
+	cfg := &agent.GlobalConfig{}
+	cfg.Server.URL = ""
+	cfg.Local.Enabled = false
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := agent.SaveGlobalConfig(cfg, path); err != nil {
+		t.Fatalf("save config: %v", err)
+	}
+
+	sup := agent.NewSupervisor(cfg, path, agent.SupervisorOptions{})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- sup.Run(ctx) }()
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("console-only run: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("supervisor did not shut down after context cancellation")
+	}
+}
+
+// TestSupervisorAddConnectionRequiresServerURL proves the guided-mode entry
+// check: while server.url is unset, adding a connection is rejected (an empty
+// BaseURL registration loop could never succeed); after the URL is set the
+// same add goes through.
+func TestSupervisorAddConnectionRequiresServerURL(t *testing.T) {
+	cfg := &agent.GlobalConfig{}
+	cfg.Server.URL = ""
+	cfg.Local.Enabled = false
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := agent.SaveGlobalConfig(cfg, path); err != nil {
+		t.Fatalf("save config: %v", err)
+	}
+
+	sup := agent.NewSupervisor(cfg, path, agent.SupervisorOptions{})
+	err := sup.AddConnection("team-a", "td_x")
+	if err == nil || !strings.Contains(err.Error(), "server.url") {
+		t.Fatalf("expected server.url guard error, got %v", err)
+	}
+
+	if err := sup.SetServerURL("http://127.0.0.1:9"); err != nil {
+		t.Fatalf("set server url: %v", err)
+	}
+	if err := sup.AddConnection("team-a", "td_x"); err != nil {
+		t.Fatalf("add connection after url set: %v", err)
+	}
+	if conns := sup.Connections(); len(conns) != 1 || conns[0].Name != "team-a" {
+		t.Fatalf("unexpected connections: %+v", conns)
+	}
+}
+
+// TestSupervisorSetServerURL proves the hot server switch: invalid URLs are
+// rejected without touching state, an unchanged URL is a no-op that keeps
+// every connection, and a real switch tears down all connections, clears the
+// persisted workspaces list (tokens and identities only live on the issuing
+// server) and persists the new URL.
+func TestSupervisorSetServerURL(t *testing.T) {
+	cfg := &agent.GlobalConfig{}
+	cfg.Server.URL = "http://127.0.0.1:1"
+	cfg.Local.Enabled = false
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := agent.SaveGlobalConfig(cfg, path); err != nil {
+		t.Fatalf("save config: %v", err)
+	}
+
+	sup := agent.NewSupervisor(cfg, path, agent.SupervisorOptions{})
+	for _, name := range []string{"team-a", "team-b"} {
+		if err := sup.AddConnection(name, "td_"+name); err != nil {
+			t.Fatalf("add connection %s: %v", name, err)
+		}
+	}
+
+	for _, bad := range []string{"", "not-a-url", "ftp://example.com", "http://"} {
+		if err := sup.SetServerURL(bad); err == nil {
+			t.Fatalf("expected invalid url error for %q", bad)
+		}
+	}
+	if got := sup.ServerURL(); got != "http://127.0.0.1:1" {
+		t.Fatalf("url changed by rejected switch: %q", got)
+	}
+	if conns := sup.Connections(); len(conns) != 2 {
+		t.Fatalf("connections changed by rejected switch: %+v", conns)
+	}
+
+	// An unchanged URL (after normalization) is a no-op: connections survive.
+	if err := sup.SetServerURL("http://127.0.0.1:1/"); err != nil {
+		t.Fatalf("no-op switch: %v", err)
+	}
+	if conns := sup.Connections(); len(conns) != 2 {
+		t.Fatalf("connections lost on no-op switch: %+v", conns)
+	}
+
+	if err := sup.SetServerURL("http://127.0.0.2:8080"); err != nil {
+		t.Fatalf("switch server url: %v", err)
+	}
+	if got := sup.ServerURL(); got != "http://127.0.0.2:8080" {
+		t.Fatalf("unexpected url after switch: %q", got)
+	}
+	if conns := sup.Connections(); len(conns) != 0 {
+		t.Fatalf("connections kept after switch: %+v", conns)
+	}
+	if agents := sup.Agents(); len(agents) != 0 {
+		t.Fatalf("runtimes kept after switch: %+v", agents)
+	}
+	reloaded, err := agent.LoadGlobalConfig(path)
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if reloaded.Server.URL != "http://127.0.0.2:8080" {
+		t.Fatalf("url not persisted: %q", reloaded.Server.URL)
+	}
+	if len(reloaded.Workspaces) != 0 {
+		t.Fatalf("workspaces not cleared: %+v", reloaded.Workspaces)
 	}
 }
 
@@ -902,6 +1119,7 @@ func writeRestartConfig(t *testing.T, serverURL string) string {
 	content := strings.Join([]string{
 		"server:",
 		"  url: " + serverURL,
+		"workspace_root: '" + t.TempDir() + "'",
 		"workspaces:",
 		"  - name: team-a",
 		"    token: td_team_a",
@@ -930,6 +1148,7 @@ func writeUninstalledProviderConfig(t *testing.T, serverURL string) string {
 	content := strings.Join([]string{
 		"server:",
 		"  url: " + serverURL,
+		"workspace_root: '" + t.TempDir() + "'",
 		"workspaces:",
 		"  - name: team-a",
 		"    token: td_team_a",

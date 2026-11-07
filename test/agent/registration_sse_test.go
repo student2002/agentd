@@ -327,3 +327,130 @@ func TestSupervisorRebuildsRuntimeOnPersonaChange(t *testing.T) {
 		t.Fatalf("rebuilt runtime must carry the new persona, got %q", after.PersonaKey())
 	}
 }
+
+// TestConnectionRunDiscardsInflightResultAfterStop proves the stop gate in
+// the registration loop: a Register call that was in flight when the token
+// was rotated away returns 401, and the stale connection must discard the
+// result instead of clearing the shared entry's identities.
+func TestConnectionRunDiscardsInflightResultAfterStop(t *testing.T) {
+	registered := make(chan struct{}, 1)
+	release := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/daemons/register" {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		registered <- struct{}{}
+		<-release
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer server.Close()
+
+	cfg := &agent.GlobalConfig{}
+	cfg.Server.URL = server.URL
+	entry := &agent.WorkspaceEntry{
+		Name:  "team-a",
+		Token: "td_rotated_away",
+		Agents: []agent.WorkspaceAgent{
+			{Name: "claude-01", Provider: "claude", AgentID: "uuid-1"},
+		},
+	}
+	hooks := agent.ConnectionHooks{
+		BuildReport: func() agent.RegisterDaemonReport { return agent.RegisterDaemonReport{} },
+		Runtime:     func(string) *agent.AgentRuntime { return nil },
+	}
+	conn := agent.NewWorkspaceConnection(cfg, entry, hooks)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		conn.Run(context.Background())
+	}()
+
+	select {
+	case <-registered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("registration call never arrived")
+	}
+	conn.Stop()
+	close(release)
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("run loop did not exit after stop")
+	}
+	if entry.Agent("claude-01").AgentID != "uuid-1" {
+		t.Fatalf("identity must survive a discarded stale registration: %+v", entry.Agents)
+	}
+}
+
+// TestConnectionHeartbeatDiscardsInflightRejectionAfterStop proves the stop
+// gate in the heartbeat rejection path: a beat that was in flight when the
+// token was rotated away returns 401, and the stopped connection must discard
+// it instead of clearing the shared entry's identities. The handler delays
+// its 401 past the caller's Stop, so the rejection always lands on an already
+// stopped connection (Stop closes stopCh synchronously before waiting for
+// the in-flight beat).
+func TestConnectionHeartbeatDiscardsInflightRejectionAfterStop(t *testing.T) {
+	beatArrived := make(chan struct{}, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/daemons/register":
+			_ = json.NewEncoder(w).Encode(agent.RegisterDaemonResponse{
+				DaemonID:          "daemon-1",
+				WorkspaceID:       "ws-1",
+				HeartbeatInterval: 1,
+				DesiredAgents: []agent.DesiredAgent{
+					{AgentID: "uuid-1", Name: "claude-01", Provider: "claude", PersonaKey: "claude-01"},
+				},
+			})
+		case "/api/daemons/heartbeat":
+			beatArrived <- struct{}{}
+			time.Sleep(300 * time.Millisecond)
+			w.WriteHeader(http.StatusUnauthorized)
+		default:
+			http.Error(w, "not found", http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	cfg := &agent.GlobalConfig{}
+	cfg.Server.URL = server.URL
+	entry := &agent.WorkspaceEntry{
+		Name:  "team-a",
+		Token: "td_rotated_away",
+		Agents: []agent.WorkspaceAgent{
+			{Name: "claude-01", Provider: "claude", AgentID: "uuid-1"},
+		},
+	}
+	hooks := agent.ConnectionHooks{
+		BuildReport:       func() agent.RegisterDaemonReport { return agent.RegisterDaemonReport{} },
+		ProviderInstalled: func(string) bool { return true },
+		Runtime:           func(string) *agent.AgentRuntime { return nil },
+		PersistConfig:     func() error { return nil },
+	}
+	conn := agent.NewWorkspaceConnection(cfg, entry, hooks)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		conn.Run(context.Background())
+	}()
+
+	select {
+	case <-beatArrived:
+	case <-time.After(5 * time.Second):
+		t.Fatal("heartbeat call never arrived")
+	}
+	// Stop closes stopCh first, then waits for the in-flight beat; the 401
+	// lands while the connection is already stopped.
+	conn.Stop()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("run loop did not exit after stop")
+	}
+	if entry.Agent("claude-01").AgentID != "uuid-1" {
+		t.Fatalf("identity must survive a discarded stale heartbeat rejection: %+v", entry.Agents)
+	}
+}

@@ -514,4 +514,109 @@ func TestLocalServerConnections(t *testing.T) {
 	if rec.Code != http.StatusConflict {
 		t.Fatalf("duplicate connection: expected 409, got %d", rec.Code)
 	}
+
+	// PUT replaces the token of an existing connection and returns the list.
+	rec = do(http.MethodPut, "/api/local/connections/team-a", `{"token":"td_rotated"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("update token: expected 200, got %d (%s)", rec.Code, rec.Body.String())
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&list); err != nil {
+		t.Fatalf("decode updated connections: %v", err)
+	}
+	if len(list.Connections) != 1 || list.Connections[0].Name != "team-a" || list.Connections[0].TokenMasked != "td_r…" {
+		t.Fatalf("token not updated: %+v", list.Connections)
+	}
+
+	// PUT on an unknown connection → 404; a non-td token → 400; POST on the
+	// entry path → 405 with Allow.
+	rec = do(http.MethodPut, "/api/local/connections/team-b", `{"token":"td_x"}`)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("update unknown connection: expected 404, got %d", rec.Code)
+	}
+	rec = do(http.MethodPut, "/api/local/connections/team-a", `{"token":"nope"}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("update with invalid token: expected 400, got %d", rec.Code)
+	}
+	rec = do(http.MethodPost, "/api/local/connections/team-a", "")
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("post on entry: expected 405, got %d", rec.Code)
+	}
+	if allow := rec.Header().Get("Allow"); !strings.Contains(allow, http.MethodPut) || !strings.Contains(allow, http.MethodDelete) {
+		t.Fatalf("expected Allow to list DELETE and PUT, got %q", allow)
+	}
+}
+
+func TestLocalServerServerURL(t *testing.T) {
+	registry := newFakeRegistry("team-a", "claude-01")
+	registry.serverURL = "http://127.0.0.1:1"
+	if err := registry.AddConnection("team-a", "td_x"); err != nil {
+		t.Fatalf("seed connection: %v", err)
+	}
+	server := newTestLocalServer(registry)
+
+	do := func(method, path, body, token string) *httptest.ResponseRecorder {
+		var reader io.Reader
+		if body != "" {
+			reader = strings.NewReader(body)
+		}
+		req := httptest.NewRequest(method, path, reader)
+		if token != "" {
+			req.Header.Set("Authorization", "Bearer "+token)
+		}
+		rec := httptest.NewRecorder()
+		server.Handler().ServeHTTP(rec, req)
+		return rec
+	}
+
+	// Both methods require the local token.
+	if rec := do(http.MethodGet, "/api/local/server", "", ""); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated GET: expected 401, got %d", rec.Code)
+	}
+	if rec := do(http.MethodPut, "/api/local/server", `{"url":"http://127.0.0.2:8080"}`, ""); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated PUT: expected 401, got %d", rec.Code)
+	}
+
+	rec := do(http.MethodGet, "/api/local/server", "", "lt_test")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET server url: expected 200, got %d (%s)", rec.Code, rec.Body.String())
+	}
+	var payload struct {
+		URL string `json:"url"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&payload); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if payload.URL != "http://127.0.0.1:1" {
+		t.Fatalf("unexpected url: %q", payload.URL)
+	}
+
+	// Invalid URLs map to 400 and change nothing.
+	rec = do(http.MethodPut, "/api/local/server", `{"url":"nope"}`, "lt_test")
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("invalid url: expected 400, got %d (%s)", rec.Code, rec.Body.String())
+	}
+	if got := registry.ServerURL(); got != "http://127.0.0.1:1" {
+		t.Fatalf("url changed by rejected switch: %q", got)
+	}
+
+	// A valid switch returns the normalized URL and clears the connections.
+	rec = do(http.MethodPut, "/api/local/server", `{"url":" http://127.0.0.2:8080/ "}`, "lt_test")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("switch: expected 200, got %d (%s)", rec.Code, rec.Body.String())
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&payload); err != nil {
+		t.Fatalf("decode switch result: %v", err)
+	}
+	if payload.URL != "http://127.0.0.2:8080" {
+		t.Fatalf("unexpected normalized url: %q", payload.URL)
+	}
+	if conns := registry.Connections(); len(conns) != 0 {
+		t.Fatalf("connections kept after switch: %+v", conns)
+	}
+
+	// Unsupported methods are rejected.
+	rec = do(http.MethodPost, "/api/local/server", `{}`, "lt_test")
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("POST server url: expected 405, got %d", rec.Code)
+	}
 }

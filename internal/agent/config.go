@@ -14,8 +14,10 @@ package agent
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -182,6 +184,15 @@ func LoadGlobalConfig(path string) (*GlobalConfig, error) {
 			return nil, fmt.Errorf("parse config: %w", err)
 		}
 	}
+	// The console opt-in is explicit: a present-but-non-boolean enabled value
+	// (e.g. YAML 1.1 "yes") is a config error, not a silent opt-out.
+	if local, ok := raw["local"].(map[string]interface{}); ok {
+		if v, exists := local["enabled"]; exists && v != nil {
+			if _, isBool := v.(bool); !isBool {
+				return nil, fmt.Errorf("local.enabled must be true or false, got %v", v)
+			}
+		}
+	}
 
 	cfg := globalConfigFromRaw(raw)
 	applyGlobalConfigDefaults(cfg)
@@ -214,9 +225,8 @@ func globalConfigFromRaw(raw map[string]interface{}) *GlobalConfig {
 	cfg.Git.BaseBranch = stringValue(git, "base_branch")
 
 	local := mapValue(raw, "local")
-	// The local control frontend is on by default; the local section only
-	// needs to appear in the config to disable it or override the defaults.
-	cfg.Local.Enabled = true
+	// The local control frontend is opt-in: it runs only when the config says
+	// enabled: true explicitly.
 	if v, ok := local["enabled"].(bool); ok {
 		cfg.Local.Enabled = v
 	}
@@ -277,27 +287,6 @@ func applyGlobalConfigDefaults(cfg *GlobalConfig) {
 		cfg.WorkspaceRoot = DefaultWorkspaceRoot()
 	} else {
 		cfg.WorkspaceRoot = expandHome(cfg.WorkspaceRoot)
-	}
-	if cfg.Tools.Claude.Path == "" {
-		cfg.Tools.Claude.Path = "claude"
-	}
-	if cfg.Tools.OpenClaw.Path == "" {
-		cfg.Tools.OpenClaw.Path = "openclaw"
-	}
-	if cfg.Tools.OpenCode.Path == "" {
-		cfg.Tools.OpenCode.Path = "opencode"
-	}
-	if cfg.Tools.AtomCode.Path == "" {
-		cfg.Tools.AtomCode.Path = "atomcode"
-	}
-	if cfg.Tools.MiMoCode.Path == "" {
-		cfg.Tools.MiMoCode.Path = "mimocode"
-	}
-	if cfg.Git.BaseBranch == "" {
-		cfg.Git.BaseBranch = "master"
-	}
-	if cfg.Local.BindAddr == "" {
-		cfg.Local.BindAddr = "127.0.0.1:17380"
 	}
 	for i := range cfg.Workspaces {
 		cfg.Workspaces[i].Name = strings.TrimSpace(cfg.Workspaces[i].Name)
@@ -374,11 +363,19 @@ func (g *GlobalConfig) viewForAgent(entry *WorkspaceEntry, a WorkspaceAgent) *Co
 	}
 }
 
-// ValidateGlobalConfig validates the required config needed to start the
-// daemon.
+// ValidateGlobalConfig validates the config needed to start the daemon. An
+// empty server.url is allowed: the daemon then runs console-only until the
+// URL is set (config set or the local console). Zero workspaces is allowed:
+// connections can be added at runtime through the local console.
 func ValidateGlobalConfig(cfg *GlobalConfig) error {
-	if len(cfg.Workspaces) == 0 {
-		return fmt.Errorf("at least one workspace entry is required; run 'teammate-agentd workspace add <td_token> --name <alias>'")
+	if cfg.Server.URL != "" {
+		normalized, err := NormalizeServerURL(cfg.Server.URL)
+		if err != nil {
+			return fmt.Errorf("server.url: %w", err)
+		}
+		// Connections dial this value verbatim; keep the canonical form so a
+		// trailing slash or stray whitespace does not reach the client.
+		cfg.Server.URL = normalized
 	}
 	// A connection's agents list may be empty: a fresh machine starts with no
 	// delivered instances and materializes them from desired delivery after
@@ -412,6 +409,9 @@ func ValidateGlobalConfig(cfg *GlobalConfig) error {
 	if cfg.Local.Enabled {
 		// local_token / instance_id are generated at startup when unset
 		// (EnsureLocalCredentials); only the bind address is validated here.
+		if cfg.Local.BindAddr == "" {
+			return fmt.Errorf("local.bind_addr is required when local.enabled=true; run 'teammate-agentd config set local.bind_addr 127.0.0.1:17380'")
+		}
 		if err := ValidateLoopbackBindAddr(cfg.Local.BindAddr); err != nil {
 			return err
 		}
@@ -451,6 +451,25 @@ func (g *GlobalConfig) EnsureLocalCredentials(path string) error {
 	}
 	log.Printf("[agentd] generated local control credentials (local.local_token / local.instance_id) and persisted them to %s", path)
 	return nil
+}
+
+// ErrInvalidServerURL marks server URL values rejected by validation.
+var ErrInvalidServerURL = errors.New("invalid server url")
+
+// NormalizeServerURL validates and canonicalizes a teammate server URL: the
+// scheme must be http/https, the host must be non-empty, surrounding
+// whitespace and a trailing slash are trimmed. Every workspace connection
+// client dials this value verbatim.
+func NormalizeServerURL(raw string) (string, error) {
+	trimmed := strings.TrimRight(strings.TrimSpace(raw), "/")
+	parsed, err := url.Parse(trimmed)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return "", fmt.Errorf("%w: %q (expected http(s)://host[:port])", ErrInvalidServerURL, raw)
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return "", fmt.Errorf("%w: %q (scheme must be http or https)", ErrInvalidServerURL, raw)
+	}
+	return trimmed, nil
 }
 
 // SaveGlobalConfig writes the daemon config to a file as sparse YAML.
@@ -518,28 +537,24 @@ func sparseGlobalConfigMap(cfg *GlobalConfig) map[string]interface{} {
 	addString(out, "workspace_root", cfg.WorkspaceRoot)
 
 	tools := make(map[string]interface{})
-	addTool(tools, "claude", cfg.Tools.Claude, "claude", true)
-	addTool(tools, "openclaw", cfg.Tools.OpenClaw, "openclaw", false)
-	addTool(tools, "opencode", cfg.Tools.OpenCode, "opencode", false)
-	addTool(tools, "atomcode", cfg.Tools.AtomCode, "atomcode", false)
-	addTool(tools, "mimocode", cfg.Tools.MiMoCode, "mimocode", false)
+	addTool(tools, "claude", cfg.Tools.Claude)
+	addTool(tools, "openclaw", cfg.Tools.OpenClaw)
+	addTool(tools, "opencode", cfg.Tools.OpenCode)
+	addTool(tools, "atomcode", cfg.Tools.AtomCode)
+	addTool(tools, "mimocode", cfg.Tools.MiMoCode)
 	addMap(out, "tools", tools)
 
 	git := make(map[string]interface{})
-	if cfg.Git.BaseBranch != "" && cfg.Git.BaseBranch != "master" {
-		git["base_branch"] = cfg.Git.BaseBranch
-	}
+	addString(git, "base_branch", cfg.Git.BaseBranch)
 	addMap(out, "git", git)
 
 	local := make(map[string]interface{})
-	// enabled defaults to true when absent, so only an explicit opt-out is
-	// meaningful on disk.
-	if !cfg.Local.Enabled {
-		local["enabled"] = false
+	// The local control frontend is opt-in: enabled must be written when true
+	// so a save/load round-trip never loses the explicit choice.
+	if cfg.Local.Enabled {
+		local["enabled"] = true
 	}
-	if cfg.Local.BindAddr != "" && cfg.Local.BindAddr != "127.0.0.1:17380" {
-		local["bind_addr"] = cfg.Local.BindAddr
-	}
+	addString(local, "bind_addr", cfg.Local.BindAddr)
 	addString(local, "local_token", cfg.Local.LocalToken)
 	addString(local, "instance_id", cfg.Local.InstanceID)
 	addMap(out, "local", local)
@@ -584,11 +599,8 @@ func boolValue(raw map[string]interface{}, key string) bool {
 	return ok && value
 }
 
-func addTool(parent map[string]interface{}, name string, tool ToolConfig, defaultPath string, includeDefault bool) {
+func addTool(parent map[string]interface{}, name string, tool ToolConfig) {
 	if tool.Path == "" {
-		return
-	}
-	if tool.Path == defaultPath && !includeDefault {
 		return
 	}
 	toolMap := make(map[string]interface{})

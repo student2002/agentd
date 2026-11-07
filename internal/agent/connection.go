@@ -237,6 +237,15 @@ func (c *WorkspaceConnection) TriggerRegister() {
 func (c *WorkspaceConnection) Run(ctx context.Context) {
 	for {
 		resp, err := c.registrar.Register(ctx)
+		// Discard a result that lands after Stop: an in-flight call may
+		// return 401 with a rotated-away token, and that must not be treated
+		// as a revoked daemon against the entry the replacement connection
+		// now owns.
+		select {
+		case <-c.stopCh:
+			return
+		default:
+		}
 		if err != nil {
 			// A 401/404 on registration means the daemon credentials were
 			// revoked or the daemon deleted server-side; retrying every 30s
@@ -480,6 +489,14 @@ func (c *WorkspaceConnection) startHeartbeat(intervalSecs int) {
 		},
 		OnError: func(err error) {
 			if IsNotFound(err) || IsUnauthorized(err) {
+				// Same gate as the registration loop: a beat in flight when
+				// the token was rotated away returns 401, and a stopped
+				// connection must not tear down the shared entry.
+				select {
+				case <-c.stopCh:
+					return
+				default:
+				}
 				c.onDaemonDeleted()
 				return
 			}

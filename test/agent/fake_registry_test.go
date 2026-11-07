@@ -16,6 +16,7 @@ type fakeRegistry struct {
 	order       [][2]string
 	failNext    error
 	connections []agent.ConnectionInfo
+	serverURL   string
 }
 
 func newFakeRegistry(conn string, names ...string) *fakeRegistry {
@@ -113,5 +114,44 @@ func (f *fakeRegistry) RemoveConnection(name string) error {
 		return fmt.Errorf("workspace %q not found", name)
 	}
 	f.connections = kept
+	return nil
+}
+
+func (f *fakeRegistry) UpdateConnectionToken(name, token string) error {
+	if !strings.HasPrefix(token, "td_") {
+		return fmt.Errorf("daemon token must carry the td_ prefix from the web UI")
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.failNext != nil {
+		return f.failNext
+	}
+	for i := range f.connections {
+		if f.connections[i].Name == name {
+			f.connections[i].TokenMasked = token[:4] + "…"
+			return nil
+		}
+	}
+	return fmt.Errorf("workspace %q not found", name)
+}
+
+func (f *fakeRegistry) ServerURL() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.serverURL
+}
+
+func (f *fakeRegistry) SetServerURL(raw string) error {
+	normalized, err := agent.NormalizeServerURL(raw)
+	if err != nil {
+		return err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.serverURL == normalized {
+		return nil
+	}
+	f.serverURL = normalized
+	f.connections = nil
 	return nil
 }

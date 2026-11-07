@@ -12,7 +12,6 @@
 const i18n = {
   en: {
     "title": "Teammate Agent Console",
-    "subtitle": "Local console — operations affect only this agentd instance; the server stays unaware (node remains in_progress).",
     "runtime": "Runtime",
     "agent": "Agent",
     "execution": "Execution",
@@ -68,12 +67,18 @@ const i18n = {
     "server-card": "Server & Workspaces",
     "server-url": "Server URL",
     "server-url-ph": "http://127.0.0.1:8080",
+    "server-url-edit": "Switch",
+    "server-url-save": "Save",
+    "server-url-cancel": "Cancel",
+    "server-url-warning": "Switching disconnects and removes all {n} workspace connection(s); tokens from the old server are invalid on the new one. Re-add connections after switching.",
     "connection-add-label": "Add workspace connection",
     "connection-name-ph": "alias (e.g. team-a)",
     "connection-token-ph": "td_… — daemon token from that workspace's web UI",
     "connection-add": "Add",
     "connection-hint": "Each connection registers with its own token; instances created in that workspace's web UI are materialized here on delivery.",
     "connection-remove": "Remove",
+    "connection-update": "Update token",
+    "connection-update-prompt": "Paste the new td_ daemon token for connection \"{name}\" (from that workspace's web UI after rotating it):",
     "no-connections": "No workspace connections configured. Paste a td_ token above to connect this machine to a workspace.",
     "confirm-remove-connection": "Remove workspace connection",
     "conn-registered": "registered",
@@ -135,7 +140,6 @@ const i18n = {
   },
   zh: {
     "title": "Teammate 代理控制台",
-    "subtitle": "本地控制台 — 操作仅作用于本机 agentd，服务器保持无感（节点保持 in_progress）。",
     "runtime": "运行时",
     "agent": "代理",
     "execution": "执行",
@@ -191,12 +195,18 @@ const i18n = {
     "server-card": "服务与空间",
     "server-url": "服务地址",
     "server-url-ph": "http://127.0.0.1:8080",
+    "server-url-edit": "切换",
+    "server-url-save": "保存",
+    "server-url-cancel": "取消",
+    "server-url-warning": "切换将断开并删除全部 {n} 条空间连接；旧服务端发放的 token 在新服务端无效，切换后需重新添加连接。",
     "connection-add-label": "添加空间连接",
     "connection-name-ph": "别名（如 team-a）",
     "connection-token-ph": "td_… — 该空间 web UI 签发的守护令牌",
     "connection-add": "添加",
     "connection-hint": "每条连接使用各自的令牌注册；该空间 web UI 创建的实例经下发自动物化到本机。",
     "connection-remove": "删除",
+    "connection-update": "更新令牌",
+    "connection-update-prompt": "粘贴连接「{name}」新的 td_ 守护令牌（在该空间 web UI 轮换令牌后获得）：",
     "no-connections": "尚未配置任何空间连接。粘贴 td_ 令牌即可把本机接入一个空间。",
     "confirm-remove-connection": "删除空间连接",
     "conn-registered": "已注册",
@@ -678,6 +688,7 @@ function restorePersistedAgent() {
 // ---------- workspace connections ----------
 
 let connections = [];
+let serverURL = "";
 
 function shortID(id) {
   return id && id.length > 8 ? id.slice(0, 8) : (id || "");
@@ -692,8 +703,10 @@ function renderConnections() {
   }
   const card = $("server-card");
   if (card) card.classList.toggle("attention", connections.length > 0 && registered === 0);
-  const urlRow = $("server-url-row");
-  if (urlRow) urlRow.textContent = connections.length ? (connections[0].server_url || "—") : "—";
+  const urlText = $("server-url-text");
+  if (urlText) urlText.textContent = serverURL || "—";
+  const warning = $("server-url-warning");
+  if (warning) warning.textContent = t("server-url-warning").replace("{n}", connections.length);
 
   const list = $("connections-list");
   if (!list) return;
@@ -749,6 +762,12 @@ function renderConnections() {
     focus.title = t("workspace-focus");
     focus.onclick = () => switchWorkspace(currentWorkspace === conn.name ? "" : conn.name);
     row.appendChild(focus);
+
+    const update = document.createElement("button");
+    update.className = "btn btn-sm";
+    update.textContent = t("connection-update");
+    update.onclick = () => updateConnectionToken(conn.name);
+    row.appendChild(update);
 
     const remove = document.createElement("button");
     remove.className = "btn btn-warn btn-sm";
@@ -818,6 +837,47 @@ async function refreshConnections() {
   } catch { /* surfaced by the health dot */ }
 }
 
+// ---------- server url (hot switch) ----------
+
+async function refreshServerURL() {
+  try {
+    const res = await fetch("/api/local/server", { headers });
+    if (res.status === 401) { showGate(); return; }
+    if (!res.ok) return;
+    const payload = await res.json();
+    serverURL = payload.url || "";
+    const urlText = $("server-url-text");
+    if (urlText) urlText.textContent = serverURL || "—";
+  } catch { /* surfaced by the health dot */ }
+}
+
+function openServerURLEdit() {
+  $("server-url-edit-box").hidden = false;
+  $("server-url-warning").hidden = false;
+  $("server-url-edit").disabled = true;
+  const input = $("server-url-input");
+  input.value = serverURL;
+  input.focus();
+}
+
+function closeServerURLEdit() {
+  $("server-url-edit-box").hidden = true;
+  $("server-url-warning").hidden = true;
+  $("server-url-edit").disabled = false;
+}
+
+async function saveServerURL() {
+  const url = $("server-url-input").value.trim();
+  if (!url) return;
+  const r = await put("/api/local/server", { url });
+  if (!r.ok) { alert(t("agent-op-failed") + (r.text || r.json?.error || r.status)); return; }
+  closeServerURLEdit();
+  // Every connection was torn down server-side of the API; refresh all lists.
+  await refreshServerURL();
+  await refreshConnections();
+  await refreshAgents();
+}
+
 async function addConnection() {
   const tokenVal = $("connection-add-token").value.trim();
   if (!tokenVal) return;
@@ -831,6 +891,19 @@ async function addConnection() {
   $("connection-add-name").value = "";
   $("connection-add-token").value = "";
   // Registration runs in the background; refresh the status shortly after.
+  setTimeout(refreshConnections, 3000);
+}
+
+async function updateConnectionToken(name) {
+  const val = prompt(t("connection-update-prompt").replace("{name}", name), "");
+  if (val === null) return;
+  const tokenVal = val.trim();
+  if (!tokenVal) return;
+  const r = await put("/api/local/connections/" + encodeURIComponent(name), { token: tokenVal });
+  if (!r.ok) { alert(t("agent-op-failed") + (r.text || r.json?.error || r.status)); return; }
+  connections = r.json.connections || connections;
+  renderConnections();
+  // Re-registration runs in the background; refresh the status shortly after.
   setTimeout(refreshConnections, 3000);
 }
 
@@ -970,6 +1043,7 @@ applyView(localStorage.getItem("teammate_view") === "chat" ? "chat" : "console")
 
 resetLogs();
 refreshAgents().then(() => { restorePersistedAgent(); refreshSnapshot(); streamLogs(); });
+refreshServerURL();
 refreshConnections();
 setInterval(refreshSnapshot, 3000);
 setInterval(refreshAgents, 10000);
@@ -977,3 +1051,7 @@ setInterval(refreshConnections, 10000);
 $("connection-add").onclick = addConnection;
 $("connection-add-token").addEventListener("keydown", (e) => { if (e.key === "Enter") addConnection(); });
 $("connection-add-name").addEventListener("keydown", (e) => { if (e.key === "Enter") addConnection(); });
+$("server-url-edit").onclick = openServerURLEdit;
+$("server-url-save").onclick = saveServerURL;
+$("server-url-cancel").onclick = closeServerURLEdit;
+$("server-url-input").addEventListener("keydown", (e) => { if (e.key === "Enter") saveServerURL(); });

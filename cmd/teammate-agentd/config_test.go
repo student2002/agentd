@@ -22,12 +22,13 @@ func TestSaveDefaultConfigWritesSparseYAML(t *testing.T) {
 	}
 	got := string(data)
 	for _, unwanted := range []string{
-		"local:",
+		"server:",
+		"claude:",
 		"openclaw:",
 		"opencode:",
 		"atomcode:",
 		"mimocode:",
-		"base_branch: master",
+		"base_branch:",
 		"max_concurrent_executions",
 		"path: \"\"",
 		"agents:",
@@ -38,7 +39,7 @@ func TestSaveDefaultConfigWritesSparseYAML(t *testing.T) {
 			t.Fatalf("default config wrote unwanted %q into sparse YAML:\n%s", unwanted, got)
 		}
 	}
-	for _, want := range []string{"url: http://127.0.0.1:8080", "workspace_root:", "claude:", "path: claude"} {
+	for _, want := range []string{"workspace_root:", "local:", "enabled: true", "bind_addr: 127.0.0.1:17380"} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("default config missing %q, got:\n%s", want, got)
 		}
@@ -51,12 +52,23 @@ func TestConfigLocalEnableGeneratesLocalBindingCredentials(t *testing.T) {
 		t.Fatalf("save config: %v", err)
 	}
 
-	before, err := os.ReadFile(path)
+	// init enables the local console explicitly; disable must turn it off.
+	initial, err := agent.LoadGlobalConfig(path)
 	if err != nil {
-		t.Fatalf("read config before enable: %v", err)
+		t.Fatalf("load initial config: %v", err)
 	}
-	if strings.Contains(string(before), "local:") {
-		t.Fatalf("default config should not enable local API:\n%s", string(before))
+	if !initial.Local.Enabled {
+		t.Fatal("init default should enable the local API explicitly")
+	}
+	if err := disableLocalAPIAtPath(path); err != nil {
+		t.Fatalf("disable local API: %v", err)
+	}
+	disabled, err := agent.LoadGlobalConfig(path)
+	if err != nil {
+		t.Fatalf("load disabled config: %v", err)
+	}
+	if disabled.Local.Enabled {
+		t.Fatal("expected local API to be disabled")
 	}
 
 	if err := enableLocalAPIAtPath(path); err != nil {

@@ -690,6 +690,12 @@ func (e *TaskExecutor) initGitWorkspace(run *RunContext, workDir string, taskID 
 	}
 
 	baseBranch := e.cfg.Git.BaseBranch
+	if baseBranch == "" {
+		e.git.CleanupCredential()
+		// A missing config is not an optional-repo condition: fail loudly
+		// instead of degrading to running the task without a repository.
+		return false, fmt.Errorf("git.base_branch is not configured; run 'teammate-agentd config set git.base_branch <branch>'")
+	}
 	if err := e.git.Clone(repoURL, baseBranch); err != nil {
 		e.git.CleanupCredential()
 		// required was promoted above based on cred; a clone failure is always treated as a
@@ -727,6 +733,12 @@ func (e *TaskExecutor) initGitWorkspace(run *RunContext, workDir string, taskID 
 //   - bool: whether the setup succeeded
 func (e *TaskExecutor) setupExistingRepo(taskID int32, required bool) (bool, error) {
 	baseBranch := e.cfg.Git.BaseBranch
+	if baseBranch == "" {
+		e.git.CleanupCredential()
+		// A missing config is not an optional-repo condition: fail loudly
+		// instead of degrading to running the task without a repository.
+		return false, fmt.Errorf("git.base_branch is not configured; run 'teammate-agentd config set git.base_branch <branch>'")
+	}
 	if err := e.git.FetchAndCheckout(taskID, baseBranch); err != nil {
 		if required {
 			return false, fmt.Errorf("fetch/checkout required git repository: %w", err)

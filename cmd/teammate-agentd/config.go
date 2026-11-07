@@ -17,6 +17,7 @@ import (
 var (
 	forceOverwrite    bool
 	showConfigSecrets bool
+	noInput           bool
 )
 
 var configCmd = &cobra.Command{
@@ -55,20 +56,29 @@ var configInitCmd = &cobra.Command{
 			}
 		}
 
+		// Interactive wizard on a TTY; skeleton config otherwise (scripts,
+		// containers, redirects, --no-input).
+		if !noInput && interactiveTerminal() {
+			return runInitWizard(path)
+		}
+
 		cfg := defaultGlobalConfig()
 		if err := agent.SaveGlobalConfig(cfg, path); err != nil {
 			return fmt.Errorf("save agentd config: %w", err)
 		}
 		fmt.Println("Agent daemon config initialized at", path)
 		fmt.Println()
-		fmt.Println("Required before running teammate-agentd:")
-		fmt.Println("  teammate-agentd workspace add <td_...> --name team-a   # One entry per workspace (daemon token from that workspace's web UI)")
+		fmt.Println("Required before the daemon can work (it starts console-only until then):")
+		fmt.Println("  teammate-agentd config set server.url <http://your-server:8080>")
+		fmt.Println("  teammate-agentd config set git.base_branch <main|master>")
+		fmt.Println("  teammate-agentd config set tools.<provider>.path <cli>   # e.g. tools.claude.path claude — one per coding tool you use")
+		fmt.Println("  teammate-agentd workspace add <td_...> --name team-a    # daemon token from that workspace's web UI (or add it in the console)")
 		fmt.Println()
 		fmt.Println("Agent instances are created in the workspace web UI (daemon group); agentd materializes them on delivery after registering.")
 		fmt.Println()
 		fmt.Println("workspace_id / daemon_id are adopted from the server after registration — never hand-edit them.")
 		fmt.Println()
-		fmt.Println("The local control API + console runs by default:")
+		fmt.Println("The local control API + console is enabled by this init (local.enabled=true, 127.0.0.1:17380):")
 		fmt.Println("  teammate-agentd config local disable                   # Turn it off")
 		fmt.Println("  teammate-agentd config local enable                    # Turn it back on")
 		return nil
@@ -175,7 +185,9 @@ var configLocalDisableCmd = &cobra.Command{
 
 func init() {
 	configInitCmd.Flags().BoolVar(&forceOverwrite, "force", false, "overwrite existing config file")
+	configInitCmd.Flags().BoolVar(&noInput, "no-input", false, "skip the interactive wizard and write the skeleton config")
 	daemonInitCmd.Flags().BoolVar(&forceOverwrite, "force", false, "overwrite existing config file")
+	daemonInitCmd.Flags().BoolVar(&noInput, "no-input", false, "skip the interactive wizard and write the skeleton config")
 	configListCmd.Flags().BoolVar(&showConfigSecrets, "show-secrets", false, "show full tokens in json/yaml output")
 	configCmd.AddCommand(configInitCmd)
 	configCmd.AddCommand(configPathCmd)
@@ -190,9 +202,7 @@ func init() {
 
 func defaultGlobalConfig() *agent.GlobalConfig {
 	cfg := &agent.GlobalConfig{}
-	cfg.Server.URL = "http://127.0.0.1:8080"
 	cfg.WorkspaceRoot = agent.DefaultWorkspaceRoot()
-	cfg.Tools.Claude.Path = "claude"
 	cfg.Local.Enabled = true
 	cfg.Local.BindAddr = "127.0.0.1:17380"
 	return cfg

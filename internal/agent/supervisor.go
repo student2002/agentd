@@ -91,6 +91,9 @@ type RuntimeRegistry interface {
 	Connections() []ConnectionInfo
 	AddConnection(name, token string) error
 	RemoveConnection(name string) error
+	UpdateConnectionToken(name, token string) error
+	ServerURL() string
+	SetServerURL(url string) error
 }
 
 // Supervisor manages the full machine lifecycle: connections, the instance
@@ -366,14 +369,21 @@ func (s *Supervisor) Run(ctx context.Context) error {
 		return err
 	}
 
-	// One registration loop per workspace connection.
-	for _, conn := range s.startConnectionLoops() {
-		conn := conn
-		s.wg.Add(1)
-		go func() {
-			defer s.wg.Done()
-			conn.Run(ctx)
-		}()
+	// Console-only guided mode: without a server URL there is nothing to
+	// register against; the daemon idles until the URL is set (config set or
+	// the local console) and connections are added.
+	if s.cfg.Server.URL == "" {
+		log.Printf("[supervisor] server.url is not configured; running console-only — set it with 'teammate-agentd config set server.url <url>' or the local console, then add workspace connections")
+	} else {
+		// One registration loop per workspace connection.
+		for _, conn := range s.startConnectionLoops() {
+			conn := conn
+			s.wg.Add(1)
+			go func() {
+				defer s.wg.Done()
+				conn.Run(ctx)
+			}()
+		}
 	}
 
 	// Tool re-probe loop: stopped by the daemon stop channel.
@@ -672,6 +682,9 @@ func (s *Supervisor) Connections() []ConnectionInfo {
 // derived from the token. A connection is name + token only — its instances
 // arrive through desired delivery.
 func (s *Supervisor) AddConnection(name, token string) error {
+	if s.ServerURL() == "" {
+		return fmt.Errorf("server.url is not configured; set it first (teammate-agentd config set server.url <url> or the local console) before adding workspace connections")
+	}
 	token = trimSpace(token)
 	if !strings.HasPrefix(token, "td_") {
 		return fmt.Errorf("daemon token must carry the td_ prefix from the web UI")
@@ -697,18 +710,25 @@ func (s *Supervisor) AddConnection(name, token string) error {
 	s.cfgMu.Unlock()
 
 	s.ensureConnections()
-	if s.runCtx != nil {
-		for _, conn := range s.startConnectionLoops() {
-			conn := conn
-			s.wg.Add(1)
-			go func() {
-				defer s.wg.Done()
-				conn.Run(s.runCtx)
-			}()
-		}
-	}
+	s.startNewConnectionLoops()
 	log.Printf("[supervisor] workspace connection %q added; registering", name)
 	return nil
+}
+
+// startNewConnectionLoops launches the registration loop of every configured
+// connection that is not running yet; no-op before Run.
+func (s *Supervisor) startNewConnectionLoops() {
+	if s.runCtx == nil {
+		return
+	}
+	for _, conn := range s.startConnectionLoops() {
+		conn := conn
+		s.wg.Add(1)
+		go func() {
+			defer s.wg.Done()
+			conn.Run(s.runCtx)
+		}()
+	}
 }
 
 // RemoveConnection stops the connection (SSE, heartbeat, identities) and
@@ -768,6 +788,121 @@ func (s *Supervisor) connectionByName(name string) *WorkspaceConnection {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.conns[name]
+}
+
+// UpdateConnectionToken swaps the daemon token of one workspace connection in
+// place (web-side rotate-token). The server keeps the daemon row and its
+// delivered instances across a rotation, so the entry keeps its identities
+// and the runtime pool is untouched: only the connection stack is torn down
+// and rebuilt with the new token, and registration re-binds everything.
+func (s *Supervisor) UpdateConnectionToken(name, token string) error {
+	if s.ServerURL() == "" {
+		return fmt.Errorf("server.url is not configured; set it first (teammate-agentd config set server.url <url> or the local console) before updating a connection token")
+	}
+	token = trimSpace(token)
+	if !strings.HasPrefix(token, "td_") {
+		return fmt.Errorf("daemon token must carry the td_ prefix from the web UI")
+	}
+
+	s.mu.Lock()
+	conn := s.conns[name]
+	delete(s.conns, name)
+	s.mu.Unlock()
+	if conn != nil {
+		conn.Stop()
+	}
+
+	s.cfgMu.Lock()
+	entry := s.cfg.Workspace(name)
+	if entry == nil {
+		s.cfgMu.Unlock()
+		return fmt.Errorf("workspace %q not found", name)
+	}
+	previous := entry.Token
+	entry.Token = token
+	if err := SaveGlobalConfig(s.cfg, s.cfgPath); err != nil {
+		// The old token is still the persisted one; restore it and bring the
+		// connection back on the old credentials rather than leaving it down.
+		entry.Token = previous
+		s.cfgMu.Unlock()
+		s.ensureConnections()
+		s.startNewConnectionLoops()
+		return fmt.Errorf("persist config: %w", err)
+	}
+	s.cfgMu.Unlock()
+
+	s.ensureConnections()
+	s.startNewConnectionLoops()
+	log.Printf("[supervisor] workspace connection %q token updated; registering", name)
+	return nil
+}
+
+// ServerURL returns the server URL every workspace connection dials.
+func (s *Supervisor) ServerURL() string {
+	s.cfgMu.Lock()
+	defer s.cfgMu.Unlock()
+	return s.cfg.Server.URL
+}
+
+// SetServerURL switches the daemon to a different teammate server. Tokens and
+// workspace/daemon identities are only valid on the server that issued them,
+// so every connection is torn down and the workspaces list cleared; the new
+// URL is persisted and the daemon idles until connections are re-added
+// against the new server. An unchanged URL is a no-op. The old server marks
+// the daemon offline through its own heartbeat timeout — no deregister is
+// attempted against a server the daemon is leaving.
+func (s *Supervisor) SetServerURL(raw string) error {
+	normalized, err := NormalizeServerURL(raw)
+	if err != nil {
+		return err
+	}
+
+	s.cfgMu.Lock()
+	unchanged := s.cfg.Server.URL == normalized
+	s.cfgMu.Unlock()
+	if unchanged {
+		return nil
+	}
+
+	// Same teardown semantics as RemoveConnection, batched over every
+	// connection: stop SSE/heartbeat and watchers; in-flight executions keep
+	// running to completion on their own.
+	s.mu.Lock()
+	conns := make([]*WorkspaceConnection, 0, len(s.conns))
+	for name, conn := range s.conns {
+		conns = append(conns, conn)
+		delete(s.conns, name)
+	}
+	removed := make([]*AgentRuntime, 0, len(s.runtimes))
+	for key, rt := range s.runtimes {
+		removed = append(removed, rt)
+		delete(s.runtimes, key)
+	}
+	s.mu.Unlock()
+	for _, conn := range conns {
+		conn.Stop()
+	}
+	for _, rt := range removed {
+		rt.StopWatchers()
+	}
+
+	s.cfgMu.Lock()
+	previousURL := s.cfg.Server.URL
+	previousWorkspaces := s.cfg.Workspaces
+	s.cfg.Server.URL = normalized
+	s.cfg.Workspaces = nil
+	if err := SaveGlobalConfig(s.cfg, s.cfgPath); err != nil {
+		s.cfg.Server.URL = previousURL
+		s.cfg.Workspaces = previousWorkspaces
+		s.cfgMu.Unlock()
+		// Best effort: rebuild the stopped connections against the old URL.
+		s.ensureConnections()
+		s.startNewConnectionLoops()
+		return fmt.Errorf("persist config: %w", err)
+	}
+	s.cfgMu.Unlock()
+	log.Printf("[supervisor] server url switched %s -> %s; %d workspace connection(s) cleared", previousURL, normalized, len(previousWorkspaces))
+	return nil
 }
 
 // ResolveIdentityForTest wires one instance's identity inside a connection the

@@ -119,15 +119,152 @@ func TestDeriveWorkspaceName(t *testing.T) {
 	}
 }
 
-func TestValidateGlobalConfigRequiresWorkspaceAndToken(t *testing.T) {
+// TestValidateGlobalConfigAllowsConsoleOnlyBareConfig proves the guided
+// startup path: a bare config (no server URL, no workspaces) validates so the
+// daemon can start console-only and be configured from the local console.
+func TestValidateGlobalConfigAllowsConsoleOnlyBareConfig(t *testing.T) {
 	cfg := &agent.GlobalConfig{}
-	if err := agent.ValidateGlobalConfig(cfg); err == nil || !strings.Contains(err.Error(), "at least one workspace") {
-		t.Fatalf("expected workspace validation error, got %v", err)
+	if err := agent.ValidateGlobalConfig(cfg); err != nil {
+		t.Fatalf("bare console-only config should validate, got %v", err)
 	}
 
 	cfg.Workspaces = []agent.WorkspaceEntry{{Name: "team-a", Token: "not-a-td-token"}}
 	if err := agent.ValidateGlobalConfig(cfg); err == nil || !strings.Contains(err.Error(), "td_") {
 		t.Fatalf("expected token prefix validation error, got %v", err)
+	}
+}
+
+// TestValidateGlobalConfigServerURLAndBindAddr covers the explicit-config
+// validation: a malformed server URL is rejected at startup, and enabling the
+// local console without a bind address is an error instead of a silent
+// fallback.
+func TestValidateGlobalConfigServerURLAndBindAddr(t *testing.T) {
+	cfg := &agent.GlobalConfig{}
+	cfg.Server.URL = "nope"
+	err := agent.ValidateGlobalConfig(cfg)
+	if err == nil || !strings.Contains(err.Error(), "server.url") {
+		t.Fatalf("expected server.url validation error, got %v", err)
+	}
+
+	cfg.Server.URL = "http://127.0.0.1:9"
+	cfg.Local.Enabled = true
+	err = agent.ValidateGlobalConfig(cfg)
+	if err == nil || !strings.Contains(err.Error(), "local.bind_addr") {
+		t.Fatalf("expected local.bind_addr validation error, got %v", err)
+	}
+
+	cfg.Local.BindAddr = "127.0.0.1:19999"
+	if err := agent.ValidateGlobalConfig(cfg); err != nil {
+		t.Fatalf("explicit config should validate, got %v", err)
+	}
+}
+
+// TestValidateGlobalConfigCanonicalizesServerURL proves validation rewrites
+// the URL to its canonical form: a trailing slash or surrounding whitespace
+// must not reach the connection clients verbatim.
+func TestValidateGlobalConfigCanonicalizesServerURL(t *testing.T) {
+	cfg := &agent.GlobalConfig{}
+	cfg.Server.URL = " http://127.0.0.1:9/ "
+	if err := agent.ValidateGlobalConfig(cfg); err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+	if cfg.Server.URL != "http://127.0.0.1:9" {
+		t.Fatalf("server.url not canonicalized: %q", cfg.Server.URL)
+	}
+}
+
+// TestLoadGlobalConfigRejectsNonBooleanLocalEnabled proves a hand-written
+// non-boolean enabled value (e.g. YAML 1.1 "yes") fails at load instead of
+// silently disabling the console.
+func TestLoadGlobalConfigRejectsNonBooleanLocalEnabled(t *testing.T) {
+	path := writeGlobalConfig(t, strings.Join([]string{
+		"local:",
+		"  enabled: yes",
+		"",
+	}, "\n"))
+	_, err := agent.LoadGlobalConfig(path)
+	if err == nil || !strings.Contains(err.Error(), "local.enabled") {
+		t.Fatalf("expected local.enabled type error, got %v", err)
+	}
+}
+
+// TestLoadGlobalConfigAppliesNoImplicitDefaults proves the daemon trusts only
+// what the file says: tool paths, base branch and bind address stay empty, the
+// local console stays off without an explicit enabled: true. workspace_root
+// keeps its documented default.
+func TestLoadGlobalConfigAppliesNoImplicitDefaults(t *testing.T) {
+	path := writeGlobalConfig(t, "name: bare\n")
+	cfg, err := agent.LoadGlobalConfig(path)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if cfg.Server.URL != "" {
+		t.Fatalf("server.url should stay empty, got %q", cfg.Server.URL)
+	}
+	for name, p := range map[string]string{
+		"claude":   cfg.Tools.Claude.Path,
+		"openclaw": cfg.Tools.OpenClaw.Path,
+		"opencode": cfg.Tools.OpenCode.Path,
+		"atomcode": cfg.Tools.AtomCode.Path,
+		"mimocode": cfg.Tools.MiMoCode.Path,
+	} {
+		if p != "" {
+			t.Fatalf("tools.%s.path should stay empty, got %q", name, p)
+		}
+	}
+	if cfg.Git.BaseBranch != "" {
+		t.Fatalf("git.base_branch should stay empty, got %q", cfg.Git.BaseBranch)
+	}
+	if cfg.Local.BindAddr != "" {
+		t.Fatalf("local.bind_addr should stay empty, got %q", cfg.Local.BindAddr)
+	}
+	if cfg.Local.Enabled {
+		t.Fatal("local console must stay off without explicit enabled: true")
+	}
+	if cfg.WorkspaceRoot == "" {
+		t.Fatal("workspace_root should keep its default")
+	}
+}
+
+// TestSaveLoadRoundTripPreservesExplicitValues guards the sparse-marshal
+// round-trip after the no-defaults cleanup: every explicit value (including
+// local.enabled: true and bare tool paths like \"claude\") survives a
+// save/load cycle.
+func TestSaveLoadRoundTripPreservesExplicitValues(t *testing.T) {
+	cfg := &agent.GlobalConfig{}
+	cfg.Server.URL = "http://127.0.0.1:9"
+	cfg.WorkspaceRoot = t.TempDir()
+	cfg.Tools.Claude.Path = "claude"
+	cfg.Tools.OpenClaw.Path = "/usr/local/bin/openclaw"
+	cfg.Git.BaseBranch = "main"
+	cfg.Local.Enabled = true
+	cfg.Local.BindAddr = "127.0.0.1:19999"
+	cfg.Workspaces = []agent.WorkspaceEntry{{
+		Name: "team-a", Token: "td_x", WorkspaceID: "ws-a", DaemonID: "dm-a",
+		Agents: []agent.WorkspaceAgent{{Name: "a1", Provider: "claude", AgentID: "agent-uuid-a1"}},
+	}}
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := agent.SaveGlobalConfig(cfg, path); err != nil {
+		t.Fatalf("save config: %v", err)
+	}
+	reloaded, err := agent.LoadGlobalConfig(path)
+	if err != nil {
+		t.Fatalf("reload config: %v", err)
+	}
+	if reloaded.Server.URL != cfg.Server.URL {
+		t.Fatalf("server.url lost in round-trip: %q", reloaded.Server.URL)
+	}
+	if reloaded.Tools.Claude.Path != "claude" || reloaded.Tools.OpenClaw.Path != "/usr/local/bin/openclaw" {
+		t.Fatalf("tool paths lost in round-trip: %+v", reloaded.Tools)
+	}
+	if reloaded.Git.BaseBranch != "main" {
+		t.Fatalf("base_branch lost in round-trip: %q", reloaded.Git.BaseBranch)
+	}
+	if !reloaded.Local.Enabled || reloaded.Local.BindAddr != "127.0.0.1:19999" {
+		t.Fatalf("local settings lost in round-trip: %+v", reloaded.Local)
+	}
+	if entry := reloaded.Workspace("team-a"); entry == nil || entry.Token != "td_x" || entry.WorkspaceID != "ws-a" {
+		t.Fatalf("workspace entry lost in round-trip: %+v", reloaded.Workspaces)
 	}
 }
 

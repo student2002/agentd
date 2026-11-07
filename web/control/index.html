@@ -97,7 +97,16 @@
           <span class="pill" id="server-pill">—</span>
         </div>
 
-        <div class="server-url-row mono" id="server-url-row">—</div>
+        <div class="server-url-row mono" id="server-url-row">
+          <span id="server-url-text">—</span>
+          <button id="server-url-edit" class="btn btn-sm" data-i18n="server-url-edit">Switch</button>
+        </div>
+        <div class="server-url-edit" id="server-url-edit-box" hidden>
+          <input id="server-url-input" class="mono" data-placeholder-i18n="server-url-ph" placeholder="http://127.0.0.1:8080" autocomplete="off" />
+          <button id="server-url-save" class="btn btn-primary btn-sm" data-i18n="server-url-save">Save</button>
+          <button id="server-url-cancel" class="btn btn-sm" data-i18n="server-url-cancel">Cancel</button>
+        </div>
+        <p class="hint server-url-warning" id="server-url-warning" hidden></p>
 
         <div class="connections-list" id="connections-list"></div>
 
@@ -250,7 +259,6 @@
 
     <footer class="footer">
       <span class="dot dot-sm" id="dot-health"></span>
-      <span data-i18n="subtitle">Local console — operations affect only this agentd instance; the server stays unaware (node remains in_progress).</span>
     </footer>
 
     <div class="gate" id="memory-modal" hidden>
