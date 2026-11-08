@@ -30,13 +30,13 @@ func TestExecuteRebindsSessionContextOnTaskChange(t *testing.T) {
 
 	// Prime stale state as if a previous task (48) had just finished with its
 	// workdir installed on the executor.
-	node48 := agent.TaskNode{ID: "n-48", Name: "old-node", SortOrder: 1, NodeType: "standard"}
+	node48 := agent.TaskNode{ID: "n-48", Name: "old-node", ExecutionID: "exec-n-48", ExecutionKind: agent.ExecutionKindAgent}
 	executor.SeedRunningForTest(&agent.RunContext{
 		Client: client, AgentID: "agent-1", WorkspaceID: "ws-1", ProjectID: "proj-1", TaskID: 48, NodeID: "n-48",
 	}, 48, node48, filepath.Join(root, "ws-1", "agent-1", "proj-1", "48"))
 
 	// Start task 58 and take it over before its tool captures any session.
-	node58 := agent.TaskNode{ID: "n-58", Name: "new-node", SortOrder: 1, NodeType: "standard"}
+	node58 := agent.TaskNode{ID: "n-58", Name: "new-node", ExecutionID: "exec-n-58", ExecutionKind: agent.ExecutionKindAgent}
 	go executor.Execute(agent.RunContext{
 		Client: client, AgentID: "agent-1", WorkspaceID: "ws-1", ProjectID: "proj-1", TaskID: 58, NodeID: "n-58",
 	}, node58)

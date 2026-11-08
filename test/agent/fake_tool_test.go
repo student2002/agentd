@@ -21,10 +21,11 @@ type fakeTool struct {
 	stopped     bool
 	outputLines []string
 
-	output          string
-	calls           int
-	lastPrompt      string
-	lastWorkDir     string
+	output           string
+	calls            int
+	lastPrompt       string
+	lastWorkDir      string
+	failErr          error
 	interventionMode atomic.Bool
 }
 
@@ -60,6 +61,10 @@ func (t *fakeTool) Execute(ctx context.Context, workDir string, prompt string, _
 	close(t.startedCh)
 	t.mu.Unlock()
 
+	if t.failErr != nil {
+		return nil, t.failErr
+	}
+
 	for _, line := range lines {
 		if onOutput != nil {
 			onOutput(line)
@@ -84,12 +89,15 @@ func (t *fakeTool) Stop() error {
 // SetInterventionMode makes Execute return synchronously with the configured output.
 func (t *fakeTool) SetInterventionMode(b bool) { t.interventionMode.Store(b) }
 func (t *fakeTool) SetOutput(s string)         { t.mu.Lock(); t.output = s; t.mu.Unlock() }
-func (t *fakeTool) callCount() int             { t.mu.Lock(); defer t.mu.Unlock(); return t.calls }
-func (t *fakeTool) lastPromptValue() string    { t.mu.Lock(); defer t.mu.Unlock(); return t.lastPrompt }
-func (t *fakeTool) lastWorkDirValue() string   { t.mu.Lock(); defer t.mu.Unlock(); return t.lastWorkDir }
 
-func (t *fakeTool) finish()      { close(t.finishCh) }
-func (t *fakeTool) waitStarted() { <-t.startedCh }
+// SetError makes Execute fail with the given error after the tool has started.
+func (t *fakeTool) SetError(err error)       { t.mu.Lock(); t.failErr = err; t.mu.Unlock() }
+func (t *fakeTool) callCount() int           { t.mu.Lock(); defer t.mu.Unlock(); return t.calls }
+func (t *fakeTool) lastPromptValue() string  { t.mu.Lock(); defer t.mu.Unlock(); return t.lastPrompt }
+func (t *fakeTool) lastWorkDirValue() string { t.mu.Lock(); defer t.mu.Unlock(); return t.lastWorkDir }
+
+func (t *fakeTool) finish()                   { close(t.finishCh) }
+func (t *fakeTool) waitStarted()              { <-t.startedCh }
 func (t *fakeTool) FinishCh() <-chan struct{} { return t.finishCh }
 func (t *fakeTool) isStopped() bool {
 	t.mu.Lock()

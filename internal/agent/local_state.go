@@ -2,7 +2,6 @@
 package agent
 
 import (
-	"fmt"
 	"sync"
 	"time"
 )
@@ -10,11 +9,9 @@ import (
 const (
 	LocalRuntimeOffline = "offline"
 	LocalRuntimeOnline  = "online"
-	LocalRuntimeError   = "error"
 
 	LocalAgentOnline = "online"
 	LocalAgentBusy   = "busy"
-	LocalAgentPaused = "paused"
 
 	LocalExecutionIdle        = "idle"
 	LocalExecutionRunning     = "running"
@@ -25,7 +22,6 @@ const (
 
 	LocalToolDisconnected = "disconnected"
 	LocalToolConnected    = "connected"
-	LocalToolConnecting   = "connecting"
 )
 
 type LocalStateConfig struct {
@@ -58,8 +54,6 @@ type LocalSnapshotConfig struct {
 }
 
 type LocalRuntimeStatus struct {
-	ID                 string    `json:"id"`
-	DaemonID           string    `json:"daemon_id"`
 	Status             string    `json:"status"`
 	LastHeartbeatAt    time.Time `json:"last_heartbeat_at"`
 	LastHeartbeatError string    `json:"last_heartbeat_error"`
@@ -160,15 +154,6 @@ func (s *LocalStateStore) Snapshot() LocalSnapshot {
 	return snapshot
 }
 
-func (s *LocalStateStore) SetRuntimeRegistered(runtimeID string, daemonID string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.snapshot.Runtime.ID = runtimeID
-	s.snapshot.Runtime.DaemonID = daemonID
-	s.snapshot.Runtime.Status = LocalRuntimeOnline
-	s.touchLocked()
-}
-
 func (s *LocalStateStore) SetSSEConnected(lastEventID string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -192,9 +177,7 @@ func (s *LocalStateStore) SetHeartbeatSuccess(at time.Time) {
 	defer s.mu.Unlock()
 	s.snapshot.Runtime.LastHeartbeatAt = at.UTC()
 	s.snapshot.Runtime.LastHeartbeatError = ""
-	if s.snapshot.Runtime.Status != LocalRuntimeError {
-		s.snapshot.Runtime.Status = LocalRuntimeOnline
-	}
+	s.snapshot.Runtime.Status = LocalRuntimeOnline
 	s.touchLocked()
 }
 
@@ -243,28 +226,6 @@ func (s *LocalStateStore) SetExecutionInterrupted(taskID int32, nodeID string) {
 	s.touchLocked()
 }
 
-// SetExecutionIntervening marks the node as locally taken over by a human;
-// the server still sees in_progress.
-func (s *LocalStateStore) SetExecutionIntervening(taskID int32, nodeID string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.snapshot.ExecutionSession.TaskID == taskID && s.snapshot.ExecutionSession.NodeID == nodeID {
-		s.snapshot.ExecutionSession.Status = LocalExecutionIntervening
-	}
-	s.touchLocked()
-}
-
-// SetExecutionHandback flips the session back to running after a human hands
-// control back to the agent.
-func (s *LocalStateStore) SetExecutionHandback(taskID int32, nodeID string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.snapshot.ExecutionSession.TaskID == taskID && s.snapshot.ExecutionSession.NodeID == nodeID {
-		s.snapshot.ExecutionSession.Status = LocalExecutionRunning
-	}
-	s.touchLocked()
-}
-
 // SetPaused records the watcher's paused flag in the snapshot so the local
 // control UI can render the pause state.
 func (s *LocalStateStore) SetPaused(paused bool) {
@@ -303,46 +264,6 @@ func (s *LocalStateStore) SetToolStatus(provider string, status string, err erro
 		s.snapshot.Tool.LastError = err.Error()
 	} else {
 		s.snapshot.Tool.LastError = ""
-	}
-	s.touchLocked()
-}
-
-func (s *LocalStateStore) SetRuntimeError(code string, message string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	now := time.Now().UTC()
-	s.snapshot.Runtime.Status = LocalRuntimeError
-	s.snapshot.LastError = LocalError{
-		Code:    code,
-		Message: message,
-		At:      &now,
-	}
-	s.touchLocked()
-}
-
-func (s *LocalStateStore) SetError(code string, err error) {
-	message := ""
-	if err != nil {
-		message = err.Error()
-	}
-	if message == "" && code != "" {
-		message = fmt.Sprintf("%s occurred", code)
-	}
-	s.SetRuntimeError(code, message)
-}
-
-func (s *LocalStateStore) SetLastError(code string, err error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	now := time.Now().UTC()
-	message := ""
-	if err != nil {
-		message = err.Error()
-	}
-	s.snapshot.LastError = LocalError{
-		Code:    code,
-		Message: message,
-		At:      &now,
 	}
 	s.touchLocked()
 }

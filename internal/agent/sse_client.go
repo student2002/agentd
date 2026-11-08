@@ -16,9 +16,8 @@
 //   - dispatchEvent: dispatches the parsed event to the registered callback
 //     (the supervisor routes by the envelope agent_id)
 //
-// Supported SSE event types: node:pending, node:continuation_invite,
-// task:interrupt, sync:required, mention:trigger, node:timeout,
-// node:reject_rollback.
+// Supported SSE event types: node:ready, node:continuation_invite,
+// task:interrupt, sync:required, mention:trigger, node:timeout.
 // On reconnection, event replay compensation is achieved via the Last-Event-ID
 // header.
 package agent
@@ -310,7 +309,7 @@ func (c *SSEClient) readStream(resp *http.Response) error {
 // If the event type is empty, it defaults to "message".
 //
 // Parameters:
-//   - eventType: the event type (e.g. "node:pending", "task:interrupt")
+//   - eventType: the event type (e.g. "node:ready", "task:interrupt")
 //   - data: the raw JSON string of the event data
 func (c *SSEClient) dispatchEvent(eventType, data string) {
 	if eventType == "" {

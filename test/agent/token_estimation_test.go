@@ -59,10 +59,12 @@ func TestTokenEstimation_CJKReducesCharBudget(t *testing.T) {
 			ProjectID:   "proj-1",
 		}
 		node := agent.TaskNode{
-			ID:          "node-1",
-			TaskID:      1,
-			Name:        "1. Work",
-			Description: "Do the work",
+			ID:            "node-1",
+			TaskID:        1,
+			Name:          "1. Work",
+			ExecutionID:   "exec-node-1",
+			ExecutionKind: agent.ExecutionKindAgent,
+			Instruction:   "Do the work",
 		}
 
 		ctx, err := agent.BuildExecutionContext(client, "ws-1", "agent-1", cfg, task, node, false)
@@ -128,7 +130,7 @@ func TestTokenEstimation_DefaultContextWindow(t *testing.T) {
 	}
 
 	task := agent.Task{ID: 1, Title: "Test", Description: "Hello", ProjectID: "proj-1"}
-	node := agent.TaskNode{ID: "node-1", TaskID: 1, Name: "1. Work", Description: "Do work"}
+	node := agent.TaskNode{ID: "node-1", TaskID: 1, Name: "1. Work", ExecutionID: "exec-node-1", Instruction: "Do work"}
 
 	ctx, err := agent.BuildExecutionContext(client, "ws-1", "agent-1", cfg, task, node, false)
 	if err != nil {

@@ -98,20 +98,14 @@ func TestPerAgentMethodsInjectAgentHeader(t *testing.T) {
 			_, err := client.ClaimNode(ctx, agentID, 1, "n1")
 			return err
 		}},
-		{"SkipClaim", "/api/tasks/1/nodes/n1/skip-claim", func() error {
-			return client.SkipClaim(ctx, agentID, 1, "n1")
-		}},
-		{"ApproveNode", "/api/tasks/1/nodes/n1/approve", func() error {
-			return client.ApproveNode(ctx, agentID, 1, "n1", "ok")
-		}},
 		{"CompleteNode", "/api/tasks/1/nodes/n1/complete", func() error {
-			return client.CompleteNode(ctx, agentID, 1, "n1", "done")
+			return client.CompleteNode(ctx, agentID, 1, "n1", "exec-1", "done", json.RawMessage("{}"))
 		}},
-		{"RejectNode", "/api/tasks/1/nodes/n1/reject", func() error {
-			return client.RejectNode(ctx, agentID, 1, "n1", "n0", "bad")
+		{"FailNode", "/api/tasks/1/nodes/n1/fail", func() error {
+			return client.FailNode(ctx, agentID, 1, "n1", "exec-1", "agent_execution_failed", "boom")
 		}},
 		{"ManualIntervention", "/api/tasks/1/nodes/n1/manual", func() error {
-			return client.ManualIntervention(ctx, agentID, 1, "n1", "help")
+			return client.ManualIntervention(ctx, agentID, 1, "n1", "exec-1", "help")
 		}},
 		{"ReportTokenUsage", "/api/tasks/1/token-usage", func() error {
 			return client.ReportTokenUsage(ctx, agentID, 1, "n1", agent.TokenUsageRequest{})

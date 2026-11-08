@@ -245,13 +245,12 @@ func (r *AgentRuntime) SetHeartbeat(err error) {
 // the identity is not bound.
 //
 // Supported event types:
-//   - node:pending: a node pending claim, triggers polling
+//   - node:ready: a node became ready for claiming, triggers polling
 //   - node:continuation_invite: a continuation-right invitation, auto-claimed and executed
 //   - task:interrupt: a task interrupt request, stops the current execution
 //   - sync:required: the buffer is stale, perform a full sync
 //   - mention:trigger: an @mention, triggers polling
 //   - node:timeout: a node timed out, interrupts the executor
-//   - node:reject_rollback: a rejection rollback, performs a git reset
 func (r *AgentRuntime) HandleEvent(eventType string, data json.RawMessage) {
 	identity := r.identitySnapshot()
 	if identity == nil {
@@ -261,8 +260,8 @@ func (r *AgentRuntime) HandleEvent(eventType string, data json.RawMessage) {
 	log.Printf("[agent=%s] SSE event: %s (connection %s)", r.name, eventType, r.connName)
 
 	switch eventType {
-	case "node:pending":
-		log.Printf("[agent=%s] received node:pending, triggering watcher poll", r.name)
+	case "node:ready":
+		log.Printf("[agent=%s] received node:ready, triggering watcher poll", r.name)
 		go r.triggerPoll()
 
 	case "node:continuation_invite":
@@ -284,10 +283,6 @@ func (r *AgentRuntime) HandleEvent(eventType string, data json.RawMessage) {
 	case "node:timeout":
 		log.Printf("[agent=%s] received node:timeout, interrupting executor", r.name)
 		go r.handleNodeTimeout(data)
-
-	case "node:reject_rollback":
-		log.Printf("[agent=%s] received node:reject_rollback", r.name)
-		go r.handleRejectRollback(identity, data)
 
 	default:
 		log.Printf("[agent=%s] unhandled SSE event type: %s", r.name, eventType)
@@ -442,101 +437,9 @@ func (r *AgentRuntime) handleInterrupt(data json.RawMessage) {
 	}
 }
 
-// handleRejectRollback handles the node:reject_rollback event on the bound
-// identity. It performs a git reset --hard to the target node's code baseline
-// tag.
-func (r *AgentRuntime) handleRejectRollback(identity *runtimeIdentity, data json.RawMessage) {
-	var payload struct {
-		TaskID        int32  `json:"task_id"`
-		TargetNodeID  string `json:"target_node_id"`
-		TargetOrder   int32  `json:"target_order"`
-		RejectedNode  string `json:"rejected_node"`
-		ProjectID     string `json:"project_id"`
-		TargetAttempt int32  `json:"target_attempt"`
-	}
-	if err := json.Unmarshal(data, &payload); err != nil {
-		log.Printf("[agent=%s] failed to parse node:reject_rollback: %v", r.name, err)
-		return
-	}
-
-	// First try to get the git manager from the current execution
-	gitMgr := r.exec.GetGitManager()
-	taskID, _, ok := r.exec.CurrentTask()
-
-	if ok && taskID == payload.TaskID && gitMgr != nil {
-		// Currently executing this task — use the active git manager
-		log.Printf("[agent=%s] performing git rollback for active task %d to node order %d", r.name, payload.TaskID, payload.TargetOrder)
-	} else {
-		// Not currently executing — try to locate the isolated workdir
-		log.Printf("[agent=%s] not currently executing task %d, attempting to locate isolated workdir for rollback", r.name, payload.TaskID)
-
-		if payload.ProjectID == "" {
-			log.Printf("[agent=%s] cannot locate workdir without project_id for rollback", r.name)
-			return
-		}
-
-		workDir := workDirPath(r.view.Workspace.Root, identity.workspaceID, identity.agentUUID, payload.ProjectID, payload.TaskID)
-		candidateGit := NewGitManager(workDir)
-		if !candidateGit.IsGitRepo() {
-			log.Printf("[agent=%s] no git repo found at %s for rollback", r.name, workDir)
-			return
-		}
-		gitMgr = candidateGit
-		log.Printf("[agent=%s] located git repo at %s for rollback", r.name, workDir)
-	}
-
-	// Create a snapshot before rollback
-	if _, err := gitMgr.SnapshotBeforeReject(payload.TaskID); err != nil {
-		log.Printf("[agent=%s] WARNING: failed to create pre-rollback snapshot: %v", r.name, err)
-	}
-
-	// Reset to the target node's start tag
-	attempt := int(payload.TargetAttempt)
-	if attempt <= 0 {
-		attempt = 1
-	}
-	if err := gitMgr.ResetToNode(payload.TaskID, int(payload.TargetOrder), attempt); err != nil {
-		log.Printf("[agent=%s] ERROR: failed to git reset to node order %d: %v", r.name, payload.TargetOrder, err)
-
-		// Fallback: try previous available tags
-		if fallbackErr := r.fallbackRollback(gitMgr, payload.TaskID, int(payload.TargetOrder)); fallbackErr != nil {
-			log.Printf("[agent=%s] ERROR: fallback rollback also failed: %v", r.name, fallbackErr)
-			if err := identity.client.ManualIntervention(context.Background(), identity.agentUUID, payload.TaskID, payload.TargetNodeID,
-				fmt.Sprintf("Git rollback failed: %v", err)); err != nil {
-				log.Printf("[agent=%s] failed to report manual intervention: %v", r.name, err)
-			}
-			return
-		}
-	}
-
-	log.Printf("[agent=%s] successfully rolled back task %d to node order %d baseline", r.name, payload.TaskID, payload.TargetOrder)
-
-	// After rollback, trigger the watcher to take over the target node
-	r.triggerPoll()
-}
-
-// fallbackRollback, when the normal rollback fails, walks backward level by
-// level looking for an available start tag to roll back to.
-//
-// Starting from targetOrder-1, it walks backward through each node order; for
-// each node it tries up to 5 attempts, and after finding the first existing
-// start tag it performs a git reset to that position.
-func (r *AgentRuntime) fallbackRollback(gitMgr *GitManager, taskID int32, targetOrder int) error {
-	for order := targetOrder - 1; order >= 1; order-- {
-		for attempt := 1; attempt <= 5; attempt++ {
-			tag := NodeStartTag(taskID, order, attempt)
-			if gitMgr.tagExists(tag) {
-				log.Printf("[agent=%s] fallback: using tag %s instead", r.name, tag)
-				return gitMgr.ResetToNode(taskID, order, attempt)
-			}
-		}
-	}
-	return fmt.Errorf("no fallback tag found")
-}
-
 // workDirPath builds the isolated per-task working directory:
 // {root}/{workspaceID}/{agentID}/{projectID}/{taskID}. The single source for
-// the layout, shared by the executor and the reject-rollback fallback.
+// the layout, shared by the executor and session-context rebinding.
 func workDirPath(root, workspaceID, agentID, projectID string, taskID int32) string {
 	if projectID == "" {
 		projectID = "no-project"

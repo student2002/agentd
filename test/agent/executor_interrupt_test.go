@@ -26,7 +26,7 @@ func TestInterruptDoesNotReportManualIntervention(t *testing.T) {
 		return &fakeToolAdapter{tool: newFakeTool("claude")}
 	})
 
-	node := agent.TaskNode{ID: "node-1", Name: "code", SortOrder: 1, NodeType: "standard"}
+	node := agent.TaskNode{ID: "node-1", Name: "code", ExecutionID: "exec-node-1", ExecutionKind: agent.ExecutionKindAgent}
 
 	go executor.Execute(agent.RunContext{
 		Client:      client,

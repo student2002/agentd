@@ -17,7 +17,7 @@ func TestLocalStateStoreSnapshotTracksRuntimeAndExecution(t *testing.T) {
 		ServerURL:  "http://127.0.0.1:8080",
 	})
 
-	store.SetRuntimeRegistered("rt-1", "daemon-1")
+	store.SetHeartbeatSuccess(time.Date(2026, 6, 23, 8, 0, 0, 0, time.UTC))
 	store.SetSSEConnected("event-1")
 	store.SetExecutionStarted(agent.LocalExecutionSession{
 		TaskID:   12,
@@ -44,7 +44,6 @@ func TestLocalStateStoreSnapshotTracksRuntimeAndExecution(t *testing.T) {
 
 func TestHeartbeatCallbacksUpdateLocalState(t *testing.T) {
 	store := agent.NewLocalStateStore(agent.LocalStateConfig{InstanceID: "instance-1"})
-	store.SetRuntimeRegistered("rt-1", "daemon-1")
 	store.SetHeartbeatSuccess(time.Date(2026, 6, 23, 8, 0, 0, 0, time.UTC))
 	if store.Snapshot().Runtime.LastHeartbeatAt.IsZero() {
 		t.Fatal("expected heartbeat timestamp")
@@ -89,7 +88,8 @@ func TestLocalStateStoreTracksExecutionCompletionAndFailure(t *testing.T) {
 
 func TestLocalStateStoreSnapshotDoesNotExposeInternalErrorPointer(t *testing.T) {
 	store := agent.NewLocalStateStore(agent.LocalStateConfig{InstanceID: "instance-1"})
-	store.SetRuntimeError("runtime_failed", "boom")
+	store.SetExecutionStarted(agent.LocalExecutionSession{TaskID: 13, NodeID: "node-2", Tool: "claude"})
+	store.SetExecutionFailed(13, "node-2", errors.New("boom"))
 
 	snapshot := store.Snapshot()
 	if snapshot.LastError.At == nil {

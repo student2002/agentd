@@ -22,7 +22,6 @@ package agent
 import (
 	"context"
 	"log"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -88,7 +87,7 @@ func (w *NodeWatcher) Start() {
 }
 
 // TriggerPoll triggers an immediate poll for claimable nodes, used by the SSE
-// event handler when it receives a node:pending event.
+// event handler when it receives a node:ready event.
 func (w *NodeWatcher) TriggerPoll() {
 	select {
 	case w.pollCh <- struct{}{}:
@@ -190,6 +189,17 @@ func (w *NodeWatcher) recoverInProgressNodes() {
 		return
 	}
 
+	// Command processes cannot survive a daemon restart: report the execution
+	// as interrupted so the server decides whether to issue a new execution.
+	// The command must never be blindly re-run from here.
+	if node.ExecutionKind == ExecutionKindCommand {
+		log.Printf("[watcher] command node %s cannot resume after restart, reporting interruption", node.ID)
+		if err := w.client.FailNode(w.ctx, w.agentID, node.TaskID, node.ID, node.ExecutionID, "command_interrupted", "daemon restarted; command executions cannot be resumed"); err != nil {
+			log.Printf("[watcher] failed to report interrupted command execution: %v", err)
+		}
+		return
+	}
+
 	log.Printf("[watcher] recovering in-progress node %s (%s) for task %d", node.ID, node.Name, node.TaskID)
 	go w.executor.Execute(RunContext{
 		Client:      w.client,
@@ -199,22 +209,14 @@ func (w *NodeWatcher) recoverInProgressNodes() {
 		ProjectID:   node.ProjectID,
 		TaskID:      node.TaskID,
 		NodeID:      node.ID,
-	}, TaskNode{
-		ID:              node.ID,
-		TaskID:          node.TaskID,
-		Name:            node.Name,
-		SortOrder:       node.SortOrder,
-		Status:          node.Status,
-		ReadonlyDirs:    node.ReadonlyDirs,    // preserve directory permissions when resuming
-		FullControlDirs: node.FullControlDirs, // preserve directory permissions when resuming
-	})
+	}, node.TaskNode) // resume with the original ticket, keeping the original execution ID
 }
 
-// pollProject checks the pending nodes in a single project, attempts to claim
-// them and dispatches them to the executor for execution.
-// Workflow nodes are strictly ordered; only the first pending node (smallest
-// sort_order) is claimed, and subsequent nodes cannot be claimed until their
-// predecessors are completed. Only non-human-assigned nodes are processed.
+// pollProject checks the ready execution tickets in a single project, attempts
+// to claim them and dispatches them to the executor for execution.
+// The server's pending list only contains tickets this agent may execute, so
+// the watcher simply takes the first ready item. Whether a specific agent is
+// allowed to execute a node is decided by the server before assignment.
 // Only one node is executed at a time (executor.IsRunning() mutex).
 //
 // Parameters:
@@ -253,15 +255,15 @@ func (w *NodeWatcher) pollProject(projectID string) {
 			continue
 		}
 
-		// Workflow is ordered: only claim the first pending, non-human-assigned node
-		var firstPending *TaskNode
+		// Take the first ready ticket; claim eligibility is server-enforced
+		var firstReady *TaskNode
 		for i := range nodes {
-			if nodes[i].Status == "pending" && nodes[i].AssigneeType != "human" {
-				firstPending = &nodes[i]
+			if nodes[i].Status == "ready" {
+				firstReady = &nodes[i]
 				break
 			}
 		}
-		if firstPending == nil {
+		if firstReady == nil {
 			continue
 		}
 
@@ -275,22 +277,12 @@ func (w *NodeWatcher) pollProject(projectID string) {
 		default:
 		}
 
-		claimed, err := w.client.ClaimNode(w.ctx, w.agentID, task.TaskID, firstPending.ID)
+		claimed, err := w.client.ClaimNode(w.ctx, w.agentID, task.TaskID, firstReady.ID)
 		if err != nil {
 			if w.ctx.Err() != nil {
 				return
 			}
-			errMsg := err.Error()
-			if strings.Contains(errMsg, "self-review") {
-				// Self-review not allowed — skip this node so other agents can claim it
-				if skipErr := w.client.SkipClaim(w.ctx, w.agentID, task.TaskID, firstPending.ID); skipErr != nil {
-					log.Printf("[watcher] failed to skip-claim node %s: %v", firstPending.ID, skipErr)
-				} else {
-					log.Printf("[watcher] skipped self-review node %s", firstPending.ID)
-				}
-			} else {
-				log.Printf("[watcher] failed to claim node %s: %v", firstPending.ID, err)
-			}
+			log.Printf("[watcher] failed to claim node %s: %v", firstReady.ID, err)
 			continue
 		}
 

@@ -27,7 +27,7 @@ func TestSoftInterruptStopsToolWithoutReportingFailure(t *testing.T) {
 		return &fakeToolAdapter{tool: newFakeTool("claude")}
 	})
 
-	node := agent.TaskNode{ID: "n-soft", Name: "node-1", SortOrder: 1, NodeType: "standard"}
+	node := agent.TaskNode{ID: "n-soft", Name: "node-1", ExecutionID: "exec-n-soft", ExecutionKind: agent.ExecutionKindAgent}
 	go executor.Execute(agent.RunContext{
 		Client:      client,
 		AgentID:     "agent-1",
@@ -85,7 +85,7 @@ func TestInterventionAfterSoftInterrupt(t *testing.T) {
 	resumed := make(chan struct{}, 1)
 	executor.SetResumeCallback(func() { resumed <- struct{}{} })
 
-	node := agent.TaskNode{ID: "n-takeover", Name: "node-1", SortOrder: 1, NodeType: "standard"}
+	node := agent.TaskNode{ID: "n-takeover", Name: "node-1", ExecutionID: "exec-n-takeover", ExecutionKind: agent.ExecutionKindAgent}
 	go executor.Execute(agent.RunContext{
 		Client:      client,
 		AgentID:     "agent-1",
@@ -122,4 +122,3 @@ func TestInterventionAfterSoftInterrupt(t *testing.T) {
 		t.Fatal("handback did not fire the resume callback")
 	}
 }
-

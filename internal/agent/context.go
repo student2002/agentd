@@ -5,7 +5,7 @@
 //   - ContextSection definition: a context section with priority and truncatable flag
 //   - BuildExecutionContext: builds the full context by priority from high to low,
 //     intelligently truncating when it exceeds 80% of the window
-//   - Context sources: constraints/warnings, node description, task description,
+//   - Context sources: constraints/warnings, execution instruction, task description,
 //     prior node results, agent instructions, skill context,
 //     project context, workspace context
 //   - estimateCharToTokenRatio: estimates the character-to-token conversion ratio
@@ -194,7 +194,7 @@ func estimateCharToTokenRatio(content string) float64 {
 
 // BuildExecutionContext builds the full execution context of a node in priority
 // order.
-// Priority (high to low): constraints/warnings -> node description ->
+// Priority (high to low): constraints/warnings -> execution instruction ->
 // task description -> agent instructions -> skill context -> MCP server
 // context -> project context -> workspace context.
 // When it exceeds 80% of the context window, truncation starts from the lowest
@@ -299,16 +299,27 @@ func buildContextSections(client *Client, workspaceID, agentID string, cfg *Conf
 		})
 	}
 
-	// 3. Node description (critical for understanding what to do)
-	nodeDesc := node.Description
-	if nodeDesc == "" {
-		nodeDesc = node.Name
+	// 3. Execution instruction (critical for understanding what to do)
+	instruction := node.Instruction
+	if instruction == "" {
+		instruction = node.Name
 	}
 	sections = append(sections, ContextSection{
-		Name:     "Node Description",
-		Content:  nodeDesc,
+		Name:     "Execution Instruction",
+		Content:  instruction,
 		Priority: 2,
 	})
+
+	// 4. Execution input (server-mapped structured input; the daemon never
+	// resolves workflow expressions itself, so this arrives ready to use)
+	if len(node.Input) > 0 && string(node.Input) != "null" {
+		sections = append(sections, ContextSection{
+			Name:           "Execution Input",
+			Content:        "```json\n" + string(node.Input) + "\n```",
+			Priority:       2,
+			NonTruncatable: true,
+		})
+	}
 
 	// When resuming a session, --resume preserves the previous reasoning context.
 	// Node comment context is still injected because user replies and upstream

@@ -21,7 +21,7 @@ func TestExecuteInterventionTurnRunsOneTurnWithMessage(t *testing.T) {
 
 	// Seed the executor as if Execute() had already started a node and captured
 	// its workDir, then soft-interrupted to hand control to a human.
-	executor.SeedRunningForTest(nil, 7, agent.TaskNode{ID: "n-int", Name: "node-2", SortOrder: 2}, t.TempDir())
+	executor.SeedRunningForTest(nil, 7, agent.TaskNode{ID: "n-int", Name: "node-2", ExecutionID: "exec-n-int"}, t.TempDir())
 
 	out, err := executor.ExecuteInterventionTurn(7, "n-int", "please add a test")
 	if err != nil {

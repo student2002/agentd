@@ -113,10 +113,12 @@ func TestBuildContext_AllAPIPathsVerified(t *testing.T) {
 	}
 
 	node := agent.TaskNode{
-		ID:          "node-1",
-		TaskID:      1,
-		Name:        "1. AI Processing",
-		Description: "Implement the core authentication logic",
+		ID:            "node-1",
+		TaskID:        1,
+		Name:          "1. AI Processing",
+		ExecutionID:   "exec-node-1",
+		ExecutionKind: agent.ExecutionKindAgent,
+		Instruction:   "Implement the core authentication logic",
 	}
 
 	// build the execution context
@@ -146,7 +148,7 @@ func TestBuildContext_AllAPIPathsVerified(t *testing.T) {
 		"Agent Instructions",
 		"Skill Context",
 		"MCP Servers",
-		"Node Description",
+		"Execution Instruction",
 		"Task Description",
 		"Constraints & Warnings",
 	}
@@ -361,6 +363,57 @@ func TestBuildContext_DirectoryPermissions(t *testing.T) {
 		}
 		if containsSection(ctx, "Directory Permissions") {
 			t.Errorf("expected NO Directory Permissions section when dirs are empty, got:\n%s", ctx)
+		}
+	})
+}
+
+// TestBuildContext_ExecutionInput verifies that the ticket's server-mapped
+// input JSON is injected as an Execution Input section, and that no such
+// section is injected when the ticket carries no input.
+func TestBuildContext_ExecutionInput(t *testing.T) {
+	// minimal mock: all fetch endpoints return empty data
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/", func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]interface{}{})
+	})
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	client := agent.NewClient(server.URL, "test-token")
+	cfg := &agent.Config{
+		Agent: agent.AgentInfo{ContextWindow: 100000},
+	}
+	task := agent.Task{ID: 1, Title: "Test Task", ProjectID: "proj-1"}
+
+	t.Run("with execution input", func(t *testing.T) {
+		node := agent.TaskNode{
+			ID:            "node-1",
+			Name:          "code",
+			ExecutionID:   "exec-node-1",
+			ExecutionKind: agent.ExecutionKindAgent,
+			Instruction:   "fix the bug",
+			Input:         json.RawMessage(`{"title":"bug"}`),
+		}
+		ctx, err := agent.BuildExecutionContext(client, "ws-1", "agent-1", cfg, task, node, false)
+		if err != nil {
+			t.Fatalf("BuildExecutionContext: %v", err)
+		}
+		if !containsSection(ctx, "Execution Input") {
+			t.Errorf("expected Execution Input section in context, got:\n%s", ctx)
+		}
+		if !containsContent(ctx, `"title":"bug"`) {
+			t.Errorf("expected raw input JSON in context, got:\n%s", ctx)
+		}
+	})
+
+	t.Run("without execution input", func(t *testing.T) {
+		node := agent.TaskNode{ID: "node-1", Name: "code", ExecutionID: "exec-node-1", Instruction: "fix the bug"}
+		ctx, err := agent.BuildExecutionContext(client, "ws-1", "agent-1", cfg, task, node, false)
+		if err != nil {
+			t.Fatalf("BuildExecutionContext: %v", err)
+		}
+		if containsSection(ctx, "Execution Input") {
+			t.Errorf("expected NO Execution Input section when input is empty, got:\n%s", ctx)
 		}
 	})
 }

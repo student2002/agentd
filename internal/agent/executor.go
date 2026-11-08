@@ -84,7 +84,7 @@ type TaskExecutor struct {
 	lastWorkDir string // last working directory, used for session invalidation detection
 
 	// interrupted is set by Interrupt before cancelling the execution context.
-	// It tells Execute's err branch to skip reportFailure (ManualIntervention),
+	// It tells Execute's err branch to skip reportFailure (FailNode),
 	// partial commit, and notifyExecutionFailed — Interrupt owns interrupt
 	// reporting (ReportInterrupt + interrupted git tag). Without this gate the
 	// err branch double-reports an interrupted node as manual_intervention.
@@ -92,7 +92,7 @@ type TaskExecutor struct {
 
 	// softInterrupted is set by SoftInterrupt (server-unaware local takeover)
 	// before cancelling the execution context. Like interrupted, it makes the
-	// Execute err-branch skip reportFailure/ManualIntervention, partial commit,
+	// Execute err-branch skip reportFailure/FailNode, partial commit,
 	// and notifyExecutionFailed — but unlike interrupted it does NOT create an
 	// interrupted git tag, push, or ReportInterrupt. The node stays in_progress
 	// on the server while a human works locally.
@@ -231,7 +231,7 @@ func (e *TaskExecutor) Execute(run RunContext, node TaskNode) {
 	if err := os.MkdirAll(workDir, 0755); err != nil {
 		log.Printf("[executor] failed to create workdir: %v", err)
 		e.notifyExecutionFailed(taskID, node.ID, err)
-		e.reportFailure(&run, taskID, node.ID, err)
+		e.reportFailure(&run, taskID, node, "workspace_setup_failed", err)
 		return
 	}
 	e.notifyExecutionStarted(&run, taskID, node, workDir)
@@ -240,7 +240,7 @@ func (e *TaskExecutor) Execute(run RunContext, node TaskNode) {
 	if err := e.checkDiskQuota(workDir); err != nil {
 		log.Printf("[executor] disk quota check failed: %v", err)
 		e.notifyExecutionFailed(taskID, node.ID, err)
-		e.reportFailure(&run, taskID, node.ID, err)
+		e.reportFailure(&run, taskID, node, "workspace_setup_failed", err)
 		return
 	}
 
@@ -260,7 +260,7 @@ func (e *TaskExecutor) Execute(run RunContext, node TaskNode) {
 		if err != nil {
 			log.Printf("[executor] git workspace initialization failed: %v", err)
 			e.notifyExecutionFailed(taskID, node.ID, err)
-			e.reportFailure(&run, taskID, node.ID, err)
+			e.reportFailure(&run, taskID, node, "workspace_setup_failed", err)
 			return
 		}
 	}
@@ -270,7 +270,24 @@ func (e *TaskExecutor) Execute(run RunContext, node TaskNode) {
 		defer e.git.CleanupCredential()
 	}
 
-	attempt := int(node.RejectCount) + 1
+	// 4. Dispatch on the ticket's execution kind. Both kinds share the single
+	// run lifecycle installed above (IsRunning / Interrupt / SoftInterrupt);
+	// the command branch neither tags Git nor invokes the coding tool.
+	switch node.ExecutionKind {
+	case ExecutionKindAgent:
+		// fall through to the agent flow below
+	case ExecutionKindCommand:
+		e.executeCommand(ctx, &run, node, workDir)
+		return
+	default:
+		err := fmt.Errorf("invalid execution kind %q", node.ExecutionKind)
+		log.Printf("[executor] %v", err)
+		e.notifyExecutionFailed(taskID, node.ID, err)
+		e.reportFailure(&run, taskID, node, "invalid_execution_kind", err)
+		return
+	}
+
+	attempt := node.ExecutionID
 
 	gitStartHead := ""
 	if gitReady && e.git != nil && e.git.IsGitRepo() {
@@ -282,12 +299,8 @@ func (e *TaskExecutor) Execute(run RunContext, node TaskNode) {
 	}
 
 	if gitReady {
-		// Tag the node start — use the node's SortOrder rather than parsing it from the name
-		nodeOrder := int(node.SortOrder)
-		if nodeOrder <= 0 {
-			nodeOrder = ParseNodeOrder(node.Name)
-		}
-		if err := e.git.TagNodeStart(taskID, nodeOrder, attempt); err != nil {
+		// Tag the node start with the ticket's node/execution identities
+		if err := e.git.TagNodeStart(taskID, node.ID, attempt); err != nil {
 			log.Printf("[executor] warning: failed to tag node start: %v", err)
 		}
 		// Report the Git branch name to the Server so the frontend can display it
@@ -343,7 +356,7 @@ func (e *TaskExecutor) Execute(run RunContext, node TaskNode) {
 	prompt, err := e.buildPromptWithClient(run.Client, run.WorkspaceID, run.AgentID, taskID, node, task, isResume, capabilities.PromptCapabilities)
 	if err != nil {
 		e.notifyExecutionFailed(taskID, node.ID, err)
-		e.reportFailure(&run, taskID, node.ID, fmt.Errorf("build prompt: %w", err))
+		e.reportFailure(&run, taskID, node, "agent_execution_failed", fmt.Errorf("build prompt: %w", err))
 		return
 	}
 
@@ -448,7 +461,7 @@ func (e *TaskExecutor) Execute(run RunContext, node TaskNode) {
 			// Interrupt (server-aware) already reported via ReportInterrupt + tag.
 			// SoftInterrupt (server-unaware) intentionally keeps the node
 			// in_progress while a human takes over locally. In both cases the
-			// err-branch must NOT call reportFailure/ManualIntervention, partial
+			// err-branch must NOT call reportFailure/FailNode, partial
 			// commit, or notifyExecutionFailed — that would double-report or
 			// leak the local intervention to the server.
 			return
@@ -459,7 +472,7 @@ func (e *TaskExecutor) Execute(run RunContext, node TaskNode) {
 			e.git.CommitAll(fmt.Sprintf("teammate: partial work for %s (failed)", node.Name))
 			_ = e.pushIfNeeded(taskID, node, attempt)
 		}
-		e.reportFailure(&run, taskID, node.ID, err)
+		e.reportFailure(&run, taskID, node, "agent_execution_failed", err)
 		e.notifyExecutionFailed(taskID, node.ID, err)
 		return
 	}
@@ -502,12 +515,8 @@ func (e *TaskExecutor) Execute(run RunContext, node TaskNode) {
 			commitFailed = true
 		}
 		if !commitFailed {
-			// Tag the node complete — use the node's SortOrder, matching TagNodeStart
-			nodeOrder := int(node.SortOrder)
-			if nodeOrder <= 0 {
-				nodeOrder = ParseNodeOrder(node.Name)
-			}
-			if err := e.git.TagNodeComplete(taskID, nodeOrder, attempt); err != nil {
+			// Tag the node complete, matching TagNodeStart
+			if err := e.git.TagNodeComplete(taskID, node.ID, attempt); err != nil {
 				log.Printf("[executor] warning: failed to tag node complete: %v", err)
 			}
 			if err := e.pushIfNeeded(taskID, node, attempt); err != nil {
@@ -542,7 +551,7 @@ func (e *TaskExecutor) Execute(run RunContext, node TaskNode) {
 				log.Printf("[executor] skipped duplicate needs_input comment for node %s", node.ID)
 			}
 		}
-		if err := run.Client.ManualIntervention(context.Background(), run.AgentID, taskID, node.ID, "Agent requests clarification"); err != nil {
+		if err := run.Client.ManualIntervention(context.Background(), run.AgentID, taskID, node.ID, node.ExecutionID, "Agent requests clarification"); err != nil {
 			log.Printf("[executor] failed to set manual intervention: %v", err)
 		}
 		log.Printf("[executor] node %s set to manual_intervention, waiting for user response", node.Name)
@@ -557,14 +566,14 @@ func (e *TaskExecutor) Execute(run RunContext, node TaskNode) {
 		}
 	}
 
-	// 11. Handle the completion logic according to the node type
+	// 11. Report the completion receipt
 	if commitFailed || pushFailed {
 		reason := "Git push failed after completion — manual review required"
 		if commitFailed {
 			reason = "Git commit failed or produced no repository changes — manual review required"
 		}
 		log.Printf("[executor] git operation failed for node %s, setting manual_intervention", node.Name)
-		if err := run.Client.ManualIntervention(context.Background(), run.AgentID, taskID, node.ID, reason); err != nil {
+		if err := run.Client.ManualIntervention(context.Background(), run.AgentID, taskID, node.ID, node.ExecutionID, reason); err != nil {
 			log.Printf("[executor] failed to set manual intervention: %v", err)
 		} else {
 			log.Printf("[executor] node %s set to manual_intervention successfully (reason: %s)", node.Name, reason)
@@ -572,27 +581,24 @@ func (e *TaskExecutor) Execute(run RunContext, node TaskNode) {
 		return
 	}
 
-	if node.NodeType == "review" {
-		// Review node: do not auto-approve. Post the structured review result as a comment.
-		reviewComment := fmt.Sprintf("## Review Completed\n\n**Node:** %s\n\n**Recommendation:** Review analysis complete. A human or authorized agent should make the approve/reject decision.\n\n**Summary:** %s", node.Name, summary)
-		if err := run.Client.PostNodeComment(context.Background(), run.AgentID, taskID, node.ID, "", "code_review", reviewComment); err != nil {
-			log.Printf("[executor] failed to post review comment: %v", err)
-		}
-		log.Printf("[executor] review node %s completed, waiting for review decision (approve/reject)", node.Name)
-	} else {
-		// Standard/manual node: auto-complete after execution
-		handoffComment := e.buildHandoffComment(taskID, node, summary, gitReady)
-		if err := run.Client.CompleteNode(context.Background(), run.AgentID, taskID, node.ID, handoffComment); err != nil {
-			log.Printf("[executor] failed to complete node: %v", err)
-			comment := fmt.Sprintf("Agent finished execution but failed to mark node completed: %v", err)
-			if postErr := run.Client.PostNodeComment(context.Background(), run.AgentID, taskID, node.ID, "", "question", comment); postErr != nil {
-				log.Printf("[executor] failed to post completion failure comment: %v", postErr)
-			}
-			if miErr := run.Client.ManualIntervention(context.Background(), run.AgentID, taskID, node.ID, comment); miErr != nil {
-				log.Printf("[executor] failed to set manual intervention after completion failure: %v", miErr)
-			}
+	handoffComment := e.buildHandoffComment(taskID, node, summary, gitReady)
+	if err := run.Client.CompleteNode(context.Background(), run.AgentID, taskID, node.ID, node.ExecutionID, handoffComment, e.agentExecutionOutput(taskID, gitReady)); err != nil {
+		if IsConflict(err) {
+			// The server rejected this receipt because its execution was
+			// superseded — retry and routing are no longer this run's
+			// business, so no comment and no manual escalation.
+			log.Printf("[executor] complete receipt rejected for execution %s: %v", node.ExecutionID, err)
 			return
 		}
+		log.Printf("[executor] failed to complete node: %v", err)
+		comment := fmt.Sprintf("Agent finished execution but failed to mark node completed: %v", err)
+		if postErr := run.Client.PostNodeComment(context.Background(), run.AgentID, taskID, node.ID, "", "question", comment); postErr != nil {
+			log.Printf("[executor] failed to post completion failure comment: %v", postErr)
+		}
+		if miErr := run.Client.ManualIntervention(context.Background(), run.AgentID, taskID, node.ID, node.ExecutionID, comment); miErr != nil {
+			log.Printf("[executor] failed to set manual intervention after completion failure: %v", miErr)
+		}
+		return
 	}
 
 	log.Printf("[executor] completed node %s for task %d", node.Name, taskID)
@@ -777,11 +783,11 @@ func (e *TaskExecutor) fetchAgentGitIdentity(run *RunContext) (gitName, gitEmail
 // Args:
 //   - taskID: task ID
 //   - node: node information
-//   - attempt: attempt count
+//   - attemptID: the ticket's execution ID, matching the TagNodeStart identity
 //
 // Returns:
 //   - error: returns an error when the branch push fails
-func (e *TaskExecutor) pushIfNeeded(taskID int32, node TaskNode, attempt int) error {
+func (e *TaskExecutor) pushIfNeeded(taskID int32, node TaskNode, attemptID string) error {
 	if e.git == nil || !e.git.IsGitRepo() {
 		return nil
 	}
@@ -791,18 +797,13 @@ func (e *TaskExecutor) pushIfNeeded(taskID int32, node TaskNode, attempt int) er
 		return fmt.Errorf("failed to push branch: %w", err)
 	}
 
-	// Push the node start tag — use the node's SortOrder
-	nodeOrder := int(node.SortOrder)
-	if nodeOrder <= 0 {
-		nodeOrder = ParseNodeOrder(node.Name)
-	}
-	startTag := NodeStartTag(taskID, nodeOrder, attempt)
+	startTag := NodeStartTag(taskID, node.ID, attemptID)
 	if err := e.git.PushTag(startTag); err != nil {
 		log.Printf("[executor] warning: failed to push tag %s: %v", startTag, err)
 	}
 	// The complete tag only exists on runs that reached the completion phase;
 	// push it only when present locally
-	completeTag := NodeCompleteTag(taskID, nodeOrder, attempt)
+	completeTag := NodeCompleteTag(taskID, node.ID, attemptID)
 	if e.git.tagExists(completeTag) {
 		if err := e.git.PushTag(completeTag); err != nil {
 			log.Printf("[executor] warning: failed to push tag %s: %v", completeTag, err)
@@ -858,7 +859,7 @@ func (e *TaskExecutor) Interrupt(taskID int32, nodeID string) error {
 
 	log.Printf("[executor] interrupting task %d node %s", taskID, nodeID)
 	// The interrupted flag (set by the Swap above) makes Execute's err branch
-	// skip reportFailure (ManualIntervention), partial commit, and
+	// skip reportFailure (FailNode), partial commit, and
 	// notifyExecutionFailed; Interrupt owns the interrupt reporting path.
 	e.notifyExecutionInterrupted(taskID, nodeID)
 
@@ -879,17 +880,15 @@ func (e *TaskExecutor) Interrupt(taskID int32, nodeID string) error {
 		}
 	}
 
-	// 3. Force a git commit using the tag interrupted/<node-id>
-	if e.git != nil && e.git.IsGitRepo() {
-		nodeOrder := int(currentNode.SortOrder)
-		if nodeOrder <= 0 {
-			nodeOrder = ParseNodeOrder(currentNode.Name)
-		}
-		interruptMsg := fmt.Sprintf("chore: interrupted by admin [%d node-%d]", taskID, nodeOrder)
+	// 3. Force a git commit using the tag interrupted/<node-id>.
+	// Command tickets do not own the Git flow — interrupting them only kills
+	// the process and acknowledges the interrupt.
+	if e.git != nil && e.git.IsGitRepo() && currentNode.ExecutionKind != ExecutionKindCommand {
+		interruptMsg := fmt.Sprintf("chore: interrupted by admin [%d node-%s]", taskID, currentNode.ID)
 		e.git.CommitAll(interruptMsg)
 
 		// Create the interrupt tag locally first, then push it
-		tag := fmt.Sprintf("%s/node-%d-interrupted-%d", BranchName(taskID), nodeOrder, time.Now().Unix())
+		tag := fmt.Sprintf("%s/node-%s-interrupted-%d", BranchName(taskID), currentNode.ID, time.Now().Unix())
 		if err := e.git.CreateTag(tag); err != nil {
 			log.Printf("[executor] warning: failed to create local interrupt tag: %v", err)
 		} else if err := e.git.PushTag(tag); err != nil {
@@ -918,7 +917,7 @@ func (e *TaskExecutor) Interrupt(taskID int32, nodeID string) error {
 // human can take over locally, but it deliberately does NOT create the
 // interrupted git tag, does NOT PushBranch, and does NOT ReportInterrupt. The
 // node stays in_progress on the server; the err-branch is gated by
-// softInterrupted so neither reportFailure (ManualIntervention) nor
+// softInterrupted so neither reportFailure (FailNode) nor
 // notifyExecutionFailed fires.
 //
 // Data source / permission boundary: this is a local-only control that reuses
@@ -934,6 +933,14 @@ func (e *TaskExecutor) SoftInterrupt(taskID int32, nodeID string) error {
 	if !running || currentTaskID != taskID || currentNode.ID != nodeID {
 		log.Printf("[executor] soft-interrupt rejected: not running task %d node %s", taskID, nodeID)
 		return fmt.Errorf("%w: not running task %d node %s", ErrInterventionNotHeld, taskID, nodeID)
+	}
+
+	// A command has no tool session to take over; a local takeover would only
+	// kill it and set up the handback path to re-run it blindly. Humans stop
+	// commands through the server-aware interrupt instead.
+	if currentNode.ExecutionKind == ExecutionKindCommand {
+		log.Printf("[executor] soft-interrupt rejected: command executions do not support local takeover (task %d node %s)", taskID, nodeID)
+		return fmt.Errorf("%w: command executions do not support local takeover", ErrInterventionNotHeld)
 	}
 
 	log.Printf("[executor] soft-interrupting task %d node %s (server stays unaware)", taskID, nodeID)
@@ -1150,7 +1157,7 @@ func (e *TaskExecutor) CompleteManually(taskID int32, nodeID string) bool {
 	}
 
 	comment := fmt.Sprintf("Node %s completed manually by the local operator.", currentNode.Name)
-	if err := run.Client.CompleteNode(context.Background(), run.AgentID, taskID, nodeID, comment); err != nil {
+	if err := run.Client.CompleteNode(context.Background(), run.AgentID, taskID, nodeID, currentNode.ExecutionID, comment, json.RawMessage("{}")); err != nil {
 		log.Printf("[intervention] manual CompleteNode failed: %v", err)
 		return false
 	}
@@ -1173,12 +1180,18 @@ func (e *TaskExecutor) notifyExecutionStarted(run *RunContext, taskID int32, nod
 	e.mu.Lock()
 	sessionPresent := e.sessionID != ""
 	e.mu.Unlock()
+	// Command tickets run no coding tool — label the local session by their
+	// own execution kind instead of the configured provider.
+	tool := e.cfg.Agent.Provider
+	if node.ExecutionKind == ExecutionKindCommand {
+		tool = "command"
+	}
 	e.observer.OnExecutionStarted(LocalExecutionSession{
 		WorkspaceID:          run.WorkspaceID,
 		TaskID:               taskID,
 		NodeID:               node.ID,
 		NodeName:             node.Name,
-		Tool:                 e.cfg.Agent.Provider,
+		Tool:                 tool,
 		ToolSessionIDPresent: sessionPresent,
 		WorkDir:              workDir,
 	})
@@ -1231,13 +1244,6 @@ func (e *TaskExecutor) CurrentTask() (taskID int32, node TaskNode, ok bool) {
 		return 0, TaskNode{}, false
 	}
 	return e.taskID, e.node, true
-}
-
-// GetGitManager returns the current Git manager, or nil if unavailable.
-func (e *TaskExecutor) GetGitManager() *GitManager {
-	e.currentMu.Lock()
-	defer e.currentMu.Unlock()
-	return e.git
 }
 
 // TestTool is the minimal interface tests use to replace the real coding tool.
@@ -1436,25 +1442,43 @@ func (e *TaskExecutor) buildPromptWithClient(client *Client, workspaceID, agentI
 	return context, nil
 }
 
-// reportFailure reports the execution failure as a manual_intervention status, requesting
-// human intervention.
+// agentExecutionOutput builds the structured output receipt of a completed
+// agent task: the Git location of the produced work when a repository is
+// available, an empty object otherwise.
+func (e *TaskExecutor) agentExecutionOutput(taskID int32, gitReady bool) json.RawMessage {
+	if !gitReady || e.git == nil || !e.git.IsGitRepo() {
+		return json.RawMessage("{}")
+	}
+	commit := ""
+	if head, err := e.git.HeadCommit(); err == nil {
+		commit = head
+	}
+	raw, err := json.Marshal(map[string]any{
+		"git": map[string]string{
+			"branch": BranchName(taskID),
+			"commit": commit,
+		},
+	})
+	if err != nil {
+		return json.RawMessage("{}")
+	}
+	return raw
+}
+
+// reportFailure reports an ordinary execution failure through FailNode. This
+// is purely an execution semantic: the server alone decides retry, routing and
+// node state from the error code. Local takeovers and git-result reviews keep
+// using ManualIntervention instead.
 //
 // Args:
 //   - taskID: task ID
-//   - nodeID: node ID
+//   - node: the failed node ticket (its ExecutionID ties the report to the run)
+//   - code: execution error code (workspace_setup_failed / agent_execution_failed)
 //   - err: the error that caused the failure
-func (e *TaskExecutor) reportFailure(run *RunContext, taskID int32, nodeID string, err error) {
-	comment := fmt.Sprintf("Execution failed: %v\nManual intervention required.", err)
-	if reportErr := run.Client.ManualIntervention(context.Background(), run.AgentID, taskID, nodeID, comment); reportErr != nil {
-		log.Printf("[executor] failed to report manual intervention: %v", reportErr)
+func (e *TaskExecutor) reportFailure(run *RunContext, taskID int32, node TaskNode, code string, err error) {
+	if reportErr := run.Client.FailNode(context.Background(), run.AgentID, taskID, node.ID, node.ExecutionID, code, err.Error()); reportErr != nil {
+		log.Printf("[executor] failed to report execution failure: %v", reportErr)
 	}
-}
-
-// ParseNodeOrder extracts the node sequence number from the node name (e.g. "1. Requirements Analysis" returns 1).
-func ParseNodeOrder(name string) int {
-	order := 0
-	fmt.Sscanf(name, "%d.", &order)
-	return order
 }
 
 // generateSummary generates a work summary for the completed node,

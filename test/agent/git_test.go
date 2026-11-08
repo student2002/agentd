@@ -24,26 +24,13 @@ func TestBranchName(t *testing.T) {
 }
 
 // TestNodeStartTag verifies that NodeStartTag returns the expected format
-// "teammate/task-{taskID}/node-{order}/attempt-{attempt}/start", used to track
-// Git state at the start of each node execution attempt.
+// "teammate/task-{taskID}/node-{nodeID}/attempt-{attemptID}/start", used to
+// track Git state at the start of each node execution attempt.
 func TestNodeStartTag(t *testing.T) {
-	got := agent.NodeStartTag(123, 2, 1)
-	want := "teammate/task-123/node-2/attempt-1/start"
+	got := agent.NodeStartTag(123, "node-abc", "exec-1")
+	want := "teammate/task-123/node-node-abc/attempt-exec-1/start"
 	if got != want {
 		t.Errorf("NodeStartTag = %q, want %q", got, want)
-	}
-}
-
-// TestCurrentTime verifies that CurrentTime returns a reasonable Unix
-// timestamp (non-zero and greater than one billion).
-func TestCurrentTime(t *testing.T) {
-	gm := agent.NewGitManager(t.TempDir())
-	ts := gm.CurrentTime()
-	if ts == 0 {
-		t.Error("CurrentTime() returned 0, expected a real timestamp")
-	}
-	if ts < 1000000000 {
-		t.Errorf("CurrentTime() = %d, seems too small for a unix timestamp", ts)
 	}
 }
 
@@ -369,78 +356,20 @@ func TestGitManager_TagNodeStart(t *testing.T) {
 		t.Fatalf("Clone failed: %v", err)
 	}
 
-	if err := gm.TagNodeStart(789, 1, 1); err != nil {
+	if err := gm.TagNodeStart(789, "node-abc", "exec-1"); err != nil {
 		t.Fatalf("TagNodeStart failed: %v", err)
 	}
 
-	cmd := exec.Command("git", "tag", "-l", "teammate/task-789/node-1/attempt-1/start")
+	cmd := exec.Command("git", "tag", "-l", "teammate/task-789/node-node-abc/attempt-exec-1/start")
 	cmd.Dir = workDir
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("git tag list failed: %v", err)
 	}
 	got := strings.TrimSpace(string(out))
-	want := "teammate/task-789/node-1/attempt-1/start"
+	want := "teammate/task-789/node-node-abc/attempt-exec-1/start"
 	if got != want {
 		t.Errorf("tag = %q, want %q", got, want)
-	}
-}
-
-// TestGitManager_ResetToNode verifies that ResetToNode can reset the working
-// tree to the node's starting tag, discarding uncommitted changes.
-func TestGitManager_ResetToNode(t *testing.T) {
-	remoteDir, cleanup := setupTestRepo(t)
-	defer cleanup()
-
-	workDir := filepath.Join(t.TempDir(), "workspace")
-	gm := agent.NewGitManager(workDir)
-	if err := gm.Clone(remoteDir, "master"); err != nil {
-		t.Fatalf("Clone failed: %v", err)
-	}
-	if err := gm.TagNodeStart(9001, 1, 1); err != nil {
-		t.Fatalf("TagNodeStart failed: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(workDir, "changed.txt"), []byte("changed"), 0644); err != nil {
-		t.Fatalf("write file: %v", err)
-	}
-	if err := gm.CommitAll("test: make change"); err != nil {
-		t.Fatalf("CommitAll failed: %v", err)
-	}
-
-	if _, err := os.Stat(filepath.Join(workDir, "changed.txt")); err != nil {
-		t.Fatalf("changed.txt should exist before reset: %v", err)
-	}
-
-	if err := gm.ResetToNode(9001, 1, 1); err != nil {
-		t.Fatalf("ResetToNode failed: %v", err)
-	}
-
-	if _, err := os.Stat(filepath.Join(workDir, "changed.txt")); err == nil {
-		t.Error("changed.txt should not exist after reset")
-	}
-}
-
-// TestGitManager_SnapshotBeforeReject verifies that CreateSnapshot commits the
-// current state before a reject operation rolls back changes.
-func TestGitManager_SnapshotBeforeReject(t *testing.T) {
-	remoteDir, cleanup := setupTestRepo(t)
-	defer cleanup()
-
-	workDir := filepath.Join(t.TempDir(), "workspace")
-	gm := agent.NewGitManager(workDir)
-	if err := gm.Clone(remoteDir, "master"); err != nil {
-		t.Fatalf("Clone failed: %v", err)
-	}
-
-	tag, err := gm.SnapshotBeforeReject(42)
-	if err != nil {
-		t.Fatalf("SnapshotBeforeReject failed: %v", err)
-	}
-	if !strings.HasPrefix(tag, "teammate/task-42/before-reject-") {
-		t.Errorf("tag = %q, want prefix teammate/task-42/before-reject-", tag)
-	}
-	if strings.HasSuffix(tag, "-0") {
-		t.Errorf("tag ends with -0, currentTime() bug: tag = %q", tag)
 	}
 }
 

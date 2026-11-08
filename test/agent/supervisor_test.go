@@ -74,7 +74,7 @@ func newFakeWorkspace(alias, token, workspaceID, daemonID string, uuids map[stri
 func (w *fakeWorkspace) pushEvent(t *testing.T, taskID int32, agentUUID string) {
 	t.Helper()
 	select {
-	case w.events <- fmt.Sprintf("event: node:pending\ndata: {\"agent_id\":%q,\"task_id\":%d}\n\n", agentUUID, taskID):
+	case w.events <- fmt.Sprintf("event: node:ready\ndata: {\"agent_id\":%q,\"task_id\":%d}\n\n", agentUUID, taskID):
 	default:
 		t.Logf("workspace %s event channel full; watcher polling will pick the node up", w.alias)
 	}
@@ -220,7 +220,7 @@ func (f *fakeTeammate) handler(t *testing.T) http.Handler {
 		})
 	})
 
-	// Daemon SSE stream per workspace: replays pushed node:pending events.
+	// Daemon SSE stream per workspace: replays pushed node:ready events.
 	mux.HandleFunc("/api/workspaces/", func(w http.ResponseWriter, r *http.Request) {
 		parts := strings.Split(r.URL.Path, "/")
 		// /api/workspaces/{ws}/...
@@ -293,7 +293,7 @@ func (f *fakeTeammate) handler(t *testing.T) http.Handler {
 				return
 			}
 			writeJSON(w, []map[string]interface{}{
-				{"id": nodeID(taskID), "task_id": taskID, "name": "1. code", "node_type": "standard", "status": "pending", "assignee_type": "agent", "sort_order": 1},
+				{"id": nodeID(taskID), "task_id": taskID, "name": "1. code", "status": "ready", "execution_id": executionID(taskID), "execution_kind": "agent", "instruction": "do the work", "timeout_minutes": 30},
 			})
 		case strings.HasSuffix(r.URL.Path, "/claim"):
 			ws.mu.Lock()
@@ -312,7 +312,7 @@ func (f *fakeTeammate) handler(t *testing.T) http.Handler {
 			ws.claims[taskID] = r.Header.Get("X-Agent-ID")
 			ws.mu.Unlock()
 			writeJSON(w, map[string]interface{}{
-				"id": nodeID(taskID), "task_id": taskID, "name": "1. code", "node_type": "standard", "status": "in_progress", "assignee_type": "agent", "sort_order": 1,
+				"id": nodeID(taskID), "task_id": taskID, "name": "1. code", "status": "running", "execution_id": executionID(taskID), "execution_kind": "agent", "instruction": "do the work", "timeout_minutes": 30,
 			})
 		case strings.HasSuffix(r.URL.Path, "/complete"):
 			ws.mu.Lock()
@@ -348,6 +348,8 @@ func (f *fakeTeammate) handler(t *testing.T) http.Handler {
 }
 
 func nodeID(taskID int32) string { return fmt.Sprintf("n%d", taskID) }
+
+func executionID(taskID int32) string { return fmt.Sprintf("exec-n%d", taskID) }
 
 func writeJSON(w http.ResponseWriter, value interface{}) {
 	w.Header().Set("Content-Type", "application/json")

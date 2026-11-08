@@ -253,14 +253,14 @@ func TestSupervisorRoutesEventsByAgentID(t *testing.T) {
 		t.Fatal("team-a/reviewer runtime missing")
 	}
 
-	// node:pending for uuid-a1 routes through team-a's connection only.
-	sup.HandleDaemonEventForTest("team-a", "node:pending", json.RawMessage(`{"agent_id":"uuid-a1","task_id":1}`))
+	// node:ready for uuid-a1 routes through team-a's connection only.
+	sup.HandleDaemonEventForTest("team-a", "node:ready", json.RawMessage(`{"agent_id":"uuid-a1","task_id":1}`))
 
 	// An agent_id belonging to another workspace's connection is dropped.
-	sup.HandleDaemonEventForTest("team-a", "node:pending", json.RawMessage(`{"agent_id":"uuid-b1","task_id":2}`))
+	sup.HandleDaemonEventForTest("team-a", "node:ready", json.RawMessage(`{"agent_id":"uuid-b1","task_id":2}`))
 
 	// Unknown agent_id must be dropped without panicking.
-	sup.HandleDaemonEventForTest("team-a", "node:pending", json.RawMessage(`{"agent_id":"uuid-unknown"}`))
+	sup.HandleDaemonEventForTest("team-a", "node:ready", json.RawMessage(`{"agent_id":"uuid-unknown"}`))
 
 	// Broadcast event reaches the connection's materialized runtimes
 	// (sync:required carries no agent_id).

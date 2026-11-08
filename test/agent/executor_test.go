@@ -8,30 +8,6 @@ import (
 	"github.com/teammate/agentd/internal/agent"
 )
 
-// TestParseNodeOrder verifies that ParseNodeOrder correctly extracts a numeric prefix from a node name (e.g. "3. Implementation" → 3), and returns 0 when there is no numeric prefix.
-func TestParseNodeOrder(t *testing.T) {
-	tests := []struct {
-		name  string
-		input string
-		want  int
-	}{
-		{"numbered", "1. Requirement Analysis", 1},
-		{"numbered2", "3. Implementation", 3},
-		{"no number", "review", 0},
-		{"empty", "", 0},
-		{"double digit", "12. Test", 12},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := agent.ParseNodeOrder(tt.input)
-			if got != tt.want {
-				t.Errorf("ParseNodeOrder(%q) = %d, want %d", tt.input, got, tt.want)
-			}
-		})
-	}
-}
-
 // TestTaskExecutor_IsRunning verifies that a newly created TaskExecutor returns false from IsRunning() before task execution begins.
 func TestTaskExecutor_IsRunning(t *testing.T) {
 	cfg := &agent.Config{
@@ -79,7 +55,7 @@ func TestTaskExecutorObserverReportsExecutionLifecycle(t *testing.T) {
 	client := agent.NewClient(cfg.Server.URL, "td_fake_token")
 	observer := &recordingExecutionObserver{}
 	executor := agent.NewTaskExecutorWithObserver(cfg, observer)
-	node := agent.TaskNode{ID: "node-1", Name: "code", SortOrder: 1, NodeType: "standard"}
+	node := agent.TaskNode{ID: "node-1", Name: "code", ExecutionID: "exec-node-1", ExecutionKind: agent.ExecutionKindAgent}
 
 	executor.Execute(agent.RunContext{
 		Client:      client,

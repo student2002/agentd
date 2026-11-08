@@ -10,12 +10,12 @@
 //   - ConfigureCredential / CleanupCredential: temporary askpass script
 //     management, safely injecting the Git PAT
 //   - PushBranch / PushTag / CommitAll: code commit and push operations
-//   - TagNodeStart / ResetToNode: node-level tag creation and state rollback
+//   - TagNodeStart / TagNodeComplete: node-level tag creation for execution tracking
 //   - BranchName / NodeStartTag: branch and tag naming convention generation
 //
 // Branch naming convention: teammate/task-{taskID}
 // Tag naming convention:
-// teammate/task-{taskID}/node-{order}/attempt-{attempt}/start
+// teammate/task-{taskID}/node-{nodeID}/attempt-{executionID}/start
 package agent
 
 import (
@@ -25,8 +25,6 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
-
-	"github.com/teammate/agentd/internal/clock"
 )
 
 // GitManager encapsulates Git operations, providing repository cloning, branch
@@ -36,12 +34,11 @@ type GitManager struct {
 	workDir     string
 	env         []string // extra environment variables (e.g. GIT_ASKPASS)
 	askpassPath string
-	clk         clock.Clock
 }
 
 // NewGitManager creates a new Git manager.
 func NewGitManager(workDir string) *GitManager {
-	return &GitManager{workDir: workDir, clk: clock.RealClock{}}
+	return &GitManager{workDir: workDir}
 }
 
 // Clone clones the remote repository into the work directory.
@@ -510,10 +507,11 @@ func (g *GitManager) PushBranch(taskID int32) error {
 	return nil
 }
 
-// TagNodeStart creates a tag marking the start of a node; the attempt parameter
-// prevents tag conflicts when a node is re-executed.
-func (g *GitManager) TagNodeStart(taskID int32, nodeOrder, attempt int) error {
-	tag := NodeStartTag(taskID, nodeOrder, attempt)
+// TagNodeStart creates a tag marking the start of a node execution; the
+// attemptID (the ticket's execution ID) prevents tag conflicts when the node
+// is re-executed.
+func (g *GitManager) TagNodeStart(taskID int32, nodeID, attemptID string) error {
+	tag := NodeStartTag(taskID, nodeID, attemptID)
 	cmd := exec.Command("git", "tag", tag)
 	cmd.Dir = g.workDir
 	cmd.Env = append(os.Environ(), g.env...)
@@ -525,9 +523,10 @@ func (g *GitManager) TagNodeStart(taskID int32, nodeOrder, attempt int) error {
 
 // TagNodeComplete creates a tag marking the completion of a node, corresponding
 // to TagNodeStart and marking the end of node execution.
-// The attempt parameter prevents tag conflicts when a node is re-executed.
-func (g *GitManager) TagNodeComplete(taskID int32, nodeOrder, attempt int) error {
-	tag := NodeCompleteTag(taskID, nodeOrder, attempt)
+// The attemptID (the ticket's execution ID) prevents tag conflicts when the
+// node is re-executed.
+func (g *GitManager) TagNodeComplete(taskID int32, nodeID, attemptID string) error {
+	tag := NodeCompleteTag(taskID, nodeID, attemptID)
 	cmd := exec.Command("git", "tag", tag)
 	cmd.Dir = g.workDir
 	cmd.Env = append(os.Environ(), g.env...)
@@ -572,39 +571,6 @@ func (g *GitManager) tagExists(tag string) bool {
 	cmd := exec.Command("git", "rev-parse", "--verify", tag)
 	cmd.Dir = g.workDir
 	return cmd.Run() == nil
-}
-
-// ResetToNode resets the working tree to the state at the start of the specified
-// node; the attempt parameter matches the one used in TagNodeStart.
-func (g *GitManager) ResetToNode(taskID int32, nodeOrder, attempt int) error {
-	tag := NodeStartTag(taskID, nodeOrder, attempt)
-
-	// Verify the tag exists
-	if !g.tagExists(tag) {
-		return fmt.Errorf("tag %s does not exist", tag)
-	}
-
-	// Perform the reset
-	cmd := exec.Command("git", "reset", "--hard", tag)
-	cmd.Dir = g.workDir
-	cmd.Env = append(os.Environ(), g.env...)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("git reset --hard %s: %s: %w", tag, string(out), err)
-	}
-	return nil
-}
-
-// SnapshotBeforeReject creates a snapshot tag before rejecting a node.
-func (g *GitManager) SnapshotBeforeReject(taskID int32) (string, error) {
-	tag := fmt.Sprintf("%s/before-reject-%d", BranchName(taskID), g.CurrentTime())
-	cmd := exec.Command("git", "tag", tag)
-	cmd.Dir = g.workDir
-	cmd.Env = append(os.Environ(), g.env...)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return "", fmt.Errorf("git tag %s: %s: %w", tag, string(out), err)
-	}
-	return tag, nil
 }
 
 // CommitAll stages all changes and commits.
@@ -702,20 +668,17 @@ func BranchName(taskID int32) string {
 }
 
 // NodeStartTag generates the node start tag, in the format
-// "teammate/task-{taskID}/node-{order}/attempt-{attempt}/start".
-func NodeStartTag(taskID int32, nodeOrder, attempt int) string {
-	return fmt.Sprintf("%s/node-%d/attempt-%d/start", BranchName(taskID), nodeOrder, attempt)
+// "teammate/task-{taskID}/node-{nodeID}/attempt-{attemptID}/start".
+// nodeID and attemptID (the ticket's execution ID) are opaque protocol
+// identities and must be valid Git ref components.
+func NodeStartTag(taskID int32, nodeID, attemptID string) string {
+	return fmt.Sprintf("%s/node-%s/attempt-%s/start", BranchName(taskID), nodeID, attemptID)
 }
 
 // NodeCompleteTag generates the node complete tag, in the format
-// "teammate/task-{taskID}/node-{order}/attempt-{attempt}/complete".
+// "teammate/task-{taskID}/node-{nodeID}/attempt-{attemptID}/complete".
 // Corresponding to NodeStartTag, it marks the commit at the end of node
 // execution.
-func NodeCompleteTag(taskID int32, nodeOrder, attempt int) string {
-	return fmt.Sprintf("%s/node-%d/attempt-%d/complete", BranchName(taskID), nodeOrder, attempt)
-}
-
-// CurrentTime returns the Unix timestamp used for tags.
-func (g *GitManager) CurrentTime() int64 {
-	return g.clk.Now().Unix()
+func NodeCompleteTag(taskID int32, nodeID, attemptID string) string {
+	return fmt.Sprintf("%s/node-%s/attempt-%s/complete", BranchName(taskID), nodeID, attemptID)
 }

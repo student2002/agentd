@@ -28,13 +28,5 @@ func terminateTree(cmd *exec.Cmd, timeout time.Duration) error {
 	if err := taskkill.Run(); err != nil && !errors.Is(err, os.ErrProcessDone) {
 		_ = cmd.Process.Kill()
 	}
-
-	deadline := time.NewTimer(timeout)
-	defer deadline.Stop()
-	select {
-	case <-deadline.C:
-		return nil
-	default:
-		return nil
-	}
+	return nil
 }
