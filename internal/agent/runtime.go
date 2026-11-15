@@ -30,6 +30,7 @@ type runtimeIdentity struct {
 	workspaceID string
 	client      *Client
 	watcher     *NodeWatcher
+	invocations *InvocationManager
 }
 
 // connectionHealth tracks the owning connection's SSE/heartbeat state for the
@@ -52,10 +53,12 @@ type AgentRuntime struct {
 	identity *runtimeIdentity
 	health   connectionHealth
 
-	exec        *TaskExecutor
-	localState  *LocalStateStore
-	localEvents *LocalEventHub
-	logBuffer   *LogBuffer
+	exec                  *TaskExecutor
+	gate                  *ExecutionGate // shared execution slot across nodes and invocations
+	localState            *LocalStateStore
+	localEvents           *LocalEventHub
+	logBuffer             *LogBuffer
+	invocationToolFactory func(provider, path string) tool.Tool
 
 	mu       sync.Mutex
 	stopCh   chan struct{}
@@ -84,6 +87,7 @@ func NewAgentRuntime(view *Config, connName, name string) *AgentRuntime {
 		name:        name,
 		view:        view,
 		exec:        exec,
+		gate:        NewExecutionGate(),
 		localState:  localState,
 		localEvents: localEvents,
 		logBuffer:   logBuffer,
@@ -156,6 +160,14 @@ func (r *AgentRuntime) SetToolFactory(factory func() tool.Tool) {
 	r.exec.SetToolFactory(factory)
 }
 
+// SetInvocationToolFactory injects the shared provider tool factory for
+// the invocation manager (same factory as executor, chat and probing).
+func (r *AgentRuntime) SetInvocationToolFactory(factory func(provider, path string) tool.Tool) {
+	r.mu.Lock()
+	r.invocationToolFactory = factory
+	r.mu.Unlock()
+}
+
 // Watchers exposes the instance's node watcher (local control API); empty
 // while the identity is not bound yet.
 func (r *AgentRuntime) Watchers() []*NodeWatcher {
@@ -186,18 +198,33 @@ func (r *AgentRuntime) BindIdentity(agentUUID string, client *Client, workspaceI
 		r.mu.Unlock()
 		return
 	}
-	if r.identity != nil && r.identity.watcher != nil {
-		r.identity.watcher.Stop()
-	}
+	previous := r.identity
 	identity := &runtimeIdentity{
 		agentUUID:   agentUUID,
 		workspaceID: workspaceID,
 		client:      client,
 	}
-	identity.watcher = NewNodeWatcher(client, r.exec, r.connName, agentUUID, workspaceID, 60*time.Second)
+	manager := NewInvocationManager(r.view, client, r.gate, agentUUID, workspaceID, r.view.Agent.Provider)
+	manager.SetToolFactory(r.invocationToolFactory)
+	identity.watcher = NewNodeWatcher(client, r.exec, r.gate, r.connName, agentUUID, workspaceID, 60*time.Second)
+	identity.invocations = manager
 	r.identity = identity
 	watcher := identity.watcher
 	r.mu.Unlock()
+
+	// Retire the previous identity's workers OUTSIDE r.mu: their shutdown
+	// waits for in-flight work whose release hook takes r.mu, so stopping
+	// them under the lock would deadlock.
+	if previous != nil {
+		if previous.watcher != nil {
+			previous.watcher.Stop()
+		}
+		if previous.invocations != nil {
+			// The old identity manager keeps scanning with stale credentials
+			// until stopped; a UUID change retires it.
+			previous.invocations.Stop()
+		}
+	}
 
 	r.localState.SetAgentIdentity(workspaceID, agentUUID)
 	r.localEvents.PublishSnapshot("agent.registered", r.localState.Snapshot())
@@ -206,6 +233,17 @@ func (r *AgentRuntime) BindIdentity(agentUUID string, client *Client, workspaceI
 	watcher.Start()
 	log.Printf("[agent=%s] node watcher started for connection %s (60s interval, fallback when SSE disconnected)", r.name, r.connName)
 	go watcher.TriggerPoll()
+	// A terminal release wakes both consumers: the invocation scanner
+	// immediately and the node watcher (plan §9.1). The hook resolves the
+	// current identity dynamically so a rebind retargets it automatically.
+	r.gate.SetReleaseHook(func() {
+		if id := r.identitySnapshot(); id != nil && id.invocations != nil {
+			id.invocations.TriggerScan()
+		}
+		r.triggerPoll()
+	})
+	manager.Start()
+	log.Printf("[agent=%s] invocation manager started for connection %s", r.name, r.connName)
 }
 
 // SetSSE mirrors the connection's SSE state into the snapshot.
@@ -284,6 +322,24 @@ func (r *AgentRuntime) HandleEvent(eventType string, data json.RawMessage) {
 		log.Printf("[agent=%s] received node:timeout, interrupting executor", r.name)
 		go r.handleNodeTimeout(data)
 
+	case "invocation:ready":
+		log.Printf("[agent=%s] received invocation:ready, triggering invocation scan", r.name)
+		if identity.invocations != nil {
+			identity.invocations.TriggerScan()
+		}
+
+	case "invocation:cancel_requested":
+		log.Printf("[agent=%s] received invocation:cancel_requested", r.name)
+		if identity.invocations != nil {
+			identity.invocations.HandleCancelRequested(parseEventID(data, "invocation_id"), parseEventID(data, "execution_id"))
+		}
+
+	case "invocation:cancelled":
+		log.Printf("[agent=%s] received invocation:cancelled", r.name)
+		if identity.invocations != nil {
+			identity.invocations.HandleCancelled(parseEventID(data, "invocation_id"))
+		}
+
 	default:
 		log.Printf("[agent=%s] unhandled SSE event type: %s", r.name, eventType)
 	}
@@ -327,6 +383,9 @@ func (r *AgentRuntime) Stop() {
 	r.stopOnce.Do(func() {
 		close(r.stopCh)
 	})
+	if identity := r.identitySnapshot(); identity != nil && identity.invocations != nil {
+		identity.invocations.Stop()
+	}
 	r.StopWatchers()
 	r.exec.Stop()
 	log.Printf("[agent=%s] executor stopped", r.name)
@@ -365,6 +424,15 @@ func (r *AgentRuntime) handleNodeTimeout(data json.RawMessage) {
 	}
 }
 
+// parseEventID extracts one id string field from an event payload.
+func parseEventID(data json.RawMessage, field string) string {
+	var payload map[string]string
+	if err := json.Unmarshal(data, &payload); err != nil {
+		return ""
+	}
+	return payload[field]
+}
+
 // handleContinuationInvite handles the continuation invitation event on the
 // bound identity.
 func (r *AgentRuntime) handleContinuationInvite(identity *runtimeIdentity, data json.RawMessage) {
@@ -378,23 +446,35 @@ func (r *AgentRuntime) handleContinuationInvite(identity *runtimeIdentity, data 
 		return
 	}
 
+	// The shared slot is taken before the server claim; when it is busy the
+	// invite is dropped instead of racing a running execution (the server-side
+	// node stays claimable for the next poll).
+	release, ok := r.gate.TryAcquire()
+	if !ok {
+		log.Printf("[agent=%s] continuation node %s skipped: execution slot busy", r.name, payload.NodeID)
+		return
+	}
+
 	log.Printf("[agent=%s] auto-claiming continuation node %s for task %d", r.name, payload.NodeID, payload.TaskID)
 	claimed, err := identity.client.ClaimNode(context.Background(), identity.agentUUID, payload.TaskID, payload.NodeID)
 	if err != nil {
+		release()
 		log.Printf("[agent=%s] failed to claim continuation node: %v", r.name, err)
 		return
 	}
 
-	log.Printf("[agent=%s] claimed continuation node %s (%s) for task %d", r.name, claimed.ID, claimed.Name, payload.TaskID)
-	go r.exec.Execute(RunContext{
-		Client:      identity.client,
-		ConnName:    r.connName,
-		AgentID:     identity.agentUUID,
-		WorkspaceID: identity.workspaceID,
-		ProjectID:   payload.ProjectID,
-		TaskID:      payload.TaskID,
-		NodeID:      claimed.ID,
-	}, *claimed)
+	go func() {
+		defer release()
+		r.exec.Execute(RunContext{
+			Client:      identity.client,
+			ConnName:    r.connName,
+			AgentID:     identity.agentUUID,
+			WorkspaceID: identity.workspaceID,
+			ProjectID:   payload.ProjectID,
+			TaskID:      payload.TaskID,
+			NodeID:      claimed.ID,
+		}, *claimed)
+	}()
 }
 
 // handleMentionTrigger handles the mention:trigger event.

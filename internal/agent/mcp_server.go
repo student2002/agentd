@@ -29,6 +29,7 @@ type MCPServerConfig struct {
 	Connection   string
 	WorkspaceID  string
 	AgentID      string
+	ProjectID    string
 	ServerURL    string
 	Token        string
 	MemoryRoot   string // "" → DefaultMemoryRoot()
@@ -165,7 +166,7 @@ func mcpToolDefs() []map[string]interface{} {
 	stringProp := func(description string) map[string]interface{} {
 		return map[string]interface{}{"type": "string", "description": description}
 	}
-	return []map[string]interface{}{
+	defs := []map[string]interface{}{
 		{
 			"name":        "search_instance_memory",
 			"description": "Search this instance's persistent memory (shared across all workspaces this instance works in) by keyword. Use it to recall earlier decisions, conventions and project knowledge.",
@@ -181,7 +182,7 @@ func mcpToolDefs() []map[string]interface{} {
 			"inputSchema": map[string]interface{}{"type": "object", "properties": map[string]interface{}{}},
 		},
 		{
-			"name": "write_instance_memory",
+			"name":        "write_instance_memory",
 			"description": "Append one durable memory entry for this instance (decisions, conventions, project knowledge worth keeping for future tasks). Before writing, call search_instance_memory (or read_instance_memory) and check whether the fact is already recorded — duplicate entries accumulate verbatim, so write only facts that are new or changed. Keep entries short and factual.",
 			"inputSchema": map[string]interface{}{
 				"type":       "object",
@@ -198,7 +199,23 @@ func mcpToolDefs() []map[string]interface{} {
 				"required":   []string{"keyword"},
 			},
 		},
+		{
+			"name":        "dispatch_task_to_machine",
+			"description": "Create a directed task on the Teammate server targeted to another machine's agentd (cross-machine dispatch). The target machine's agent claims and executes it there; results stay on the server where you can read them with the normal task tools. Requires the workflow template id to instantiate (take it from the project's workflow configuration — e.g. a single agent-node template prepared for dispatch) and the target machine's daemon name (the workspace's daemon list).",
+			"inputSchema": map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"title":          stringProp("task title"),
+					"description":    stringProp("what the target machine's agent should do"),
+					"template_id":    stringProp("workflow template id to instantiate (from the project's workflow configuration)"),
+					"target_machine": stringProp("target machine's daemon name (e.g. box-b)"),
+					"project_id":     stringProp("optional project id; defaults to the current run's project"),
+				},
+				"required": []string{"title", "template_id", "target_machine"},
+			},
+		},
 	}
+	return append(defs, mcpInvocationToolDefs()...)
 }
 
 // callMemoryTool executes one tool call and returns the text content plus an
@@ -271,7 +288,34 @@ func callMemoryTool(ctx context.Context, store *MemoryStore, cfg MCPServerConfig
 		}
 		return sb.String(), false
 
+	case "dispatch_task_to_machine":
+		title := argString("title")
+		templateID := argString("template_id")
+		target := argString("target_machine")
+		if title == "" || templateID == "" || target == "" {
+			return "title, template_id and target_machine are required", true
+		}
+		if cfg.ServerURL == "" || cfg.Token == "" || cfg.AgentID == "" {
+			return "dispatch unavailable: no connection credentials in this execution context", true
+		}
+		projectID := argString("project_id")
+		if projectID == "" {
+			projectID = cfg.ProjectID
+		}
+		if projectID == "" {
+			return "project_id is required (no current run project in this execution context)", true
+		}
+		description := argString("description")
+		taskID, err := NewClient(cfg.ServerURL, cfg.Token).DispatchTaskToMachine(ctx, cfg.AgentID, projectID, templateID, title, description, target)
+		if err != nil {
+			return fmt.Sprintf("dispatch failed: %v", err), true
+		}
+		return fmt.Sprintf("task %d created on machine %q; its agent will claim and execute it there", taskID, target), false
+
 	default:
+		if text, isErr, handled := callInvocationTool(ctx, cfg, name, args); handled {
+			return text, isErr
+		}
 		return fmt.Sprintf("unknown tool %q", name), true
 	}
 }

@@ -21,7 +21,7 @@ func TestNodeWatcherPausedStopsClaiming(t *testing.T) {
 	}
 	client := agent.NewClient(cfg.Server.URL, "td_fake_token")
 	executor := agent.NewTaskExecutor(cfg)
-	watcher := agent.NewNodeWatcher(client, executor, "team-a", "agent-1", "ws-1", 10*time.Millisecond)
+	watcher := agent.NewNodeWatcher(client, executor, agent.NewExecutionGate(), "team-a", "agent-1", "ws-1", 10*time.Millisecond)
 
 	if watcher.IsPaused() {
 		t.Fatal("new watcher should not be paused")

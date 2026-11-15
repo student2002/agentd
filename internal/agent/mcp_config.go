@@ -192,6 +192,7 @@ func WriteTeammateMemoryMCPEntry(run RunContext, cfg *Config, workDir string) (s
 			MCPCtxAgentID:     run.AgentID,
 			MCPCtxServerURL:   run.Client.BaseURL,
 			MCPCtxToken:       run.Client.APIToken,
+			MCPCtxProjectID:   run.ProjectID,
 		},
 	}
 

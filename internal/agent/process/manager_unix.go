@@ -13,6 +13,7 @@ import (
 
 func prepareCommand(cmd *exec.Cmd) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	prepareLinuxWrapper(cmd)
 }
 
 func terminateTree(cmd *exec.Cmd, timeout time.Duration) error {

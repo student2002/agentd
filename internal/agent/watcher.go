@@ -34,6 +34,7 @@ import (
 type NodeWatcher struct {
 	client      *Client
 	executor    *TaskExecutor
+	gate        *ExecutionGate // shared execution slot of this agent instance
 	connName    string
 	agentID     string
 	workspaceID string
@@ -48,11 +49,12 @@ type NodeWatcher struct {
 
 // NewNodeWatcher creates a new node watcher scoped to one (connection,
 // instance) identity.
-func NewNodeWatcher(client *Client, executor *TaskExecutor, connName, agentID, workspaceID string, interval time.Duration) *NodeWatcher {
+func NewNodeWatcher(client *Client, executor *TaskExecutor, gate *ExecutionGate, connName, agentID, workspaceID string, interval time.Duration) *NodeWatcher {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &NodeWatcher{
 		client:      client,
 		executor:    executor,
+		gate:        gate,
 		connName:    connName,
 		agentID:     agentID,
 		workspaceID: workspaceID,
@@ -200,16 +202,24 @@ func (w *NodeWatcher) recoverInProgressNodes() {
 		return
 	}
 
+	release, ok := w.gate.TryAcquire()
+	if !ok {
+		return // the shared slot is busy; a later poll resumes the node
+	}
+
 	log.Printf("[watcher] recovering in-progress node %s (%s) for task %d", node.ID, node.Name, node.TaskID)
-	go w.executor.Execute(RunContext{
-		Client:      w.client,
-		ConnName:    w.connName,
-		AgentID:     w.agentID,
-		WorkspaceID: w.workspaceID,
-		ProjectID:   node.ProjectID,
-		TaskID:      node.TaskID,
-		NodeID:      node.ID,
-	}, node.TaskNode) // resume with the original ticket, keeping the original execution ID
+	go func() {
+		defer release()
+		w.executor.Execute(RunContext{
+			Client:      w.client,
+			ConnName:    w.connName,
+			AgentID:     w.agentID,
+			WorkspaceID: w.workspaceID,
+			ProjectID:   node.ProjectID,
+			TaskID:      node.TaskID,
+			NodeID:      node.ID,
+		}, node.TaskNode) // resume with the original ticket, keeping the original execution ID
+	}()
 }
 
 // pollProject checks the ready execution tickets in a single project, attempts
@@ -277,8 +287,16 @@ func (w *NodeWatcher) pollProject(projectID string) {
 		default:
 		}
 
+		// Take the shared slot before the server claim so a claimed node
+		// never queues behind another execution locally.
+		release, ok := w.gate.TryAcquire()
+		if !ok {
+			return
+		}
+
 		claimed, err := w.client.ClaimNode(w.ctx, w.agentID, task.TaskID, firstReady.ID)
 		if err != nil {
+			release()
 			if w.ctx.Err() != nil {
 				return
 			}
@@ -287,15 +305,18 @@ func (w *NodeWatcher) pollProject(projectID string) {
 		}
 
 		log.Printf("[watcher] claimed node %s (%s) for task %d", claimed.ID, claimed.Name, task.TaskID)
-		go w.executor.Execute(RunContext{
-			Client:      w.client,
-			ConnName:    w.connName,
-			AgentID:     w.agentID,
-			WorkspaceID: w.workspaceID,
-			ProjectID:   projectID,
-			TaskID:      task.TaskID,
-			NodeID:      claimed.ID,
-		}, *claimed)
+		go func() {
+			defer release()
+			w.executor.Execute(RunContext{
+				Client:      w.client,
+				ConnName:    w.connName,
+				AgentID:     w.agentID,
+				WorkspaceID: w.workspaceID,
+				ProjectID:   projectID,
+				TaskID:      task.TaskID,
+				NodeID:      claimed.ID,
+			}, *claimed)
+		}()
 	}
 }
 

@@ -95,6 +95,8 @@ func (e *TaskExecutor) executeCommand(ctx context.Context, run *RunContext, node
 		e.failCommand(run, node, "command_start_failed", fmt.Sprintf("start %s: %v", spec.Program, err))
 		return
 	}
+	// Bind the command tree to the daemon lifetime like the coding tools.
+	defer agentprocess.AttachAfterStart(cmd)()
 
 	waitErr := cmd.Wait()
 	// A trailing chunk without a newline is still real output.

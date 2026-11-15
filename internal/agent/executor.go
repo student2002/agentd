@@ -214,6 +214,9 @@ func (e *TaskExecutor) Execute(run RunContext, node TaskNode) {
 			task = *fetchedTask
 			task.ProjectID = projectID // ensure projectID is set even if the API did not return it
 		}
+		// the execution context (MCP env injection) derives from run; keep its
+		// project id in sync once the authoritative task/project ids are known
+		run.ProjectID = task.ProjectID
 		if project, err := run.Client.GetProject(context.Background(), run.AgentID, run.WorkspaceID, projectID); err == nil && project != nil {
 			projectRepoURL = strings.TrimSpace(project.RepoURL)
 		} else {

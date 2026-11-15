@@ -31,6 +31,7 @@ const (
 	MCPCtxAgentID     = "TEAMMATE_MCP_AGENT_ID"
 	MCPCtxServerURL   = "TEAMMATE_MCP_SERVER_URL"
 	MCPCtxToken       = "TEAMMATE_MCP_TOKEN"
+	MCPCtxProjectID   = "TEAMMATE_MCP_PROJECT_ID"
 )
 
 // MemoryLimits bounds one instance's memory. The defaults are adjustable

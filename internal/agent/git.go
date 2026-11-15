@@ -19,6 +19,7 @@
 package agent
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -681,4 +682,42 @@ func NodeStartTag(taskID int32, nodeID, attemptID string) string {
 // execution.
 func NodeCompleteTag(taskID int32, nodeID, attemptID string) string {
 	return fmt.Sprintf("%s/node-%s/attempt-%s/complete", BranchName(taskID), nodeID, attemptID)
+}
+
+// CloneForReview prepares a review workspace: a plain clone without the
+// task-branch setup; an existing repository refreshes its remote refs and
+// follows a changed origin URL (a project may be re-pointed mid-review).
+func (g *GitManager) CloneForReview(ctx context.Context, repoURL string) error {
+	if g.IsGitRepo() {
+		// A changed origin URL must be applied BEFORE the fetch, otherwise a
+		// stale remote fails the fetch and the re-pointing never lands.
+		if current, err := g.RevParseRemoteURL(); err == nil && current != repoURL {
+			if err := g.git(ctx, "remote", "set-url", "origin", repoURL); err != nil {
+				return err
+			}
+		}
+		return g.git(ctx, "fetch", "--all", "--prune")
+	}
+	if err := os.MkdirAll(g.workDir, 0755); err != nil {
+		return fmt.Errorf("mkdir %s: %w", g.workDir, err)
+	}
+	cmd := execGit(ctx, "clone", repoURL, g.workDir)
+	cmd.Env = append(os.Environ(), g.env...)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("git clone: %w: %s", err, DesensitizeLog(string(out)))
+	}
+	g.ensureGitignore()
+	return nil
+}
+
+// RevParseRemoteURL returns the configured origin URL.
+func (g *GitManager) RevParseRemoteURL() (string, error) {
+	cmd := exec.Command("git", "remote", "get-url", "origin")
+	cmd.Dir = g.workDir
+	cmd.Env = append(os.Environ(), g.env...)
+	out, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("git remote get-url origin: %w", err)
+	}
+	return strings.TrimSpace(string(out)), nil
 }

@@ -46,6 +46,7 @@ func main() {
 	rootCmd.AddCommand(daemonCmd)
 	rootCmd.AddCommand(agentCmd)
 	rootCmd.AddCommand(workspaceCmd)
+	rootCmd.AddCommand(toolWrapperCommand())
 	rootCmd.AddCommand(&cobra.Command{
 		Use:   "version",
 		Short: "Print version",

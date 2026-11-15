@@ -307,6 +307,7 @@ func (s *Supervisor) addRuntimeLocked(connName, name string) {
 		path := ToolPathFor(s.cfg.Tools, provider)
 		factory := s.toolFactory
 		runtime.SetToolFactory(func() tool.Tool { return factory(provider, path) })
+		runtime.SetInvocationToolFactory(factory)
 	}
 	s.runtimes[key] = runtime
 	log.Printf("[supervisor] runtime created for connection=%s agent=%s provider=%s", connName, name, agent.Provider)

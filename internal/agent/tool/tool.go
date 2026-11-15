@@ -44,11 +44,33 @@ type ExecutionResult struct {
 	OutputTokens int
 	TotalTokens  int
 	SessionID    string // Claude Code session ID, used for --resume
+	// DisplayText is the human-facing execution transcript: the sanitized
+	// displayable text without protocol logs (e.g. Claude stream-json lines).
+	// Empty when an adapter does not separate display text from raw output.
+	DisplayText string
+	// FinalText is the adapter's best extraction of the model's final answer,
+	// sanitized like DisplayText. Empty means the adapter cannot distinguish
+	// a final answer from the transcript; consumers fall back to DisplayText.
+	FinalText string
 }
 
 // ExecuteOptions contains the optional runtime configuration passed to the coding tool.
 type ExecuteOptions struct {
 	MCPConfigPath string
+	// Env replaces the inherited user environment for the tool process when
+	// non-empty. Callers that need credential isolation (cross-machine
+	// invocations) pass a minimized environment; the adapters still append
+	// their own GIT_CEILING_DIRECTORIES entry on top of it.
+	Env []string
+}
+
+// env returns the base environment for the tool process: the caller-supplied
+// minimal set when provided, otherwise the full inherited environment.
+func (o ExecuteOptions) env() []string {
+	if len(o.Env) > 0 {
+		return o.Env
+	}
+	return os.Environ()
 }
 
 // Tool defines the interface for a coding tool; all coding tool adapters must implement this interface.
@@ -222,7 +244,7 @@ func (t *ClaudeTool) Execute(ctx context.Context, workDir, prompt string, option
 	t.cmd.Dir = workDir
 	agentprocess.PrepareCommand(t.cmd)
 	ceilingDir := filepath.Dir(workDir)
-	t.cmd.Env = append(os.Environ(),
+	t.cmd.Env = append(options.env(),
 		"GIT_CEILING_DIRECTORIES="+ceilingDir,
 	)
 
@@ -237,6 +259,9 @@ func (t *ClaudeTool) Execute(ctx context.Context, workDir, prompt string, option
 		return nil, fmt.Errorf("claude start: %w", err)
 	}
 	started = true
+	// Bind the tool tree to the daemon lifetime before any further code runs;
+	// release runs when Execute returns, after the process has been reaped.
+	defer agentprocess.AttachAfterStart(t.cmd)()
 
 	go func() {
 		defer stdin.Close()
@@ -325,6 +350,8 @@ func (t *ClaudeTool) Execute(ctx context.Context, workDir, prompt string, option
 	sessionIDMu.Lock()
 	result.SessionID = capturedSessionID
 	sessionIDMu.Unlock()
+	result.DisplayText = strings.Join(outputLines, "\n")
+	result.FinalText = sanitizeLog(textExtractor.finalText)
 
 	// Try to parse token usage from the JSON output
 	result.InputTokens, result.OutputTokens = extractTokenUsage(result.Output)
@@ -399,7 +426,7 @@ func (t *OpenClawTool) Execute(ctx context.Context, workDir, prompt string, opti
 	t.cmd.Dir = workDir
 	agentprocess.PrepareCommand(t.cmd)
 	ceilingDir := filepath.Dir(workDir)
-	t.cmd.Env = append(os.Environ(), "GIT_CEILING_DIRECTORIES="+ceilingDir)
+	t.cmd.Env = append(options.env(), "GIT_CEILING_DIRECTORIES="+ceilingDir)
 
 	stdout, _ := t.cmd.StdoutPipe()
 	stderr, _ := t.cmd.StderrPipe()
@@ -408,6 +435,9 @@ func (t *OpenClawTool) Execute(ctx context.Context, workDir, prompt string, opti
 		return nil, fmt.Errorf("openclaw start: %w", err)
 	}
 	started = true
+	// Bind the tool tree to the daemon lifetime before any further code runs;
+	// release runs when Execute returns, after the process has been reaped.
+	defer agentprocess.AttachAfterStart(t.cmd)()
 	t.mu.Unlock() // release the lock after Start() so Stop() can access t.cmd
 
 	go func() {
@@ -455,6 +485,7 @@ func (t *OpenClawTool) Execute(ctx context.Context, workDir, prompt string, opti
 		Output:   fullOutput.String(),
 		ExitCode: exitCode,
 	}
+	result.DisplayText = strings.TrimSpace(sanitizeLog(fullOutput.String()))
 
 	result.InputTokens, result.OutputTokens = extractTokenUsage(result.Output)
 	result.TotalTokens = result.InputTokens + result.OutputTokens
@@ -524,7 +555,7 @@ func (t *OpenCodeTool) Execute(ctx context.Context, workDir, prompt string, opti
 	t.cmd.Dir = workDir
 	agentprocess.PrepareCommand(t.cmd)
 	ceilingDir := filepath.Dir(workDir)
-	t.cmd.Env = append(os.Environ(), "GIT_CEILING_DIRECTORIES="+ceilingDir)
+	t.cmd.Env = append(options.env(), "GIT_CEILING_DIRECTORIES="+ceilingDir)
 
 	stdout, _ := t.cmd.StdoutPipe()
 	stderr, _ := t.cmd.StderrPipe()
@@ -533,6 +564,9 @@ func (t *OpenCodeTool) Execute(ctx context.Context, workDir, prompt string, opti
 		return nil, fmt.Errorf("opencode start: %w", err)
 	}
 	started = true
+	// Bind the tool tree to the daemon lifetime before any further code runs;
+	// release runs when Execute returns, after the process has been reaped.
+	defer agentprocess.AttachAfterStart(t.cmd)()
 	t.mu.Unlock() // release the lock after Start() so Stop() can access t.cmd
 
 	go func() {
@@ -580,6 +614,7 @@ func (t *OpenCodeTool) Execute(ctx context.Context, workDir, prompt string, opti
 		Output:   fullOutput.String(),
 		ExitCode: exitCode,
 	}
+	result.DisplayText = strings.TrimSpace(sanitizeLog(fullOutput.String()))
 
 	result.InputTokens, result.OutputTokens = extractTokenUsage(result.Output)
 	result.TotalTokens = result.InputTokens + result.OutputTokens
@@ -674,10 +709,19 @@ func (t *AtomCodeTool) Execute(ctx context.Context, workDir, prompt string, opti
 	}()
 
 	if options.MCPConfigPath != "" {
-		prompt += fmt.Sprintf("\n\nMCP server configuration is available at %s. Use the MCP servers described there when the tool supports MCP configuration files.", options.MCPConfigPath)
+		// AtomCode loads project-level .mcp.json natively: bridge the
+		// materialized config to the project root for the run, then remove it.
+		cleanupMCP, err := bridgeAtomCodeMCPConfig(workDir, options.MCPConfigPath)
+		if err != nil {
+			return nil, fmt.Errorf("bridge atomcode mcp config: %w", err)
+		}
+		defer cleanupMCP()
 	}
 
-	args := []string{"-p", prompt}
+	// Unattended runs must skip the approval loop entirely: headless only
+	// auto-approves bash, so any other tool escalation (write_file, …) is
+	// denied and turns a completed session's exit code into 2.
+	args := []string{"--dangerously-skip-permissions", "-p", prompt}
 	if resumeID != "" {
 		args = append(args, "--resume", resumeID)
 	} else if continueSession {
@@ -687,7 +731,7 @@ func (t *AtomCodeTool) Execute(ctx context.Context, workDir, prompt string, opti
 	t.cmd.Dir = workDir
 	agentprocess.PrepareCommand(t.cmd)
 	ceilingDir := filepath.Dir(workDir)
-	t.cmd.Env = append(os.Environ(), "GIT_CEILING_DIRECTORIES="+ceilingDir)
+	t.cmd.Env = append(options.env(), "GIT_CEILING_DIRECTORIES="+ceilingDir)
 
 	stdout, _ := t.cmd.StdoutPipe()
 	stderr, _ := t.cmd.StderrPipe()
@@ -696,6 +740,9 @@ func (t *AtomCodeTool) Execute(ctx context.Context, workDir, prompt string, opti
 		return nil, fmt.Errorf("atomcode start: %w", err)
 	}
 	started = true
+	// Bind the tool tree to the daemon lifetime before any further code runs;
+	// release runs when Execute returns, after the process has been reaped.
+	defer agentprocess.AttachAfterStart(t.cmd)()
 	t.mu.Unlock() // release the lock after Start() so Stop() can access t.cmd
 
 	go func() {
@@ -755,6 +802,7 @@ func (t *AtomCodeTool) Execute(ctx context.Context, workDir, prompt string, opti
 		Output:   fullOutput.String(),
 		ExitCode: exitCode,
 	}
+	result.DisplayText = strings.TrimSpace(sanitizeLog(fullOutput.String()))
 	sessionIDMu.Lock()
 	result.SessionID = capturedSessionID
 	sessionIDMu.Unlock()
@@ -831,7 +879,7 @@ func (t *MiMoCodeTool) Execute(ctx context.Context, workDir, prompt string, opti
 	t.cmd.Dir = workDir
 	agentprocess.PrepareCommand(t.cmd)
 	ceilingDir := filepath.Dir(workDir)
-	t.cmd.Env = append(os.Environ(), "GIT_CEILING_DIRECTORIES="+ceilingDir)
+	t.cmd.Env = append(options.env(), "GIT_CEILING_DIRECTORIES="+ceilingDir)
 
 	stdout, _ := t.cmd.StdoutPipe()
 	stderr, _ := t.cmd.StderrPipe()
@@ -840,6 +888,9 @@ func (t *MiMoCodeTool) Execute(ctx context.Context, workDir, prompt string, opti
 		return nil, fmt.Errorf("mimocode start: %w", err)
 	}
 	started = true
+	// Bind the tool tree to the daemon lifetime before any further code runs;
+	// release runs when Execute returns, after the process has been reaped.
+	defer agentprocess.AttachAfterStart(t.cmd)()
 	t.mu.Unlock() // release the lock after Start() so Stop() can access t.cmd
 
 	go func() {
@@ -887,6 +938,7 @@ func (t *MiMoCodeTool) Execute(ctx context.Context, workDir, prompt string, opti
 		Output:   fullOutput.String(),
 		ExitCode: exitCode,
 	}
+	result.DisplayText = strings.TrimSpace(sanitizeLog(fullOutput.String()))
 
 	result.InputTokens, result.OutputTokens = extractTokenUsage(result.Output)
 	result.TotalTokens = result.InputTokens + result.OutputTokens
@@ -919,6 +971,9 @@ func (t *MiMoCodeTool) Stop() error {
 type streamJSONTextExtractor struct {
 	sawDeltas bool
 	emitted   bool
+	// finalText holds the result event's answer regardless of the fallback
+	// emission logic, so callers can use the model's final answer directly.
+	finalText string
 }
 
 // extract parses a single stream-json line and returns its displayable text.
@@ -1002,13 +1057,15 @@ func (x *streamJSONTextExtractor) extract(line string) string {
 	case "result":
 		// Final result: {"type":"result","result":"...","usage":{...}}.
 		// The result text duplicates the final assistant reply; emit it only
-		// when no other source carried the text.
-		if x.emitted {
-			return ""
-		}
+		// when no other source carried the text, but always keep it as the
+		// authoritative final answer for callers that need it separately.
 		var resultStr string
 		if r, ok := obj["result"]; ok {
 			_ = json.Unmarshal(r, &resultStr)
+		}
+		x.finalText = resultStr
+		if x.emitted {
+			return ""
 		}
 		return resultStr
 
@@ -1162,7 +1219,7 @@ func extractTokenUsage(output string) (int, int) {
 
 	for _, obj := range scanJSONObjects(output) {
 		var event struct {
-			Type    string `json:"type"`
+			Type    string     `json:"type"`
 			Usage   *usageJSON `json:"usage"`
 			Message *struct {
 				Usage *usageJSON `json:"usage"`

@@ -831,3 +831,26 @@ func (c *Client) PostNodeComment(ctx context.Context, agentID string, taskID int
 	}
 	return c.doJSON(ctx, "POST", fmt.Sprintf("/api/tasks/%d/comments", taskID), body, nil, withAgentHeader(agentID))
 }
+
+// DispatchTaskToMachine starts a workflow run on the server that creates a
+// task directed to another machine's agentd (cross-machine dispatch): the
+// target machine's agent claims and executes it there, results stay on the
+// server. Requires the project-scoped task:create agent permission.
+func (c *Client) DispatchTaskToMachine(ctx context.Context, agentID, projectID, templateID, title, description, targetDaemonName string) (int32, error) {
+	body := map[string]interface{}{
+		"title":              title,
+		"input":              map[string]interface{}{"description": description},
+		"target_daemon_name": targetDaemonName,
+	}
+	var result struct {
+		TaskID int32 `json:"task_id"`
+	}
+	err := c.doJSON(ctx, "POST", fmt.Sprintf("/api/projects/%s/workflows/%s/runs", projectID, templateID), body, &result, withAgentHeader(agentID))
+	if err != nil {
+		return 0, err
+	}
+	if result.TaskID <= 0 {
+		return 0, fmt.Errorf("unexpected run response: task_id missing")
+	}
+	return result.TaskID, nil
+}

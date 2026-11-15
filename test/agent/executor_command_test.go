@@ -567,7 +567,7 @@ func TestRecoveryReportsInterruptedCommand(t *testing.T) {
 		Workspace: agent.WorkspaceConfig{Root: t.TempDir()},
 		Git:       agent.GitConfig{BaseBranch: "master"},
 	})
-	watcher := agent.NewNodeWatcher(client, executor, "conn", "agent-1", "ws-1", time.Hour)
+	watcher := agent.NewNodeWatcher(client, executor, agent.NewExecutionGate(), "conn", "agent-1", "ws-1", time.Hour)
 	watcher.PollForTest()
 
 	if executor.IsRunning() {

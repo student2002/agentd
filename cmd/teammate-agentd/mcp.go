@@ -28,6 +28,7 @@ var mcpCmd = &cobra.Command{
 			Connection:   os.Getenv(agent.MCPCtxConnection),
 			WorkspaceID:  os.Getenv(agent.MCPCtxWorkspaceID),
 			AgentID:      os.Getenv(agent.MCPCtxAgentID),
+			ProjectID:    os.Getenv(agent.MCPCtxProjectID),
 			ServerURL:    os.Getenv(agent.MCPCtxServerURL),
 			Token:        os.Getenv(agent.MCPCtxToken),
 		})
